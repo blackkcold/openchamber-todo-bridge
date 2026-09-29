@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>渲染验证 — 真实数据</title>
+    <style>
+      /* Harness: renders the SHIPPED status/index.html in an iframe against a
+         stub of the host protocol, so we verify the real markup + CSS rather
+         than a mockup. Protocol taken from @openchamber/sdk 2.0.4:
+           channel "openchamber.sdk", v 1
+           host push : { channel, v, type:'ready', payload }
+           guest call: { channel, v, type:'file-read', id, payload:{path} }
+           host reply: { channel, v, type:'result', id, ok:true, payload }
+      */
+      body { margin: 0; padding: 20px; font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; background: #faf9f5; color: #100f0f; }
+      h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #6f6e69; margin: 0 0 8px; }
+      .wrap { display: flex; gap: 16px; flex-wrap: wrap; }
+      .pane { width: 300px; height: 200px; border: 1px solid #dad8ce; border-radius: 10px; overflow: hidden; background: #FFFCF0; }
+      .pane iframe { width: 100%; height: 100%; border: 0; display: block; }
+      .dark .pane { background: #100f0f; border-color: #282726; }
+      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; }
+      .cap { font-size: 11px; color: #6f6e69; margin: 0 0 6px; }
+    </style>
+  </head>
+  <body>
+    <p class="tip">
+      用真实 <code>status/index.html</code> 渲染，宿主用协议桩替代。左：折叠（默认）；右：展开已完成。
+    </p>
+    <h2>Light</h2>
+    <div class="wrap">
+      <div><p class="cap">折叠（默认）</p><div class="pane"><iframe id="l1"></iframe></div></div>
+      <div><p class="cap">展开已完成</p><div class="pane"><iframe id="l2"></iframe></div></div>
+    </div>
+    <h2>Dark</h2>
+    <div class="wrap dark">
+      <div><p class="cap">折叠（默认）</p><div class="pane"><iframe id="d1"></iframe></div></div>
+    </div>
+
+    <script>
+      const CHANNEL = "openchamber.sdk"
+      const V = 1
+
+      // Exactly the shape the OpenCode plugin writes.
+      const DATA = {
+        sessionID: "ses_demo",
+        updatedAt: Date.now(),
+        todos: [
+          { content: "更新 changelog 与版本号", status: "pending", priority: "low" },
+          { content: "重构支付回调处理", status: "in_progress", priority: "high" },
+          { content: "定位 flaky 用例根因", status: "completed", priority: "high" },
+          { content: "部署到预发环境并验证", status: "pending" },
+          { content: "补 check_out 的回归测试", status: "pending", priority: "high" },
+          { content: "拆分 webhook handler", status: "completed", priority: "medium" },
+          { content: "一条被取消的旧任务", status: "cancelled" },
+          { content: "长文本测试：重构导出模块并把调用点迁移到新接口，同时保持旧签名兼容一个版本",
+            status: "pending", priority: "medium" },
+        ],
+      }
+
+      const LIGHT = {
+        fg: "#100f0f", muted: "#6f6e69", border: "#dad8ce", primary: "#205ea6",
+        success: "#66800b", warning: "#bc5215", error: "#af3029", hover: "rgba(0,0,0,.035)",
+      }
+      const DARK = {
+        fg: "#cecdc3", muted: "#878580", border: "#282726", primary: "#4385be",
+        success: "#879a39", warning: "#da702c", error: "#d14d41", hover: "rgba(255,255,255,.05)",
+      }
+
+      function readyPayload(c) {
+        return {
+          theme: {
+            mode: c === DARK ? "dark" : "light",
+            tokens: {
+              background: "transparent", elevated: "transparent", foreground: c.fg,
+              muted: c.muted, subtle: c.border, border: c.border, hover: c.hover,
+              selection: "transparent", focus: c.primary, primary: c.primary,
+              mutedSurface: "transparent", elevatedForeground: c.fg, active: "transparent",
+              selectionForeground: "inherit", primaryForeground: "#ffffff",
+              primaryText: c.primary, successText: c.success, warningText: c.warning,
+              errorText: c.error, infoText: c.primary,
+              success: c.success, warning: c.warning, error: c.error, info: c.primary,
+              font: "ui-sans-serif, -apple-system, system-ui, sans-serif",
+              mono: "ui-monospace, monospace", radius: "9px",
+            },
+          },
+          session: { id: "ses_demo", title: "demo", busy: false },
+          directory: null,
+          surface: "status",
+          item: null,
+          connection: { connected: false },
+          settings: {},
+        }
+      }
+
+      // One listener for every frame; route by source.
+      const registry = new Map()
+
+      window.addEventListener("message", (event) => {
+        const entry = registry.get(event.source)
+        if (!entry) return
+        const msg = event.data
+        if (!msg || msg.channel !== CHANNEL || msg.v !== V) return
+
+        if (msg.type === "hello") {
+          entry.iframe.contentWindow.postMessage(
+            { channel: CHANNEL, v: V, type: "ready", payload: readyPayload(entry.tokens) }, "*")
+          if (entry.expand) setTimeout(() => {
+            const btn = entry.iframe.contentDocument.getElementById("fold")
+            if (btn) btn.click()
+          }, 400)
+          return
+        }
+
+        if (msg.type === "file-read") {
+          entry.iframe.contentWindow.postMessage(
+            { channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
+              payload: { content: JSON.stringify(DATA) } }, "*")
+          return
+        }
+
+        // Any other guest call: answer with a benign result so nothing hangs.
+        if (typeof msg.id === "string") {
+          entry.iframe.contentWindow.postMessage(
+            { channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false,
+              code: "NOT_FOUND", error: "stub: not implemented" }, "*")
+        }
+      })
+
+      function mount(id, tokens, expand) {
+        const iframe = document.getElementById(id)
+        registry.set(iframe.contentWindow, { iframe, tokens, expand })
+        iframe.src = "/status/index.html"
+      }
+
+      mount("l1", LIGHT, false)
+      mount("l2", LIGHT, true)
+      mount("d1", DARK, false)
+    </script>
+  </body>
+</html>

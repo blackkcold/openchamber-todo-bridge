@@ -8,8 +8,15 @@
  *   ~/.config/openchamber/todos/<sessionID>.json
  *   { sessionID, todos: [{ content, status, priority? }], updatedAt }
  *
- * The section is loaded only while the panel is visible and this section is
- * expanded, so a light poll is enough; it is cleared on teardown.
+ * Presentation choices, and why:
+ *   - Work in progress is pinned above pending items. The open list is what the
+ *     reader cares about, and a long tail of pending work should not push the
+ *     active item out of view.
+ *   - Finished items collapse into one summary row that expands on click, so the
+ *     200px section spends its height on open work. The state travels with the
+ *     list, so a re-render does not undo the reader's choice.
+ *   - Priority is a 3px dot rather than a text label: it has to be visible at a
+ *     glance without competing with the task text.
  *
  * Notes on the host contract (checked against @openchamber/sdk 2.0.4):
  *   - `applyHostReady` lives at the `@openchamber/sdk/ui` entrypoint and is what
@@ -28,8 +35,8 @@ import { applyHostReady } from "@openchamber/sdk/ui"
 const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
-const MARK = { pending: "[ ]", in_progress: "[•]", completed: "[x]", cancelled: "[-]" }
 const STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"])
+const PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" }
 
 const el = (id) => document.getElementById(id)
 
@@ -38,6 +45,9 @@ let sessionID = null
 let timer = null
 let lastKey = ""
 let booted = false
+/** Reader's choice, kept per session so a re-render does not collapse it back. */
+let openFinished = false
+let finishedFor = null
 
 function file(sessionID) {
   return `~/.config/openchamber/todos/${sessionID}.json`
@@ -73,32 +83,78 @@ function parse(content) {
   return todos
 }
 
+const isFinished = (t) => t.status === "completed" || t.status === "cancelled"
+
+/** Work in progress first, then pending, then whatever order they arrived in. */
+function order(list) {
+  const rank = { in_progress: 0, pending: 1 }
+  return list
+    .map((todo, index) => ({ todo, index }))
+    .sort((a, b) => {
+      const ra = rank[a.todo.status] ?? 9
+      const rb = rank[b.todo.status] ?? 9
+      return ra === rb ? a.index - b.index : ra - rb
+    })
+    .map((entry) => entry.todo)
+}
+
+function itemHtml(todo) {
+  const pri = PRIORITY_CLASS[todo.priority] ? `<span class="pri ${PRIORITY_CLASS[todo.priority]}"></span>` : ""
+  let mark = '<span class="box"></span>'
+  if (todo.status === "completed") mark = '<span class="box"><span class="tick"></span></span>'
+  else if (todo.status === "in_progress") mark = '<span class="box"><span class="dot"></span></span>'
+  else if (todo.status === "cancelled") mark = '<span class="box"><span class="dash"></span></span>'
+
+  return (
+    `<div class="item ${esc(todo.status)}">` +
+    mark +
+    `<span class="txt">${esc(todo.content)}</span>${pri}</div>`
+  )
+}
+
 function paint(todos) {
-  const head = el("head")
+  const top = el("top")
   const body = el("body")
 
   if (!todos.length) {
-    head.textContent = "Todo"
+    top.dataset.empty = "true"
     body.innerHTML = '<div class="empty">No todos for this session.</div>'
     return
   }
 
-  const done = todos.filter((t) => t.status === "completed").length
-  head.textContent = `Todo [${done}/${todos.length}]`
-  body.innerHTML = todos
-    .map((t) => {
-      const pri = t.priority ? `<span class="pri">${esc(t.priority)}</span>` : ""
-      return (
-        `<div class="row ${esc(t.status)}">` +
-        `<span class="mark">${MARK[t.status]}</span>` +
-        `<span class="text">${esc(t.content)}</span>${pri}</div>`
-      )
+  const done = todos.filter(isFinished).length
+  const active = order(todos.filter((t) => !isFinished(t)))
+  const finished = todos.filter(isFinished)
+
+  top.dataset.empty = "false"
+  el("count").textContent = `${done}/${todos.length}`
+  top.querySelector("#bar > i").style.width = `${Math.round((done / todos.length) * 100)}%`
+
+  let html = active.map(itemHtml).join("")
+
+  if (finished.length) {
+    const expanded = openFinished && finishedFor === sessionID
+    html +=
+      `<button id="fold" type="button" aria-expanded="${expanded}">` +
+      `已完成 ${finished.length} 项</button>` +
+      (expanded ? finished.map(itemHtml).join("") : "")
+  }
+
+  body.innerHTML = html
+
+  const fold = el("fold")
+  if (fold) {
+    fold.hidden = false
+    fold.addEventListener("click", () => {
+      openFinished = !(openFinished && finishedFor === sessionID)
+      finishedFor = sessionID
+      paint(todos)
     })
-    .join("")
+  }
 }
 
 function paintMessage(text) {
-  el("head").textContent = "Todo"
+  el("top").dataset.empty = "true"
   el("body").innerHTML = `<div class="empty">${esc(text)}</div>`
 }
 
@@ -145,8 +201,9 @@ async function refresh() {
     return
   }
 
-  // Skip the DOM write when nothing changed, so a poll does not disturb scrolling.
-  const key = sessionID + "\u0000" + (content || "")
+  // Skip the DOM write when nothing changed, so a poll does not disturb
+  // scrolling or the finished-group toggle.
+  const key = sessionID + "\u0000" + (content || "") + "\u0000" + String(openFinished)
   if (key === lastKey) return
   lastKey = key
   paint(todos)
@@ -207,6 +264,8 @@ function boot() {
     if (next !== sessionID) {
       sessionID = next
       lastKey = ""
+      openFinished = false
+      finishedFor = null
     }
     void refresh()
     start()

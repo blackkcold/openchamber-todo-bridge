@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Todo section — 设计方案对比</title>
+    <style>
+      /*
+        Design preview only. Not part of the shipped extension.
+
+        Colours approximate OpenChamber's palette (Flexoki-ish). In the real
+        section these come from the host as --oc-* variables.
+      */
+      .theme-light { --bg:#FFFCF0; --fg:#100F0F; --muted:#6F6E69; --border:#DAD8CE; --primary:#205EA6; --success:#66800B; --warning:#BC5215; --error:#AF3029; --chip:#F2F0E5; }
+      .theme-dark  { --bg:#100F0F; --fg:#CECDC3; --muted:#878580; --border:#282726; --primary:#4385BE; --success:#879A39; --warning:#DA702C; --error:#D14D41; --chip:#1C1B1A; }
+
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; padding: 24px;
+        font: 13px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+        background: #faf9f5; color: #100F0F;
+      }
+      h1 { font-size: 15px; margin: 0 0 4px; }
+      .note { color: #6F6E69; margin: 0 0 20px; font-size: 12px; }
+      h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #6F6E69; margin: 24px 0 10px; font-weight: 600; }
+      .row { display: flex; gap: 16px; flex-wrap: wrap; }
+      .card {
+        width: 300px; padding: 12px;
+        background: var(--bg); color: var(--fg);
+        border: 1px solid var(--border); border-radius: 10px;
+      }
+      .card > .t { font-size: 11px; color: var(--muted); margin-bottom: 8px; font-weight: 600; }
+      .sec { height: 200px; display: flex; flex-direction: column; overflow: hidden; }
+
+      /* ---------- shared bits ---------- */
+      .hd { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 2px 2px 6px; }
+      .hd .name { font-size: 11px; font-weight: 600; letter-spacing: .01em; color: var(--muted); }
+      .hd .count { font-size: 11px; font-variant-numeric: tabular-nums; color: var(--muted); }
+      .body { flex: 1 1 auto; overflow-y: auto; padding: 0 2px; }
+      .empty { color: var(--muted); }
+
+      /* ============ A — Checklist（推荐） ============ */
+      .A .bar { height: 2px; background: var(--border); border-radius: 999px; margin: 0 2px 8px; overflow: hidden; }
+      .A .bar > i { display: block; height: 100%; background: var(--success); border-radius: 999px; }
+      .A .item { display: flex; gap: 7px; align-items: flex-start; padding: 3px 2px; border-radius: 5px; }
+      .A .box {
+        flex: 0 0 auto; width: 13px; height: 13px; margin-top: 3px;
+        border: 1.5px solid var(--border); border-radius: 4px;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .A .dot { width: 5px; height: 5px; border-radius: 999px; background: var(--primary); }
+      .A .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+      .A .item.ip .txt { font-weight: 600; }
+      .A .item.ip .box { border-color: var(--primary); }
+      .A .item.done .txt { color: var(--muted); text-decoration: line-through; }
+      .A .item.done .box { border-color: var(--success); background: color-mix(in srgb, var(--success) 14%, transparent); }
+      .A .tick { width: 7px; height: 4px; border-left: 1.5px solid var(--success); border-bottom: 1.5px solid var(--success); transform: rotate(-45deg) translateY(-1px); }
+      .A .p { flex: 0 0 auto; width: 3px; height: 3px; border-radius: 999px; margin: 7px 0 0; }
+      .A .p.high { background: var(--error); } .A .p.med { background: var(--warning); } .A .p.low { background: var(--border); }
+      .A .more { margin-top: 4px; padding: 3px 2px; font-size: 11px; color: var(--muted); }
+
+      /* ============ B — Compact dots ============ */
+      .B .item { display: flex; gap: 7px; align-items: center; padding: 1px 2px; height: 20px; }
+      .B .d { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 999px; border: 1.5px solid var(--border); }
+      .B .item.ip .d { border-color: var(--primary); background: var(--primary); }
+      .B .item.done .d { border-color: var(--success); background: var(--success); }
+      .B .txt { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .B .item.ip .txt { font-weight: 600; }
+      .B .item.done .txt { color: var(--muted); }
+      .B .g { height: 6px; }
+
+      /* ============ C — Grouped sections ============ */
+      .C .grp { margin: 0 0 6px; }
+      .C .gh { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; padding: 2px; }
+      .C .item { display: flex; gap: 7px; align-items: flex-start; padding: 2px 2px; }
+      .C .box { flex: 0 0 auto; width: 13px; height: 13px; margin-top: 3px; border: 1.5px solid var(--border); border-radius: 4px; display: flex; align-items: center; justify-content: center; }
+      .C .dot { width: 5px; height: 5px; border-radius: 999px; background: var(--primary); }
+      .C .tick { width: 7px; height: 4px; border-left: 1.5px solid var(--success); border-bottom: 1.5px solid var(--success); transform: rotate(-45deg) translateY(-1px); }
+      .C .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+      .C .item.ip .txt { font-weight: 600; }
+      .C .item.ip .box { border-color: var(--primary); }
+      .C .item.done .txt { color: var(--muted); text-decoration: line-through; }
+      .C .item.done .box { border-color: var(--success); background: color-mix(in srgb, var(--success) 14%, transparent); }
+      .C .tag { flex: 0 0 auto; font-size: 9px; padding: 0 5px; border-radius: 999px; background: var(--chip); color: var(--muted); line-height: 15px; margin-top: 2px; }
+    </style>
+  </head>
+  <body>
+    <h1>Todo section — 三个方案</h1>
+    <p class="note">
+      卡片宽度 300px 模拟 Work Status 侧栏；高度锁 200px（当前设定，SDK 允许 24–320）。
+      配色为近似值，真实颜色由 OpenChamber 的 <code>--oc-*</code> 变量提供。
+    </p>
+
+    <h2>Light</h2>
+    <div class="row theme-light" id="light"></div>
+
+    <h2>Dark</h2>
+    <div class="row theme-dark" id="dark"></div>
+
+    <script>
+      const ACTIVE = [
+        { s: "ip",   t: "重构支付回调处理", p: "high" },
+        { s: "todo", t: "补 check_out 的回归测试", p: "high" },
+        { s: "todo", t: "部署到预发环境并验证", p: "" },
+        { s: "todo", t: "更新 changelog 与版本号", p: "low" },
+      ]
+      const DONE = [
+        { s: "done", t: "定位 flaky 用例根因", p: "high" },
+        { s: "done", t: "拆分 webhook handler", p: "medium" },
+        { s: "done", t: "补充单元测试", p: "" },
+      ]
+      const ALL = [...ACTIVE, ...DONE]
+      const TOTAL = ALL.length, OK = DONE.length
+
+      const priDot = (p) =>
+        p === "high" ? '<i class="p high"></i>' : p === "med" || p === "medium" ? '<i class="p med"></i>' : p === "low" ? '<i class="p low"></i>' : ""
+
+      const boxA = (s) =>
+        s === "done" ? '<span class="box"><span class="tick"></span></span>'
+        : s === "ip" ? '<span class="box"><span class="dot"></span></span>'
+        : '<span class="box"></span>'
+
+      // A — Checklist
+      const A = `
+        <div class="card A">
+          <div class="t">方案 A · Checklist（推荐）</div>
+          <div class="sec">
+            <div class="hd"><span class="name">待办</span><span class="count">${OK}/${TOTAL}</span></div>
+            <div class="bar"><i style="width:${Math.round(OK / TOTAL * 100)}%"></i></div>
+            <div class="body">
+              ${ACTIVE.map((x) => `<div class="item ${x.s === "ip" ? "ip" : ""}">${boxA(x.s)}<span class="txt">${x.t}</span>${priDot(x.p)}</div>`).join("")}
+              <div class="more">已完成 ${OK} 项</div>
+            </div>
+          </div>
+        </div>`
+
+      // B — Compact dots
+      const B = `
+        <div class="card B">
+          <div class="t">方案 B · 紧凑单行</div>
+          <div class="sec">
+            <div class="hd"><span class="name">待办</span><span class="count">${OK}/${TOTAL}</span></div>
+            <div class="body">
+              ${ALL.map((x) => `<div class="item ${x.s}"><span class="d"></span><span class="txt">${x.t}</span></div>`).join("")}
+            </div>
+          </div>
+        </div>`
+
+      // C — Grouped
+      const grp = (label, list) => `
+        <div class="grp">
+          <div class="gh">${label} ${list.length}</div>
+          ${list.map((x) => `<div class="item ${x.s === "ip" ? "ip" : x.s}">${boxA(x.s)}<span class="txt">${x.t}</span>${x.p ? `<span class="tag">${x.p === "medium" ? "MED" : x.p.toUpperCase()}</span>` : ""}</div>`).join("")}
+        </div>`
+      const C = `
+        <div class="card C">
+          <div class="t">方案 C · 分组</div>
+          <div class="sec">
+            <div class="hd"><span class="name">待办</span><span class="count">${OK}/${TOTAL}</span></div>
+            <div class="body">
+              ${grp("进行中", ACTIVE.filter((x) => x.s === "ip"))}
+              ${grp("待办", ACTIVE.filter((x) => x.s === "todo"))}
+              ${grp("已完成", DONE)}
+            </div>
+          </div>
+        </div>`
+
+      document.getElementById("light").innerHTML = A + B + C
+      document.getElementById("dark").innerHTML = A + B + C
+    </script>
+  </body>
+</html>
