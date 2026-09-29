@@ -40,44 +40,69 @@ design.
 
 ## Install
 
-### 1. The plugin
+**One step.** Settings → Extensions → paste this repo's URL → Add, and approve
+the permissions it asks for. That is the whole install.
 
-Clone this repo, then add the plugin **directory** to `plugins` in
-`~/.config/opencode/opencode.json`:
+The extension then places the OpenCode plugin itself, into the directory
+OpenCode discovers on its own:
+
+```
+~/.config/opencode/plugins/openchamber-todo-bridge/
+  index.js
+  package.json
+```
+
+OpenCode loads that directory without a `plugins` entry in `opencode.json` and
+watches it for changes, so the plugin is picked up **without a restart**.
+(Verified on OpenCode 2.0.18: a plugin created while the server was running came
+back `state: { status: "active" }` with nothing else touched.)
+
+The section says so once, on the run that had to place the plugin. Send any
+message in a session and it starts working.
+
+Nothing edits `opencode.json`. That file belongs to OpenCode, and autodiscovery
+makes the edit unnecessary.
+
+### Pinning a version
+
+Add `#v0.2.0` to the URL to follow a tag instead of the default branch:
+
+```
+https://github.com/blackkcold/openchamber-todo-bridge#v0.2.0
+```
+
+### Installing by hand
+
+If you would rather not let the extension write into `~/.config/opencode/`, add
+the plugin directory yourself:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    "/absolute/path/to/openchamber-todo-bridge/opencode-plugin"
-  ]
+  "plugins": ["/absolute/path/to/openchamber-todo-bridge/opencode-plugin"]
 }
 ```
 
-The entry must be a **directory**, not a file — OpenCode rejects a file path
-with `configured plugin path must be a directory`.
-
-Then restart OpenCode, or let the config watcher pick it up. Confirm it loaded:
+It has to be a **directory**, not a file — OpenCode rejects a file path with
+`configured plugin path must be a directory`. Restart OpenCode, then confirm it
+loaded:
 
 ```bash
 opencode api get /api/plugin
 # look for: { "id": "openchamber-todo-bridge", "state": { "status": "active" } }
 ```
 
-### 2. The extension
+### Permissions
 
-Build it first (the built page is committed, so this is only needed after
-editing `src/`):
+The extension asks for **filesystem**, over exactly two patterns:
 
-```bash
-bun install
-bun run build
-```
+| Pattern | Why |
+| --- | --- |
+| `~/.config/openchamber/todos/*.json` | Read the mirrored list |
+| `~/.config/opencode/plugins/openchamber-todo-bridge/*` | Place the OpenCode plugin |
 
-Then in OpenChamber: **Settings → Extensions → paste this repo's folder path →
-Add**, and approve the single **filesystem** permission it asks for.
+Both are narrow and named. Nothing else on disk is reachable.
 
-Finally expand **Todos** in the Work Status panel.
 
 ## Data file
 
@@ -119,12 +144,18 @@ is already stored by then.
 ## Layout
 
 ```
-opencode-plugin/    OpenCode plugin — restore tools + mirror to a file
-src/main.js         Extension source (the Work Status section)
-status/             Built extension page (committed; OpenChamber never builds)
-scripts/build.ts    Bundles src/main.js to status/main.js as an IIFE
-scripts/validate.ts Checks the manifest against the host's own schema
+opencode-plugin/         OpenCode plugin — restore tools + mirror to a file
+src/main.js              Extension source (the Work Status section)
+src/plugin-install.js    Places the plugin into OpenCode's autodiscovery dir
+status/                  Built extension page (committed; OpenChamber never builds)
+scripts/build.ts         Bundles src/main.js to status/main.js as an IIFE
+scripts/validate.ts      Checks the manifest against the host's own schema
+design/                  Design notes, candidate layouts, and the test harnesses
 ```
+
+The plugin source is **inlined into the section at build time**, so there is one
+canonical copy in `opencode-plugin/` and the shipped page does not fetch its own
+package over HTTP at runtime.
 
 ## Development
 
@@ -136,6 +167,18 @@ bun run build      # src/main.js -> status/main.js (IIFE)
 
 `status/main.js` is committed on purpose: OpenChamber installs extensions
 without building them.
+
+To exercise a change without installing anything:
+
+```bash
+python3 -m http.server 8899    # from the repo root
+```
+
+- `design/verify.html` renders the shipped section against a stub of the host
+  protocol, at 2×.
+- `design/plan-matrix.html` runs the install decision across every state —
+  fresh, current, stale, partially written — and prints PASS/FAIL per case.
+
 
 ## License
 

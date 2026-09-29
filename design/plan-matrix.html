@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>planInstall 状态矩阵</title>
+    <style>
+      body { margin: 0; padding: 20px; font: 13px/1.6 ui-sans-serif, system-ui, sans-serif; background: #faf9f5; color: #100f0f; }
+      h1 { font-size: 14px; margin: 0 0 4px; }
+      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; }
+      table { border-collapse: collapse; font-size: 12px; }
+      th, td { border: 1px solid #dad8ce; padding: 4px 10px; text-align: left; vertical-align: top; }
+      th { background: #f2f0e5; font-weight: 600; }
+      code { background: #f2f0e5; padding: 0 3px; border-radius: 3px; }
+      .pass { color: #66800b; font-weight: 600; }
+      .fail { color: #af3029; font-weight: 700; }
+      .summary { margin-top: 16px; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>planInstall — 决策矩阵</h1>
+    <p class="tip">
+      直接跑 <code>src/plugin-install.js</code> 的导出（经 <code>/src/plugin-install.js</code>
+      以模块加载，构建期 define 的常量在浏览器里未定义，因此这里只测纯函数）。
+    </p>
+    <div id="out">…</div>
+
+    <script type="module">
+      import { planInstall, PLUGIN_VERSION, PLUGIN_DIR_PATH } from "/src/plugin-install.js"
+
+      // Literal on purpose: the harness asserts the real expected marker, so it
+      // still catches a typo in the module's own constant. Deriving it from the
+      // module would make the test agree with any mistake.
+      const MARK = `\n// openchamber-todo-bridge@${PLUGIN_VERSION}\n`
+      const cases = [
+        { name: "首次安装（文件不存在）",          entry: null,                                         want: "write" },
+        { name: "文件存在但非本插件",              entry: "// something else\n",                        want: "write" },
+        { name: "当前版本（尾部标记一致）",        entry: "// ours\n" + MARK,                           want: "none" },
+        { name: "旧版本（标记版本不同）",          entry: "// ours\n// openchamber-todo-bridge@0.0.1\n",  want: "write" },
+        { name: "旧版本（无标记，早于本机制）",     entry: "// ours, no marker\n",                       want: "write" },
+        { name: "写入中断（只剩前半段）",          entry: "// ours\n// openchamber-todo-bri",           want: "write" },
+        { name: "空文件",                          entry: "",                                           want: "write" },
+      ]
+
+      const rows = cases.map((c) => {
+        const got = planInstall(c.entry)
+        const ok = got.action === c.want
+        const has = typeof c.entry === "string" && c.entry.includes("opencode-todo-bridge")
+        const tail = typeof c.entry === "string" ? JSON.stringify(c.entry.slice(-34)) : "null"
+        return `<tr><td>${c.name}</td><td><code>${c.want}</code></td>` +
+               `<td>includes=${has}</td><td>尾部 ${tail}</td>` +
+               `<td><code>${got.action}</code> / ${got.reason}</td>` +
+               `<td class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</td></tr>`
+      })
+      const failed = rows.filter((r) => r.includes(">FAIL<")).length
+
+      document.getElementById("out").innerHTML =
+        `<table><thead><tr><th>场景</th><th>期望</th><th>含标记名</th><th>尾部 34 字符</th><th>实际</th><th>结果</th></tr></thead>` +
+        `<tbody>${rows.join("")}</tbody></table>` +
+        `<p class="summary">${failed === 0 ? '<span class="pass">全部通过</span>' : `<span class="fail">${failed} 项失败</span>`}` +
+        ` · PLUGIN_VERSION=${PLUGIN_VERSION} · 目标目录 <code>${PLUGIN_DIR_PATH}</code></p>`
+    </script>
+  </body>
+</html>

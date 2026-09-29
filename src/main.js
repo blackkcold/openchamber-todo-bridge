@@ -32,6 +32,8 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady } from "@openchamber/sdk/ui"
 
+import { ensureInstalled, PLUGIN_DIR_PATH } from "./plugin-install.js"
+
 const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
@@ -51,6 +53,9 @@ let sessionID = null
 let timer = null
 let lastKey = ""
 let booted = false
+/** The plugin install runs once per page load, not on every host refresh. */
+let installChecked = false
+let setupNote = ""
 /** Reader's choice, kept per session so a re-render does not collapse it back. */
 let openFinished = false
 let finishedFor = null
@@ -165,8 +170,39 @@ function paintMessage(text) {
   el("body").innerHTML = `<div class="empty">${esc(text)}</div>`
 }
 
+/**
+ * One-time notice when this run had to place the plugin.
+ *
+ * Shown inside the section rather than as a toast: it explains why todos will
+ * stay empty until the next message, which is exactly what the reader is
+ * looking at. Nothing is written when the plugin is already current.
+ */
+function paintSetupNote(reason) {
+  const top = el("top")
+  const body = el("body")
+  top.dataset.empty = "true"
+
+  const lead =
+    reason === "write-failed"
+      ? "Could not install the OpenCode plugin."
+      : "OpenCode plugin installed."
+
+  const detail =
+    reason === "write-failed"
+      ? `The section stays empty until it is there. Install it by hand from <code>opencode-plugin/</code> in the repo.`
+      : `Send any message in this session to start a fresh turn — it loads without a restart. Written to <code>${esc(PLUGIN_DIR_PATH)}</code>.`
+
+  body.innerHTML = `<div class="empty"><b>${lead}</b><br>${detail}</div>`
+}
+
 async function refresh() {
   if (!host) return
+  // The install notice explains an empty panel, so it takes precedence over the
+  // file read until the reader does something.
+  if (setupNote) {
+    paintSetupNote(setupNote)
+    return
+  }
   if (!sessionID) {
     paintMessage("No session.")
     return
@@ -274,6 +310,30 @@ function boot() {
       openFinished = false
       finishedFor = null
     }
+
+    // Place the OpenCode plugin if this run is the first one, then render.
+    // It only runs once per page load, and only writes when the copy on disk is
+    // missing or stale. Nothing here edits `opencode.json`.
+    if (!installChecked) {
+      installChecked = true
+      void ensureInstalled(host)
+        .then((outcome) => {
+          if (outcome.ok && outcome.reason === "current") return
+          const failed = !outcome.ok || String(outcome.reason).startsWith("write-failed")
+          setupNote = failed ? "write-failed" : outcome.reason
+          lastKey = ""
+        })
+        .catch(() => {
+          setupNote = "write-failed"
+          lastKey = ""
+        })
+        .finally(() => {
+          void refresh()
+          start()
+        })
+      return
+    }
+
     void refresh()
     start()
   })
