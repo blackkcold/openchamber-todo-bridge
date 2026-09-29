@@ -1341,6 +1341,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var BOOT_WATCHDOG_MS = 1600;
   var STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
   var PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" };
+  var PRIORITY_MARK = {
+    high: "⌃⌃",
+    medium: "⌃",
+    low: "·"
+  };
   var el2 = (id) => document.getElementById(id);
   var host = null;
   var sessionID = null;
@@ -1390,15 +1395,16 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }).map((entry) => entry.todo);
   }
   function itemHtml(todo) {
-    const pri = PRIORITY_CLASS[todo.priority] ? `<span class="pri ${PRIORITY_CLASS[todo.priority]}"></span>` : "";
-    let mark = '<span class="box"></span>';
+    const mark = PRIORITY_MARK[todo.priority] || "";
+    const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : "";
+    let box = '<span class="box"></span>';
     if (todo.status === "completed")
-      mark = '<span class="box"><span class="tick"></span></span>';
+      box = '<span class="box"><span class="tick"></span></span>';
     else if (todo.status === "in_progress")
-      mark = '<span class="box"><span class="dot"></span></span>';
+      box = '<span class="box"><span class="dot"></span></span>';
     else if (todo.status === "cancelled")
-      mark = '<span class="box"><span class="dash"></span></span>';
-    return `<div class="item ${esc(todo.status)}">` + mark + `<span class="txt">${esc(todo.content)}</span>${pri}</div>`;
+      box = '<span class="box"><span class="dash"></span></span>';
+    return `<div class="item ${esc(todo.status)}">` + box + `<span class="txt">${esc(todo.content)}</span>${pri}</div>`;
   }
   function paint(todos) {
     const top = el2("top");

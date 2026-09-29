@@ -28,8 +28,32 @@ The section worked but looked like a terminal:
 | 2px progress bar under the count | Progress is visible without reading numbers |
 | Work in progress pinned to the top | The open item is what the reader wants first |
 | Finished items collapse into `已完成 N 项` | Spends the 200px on open work; expands on click, and the choice survives re-renders |
-| Priority as a 3px dot (red / orange / muted) | Visible at a glance, does not compete with the text |
+| Priority as a rising mark: `⌃⌃` / `⌃` / `·` | Visible at a glance, does not compete with the text |
 | Long text wraps; row height stays predictable | |
+
+## Priority marks
+
+Two chevrons for the top level, one for the next, a dot for ordinary work.
+
+| Mark | Priority | Colour |
+| --- | --- | --- |
+| `⌃⌃` | high | purple — `#5e409d` light, `#8b7ec8` dark |
+| `⌃` | medium | blue — `#205ea6` light, `#4385be` dark |
+| `·` | low | muted (host `--oc-muted`) |
+
+Characters, not CSS-drawn shapes. A first attempt rotated a 5px box into a
+chevron; its ink is about 7px tall, so stacking two either overflowed the 17px
+line or fused into one blob. `U+2303` brings its own metrics and stacks cleanly
+with `letter-spacing: -1px`.
+
+The mark shares the task text's line box (`line-height` matched to the body), so
+it rides the same baseline. An independent line-height pushed it to the row top.
+
+The host palette has no purple, so the two priority colours are defined here.
+`applyHostReady` sets `data-oc-theme` on the root, which selects the dark
+variant; the `:root` values are the light ones and double as the pre-theme
+fallback. Both are Flexoki, the palette the app uses.
+
 
 ## Colours
 
@@ -47,8 +71,8 @@ paint is readable before the theme lands.
 
 - `preview.html` — three candidate layouts side by side, light and dark. The
   chosen one is **A · Checklist**.
-- `verify.html` — renders the real shipped page against a protocol stub, so a
-  change to `status/` can be checked without installing it.
+- `verify.html` — renders the real shipped page against a protocol stub at 2×, so
+  a change to `status/` or `src/` can be checked without installing it.
 - `preview.jpg` — the screenshot above.
 
 ## Checking a change

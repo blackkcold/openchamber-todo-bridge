@@ -14,26 +14,31 @@
       */
       body { margin: 0; padding: 20px; font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; background: #faf9f5; color: #100f0f; }
       h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #6f6e69; margin: 0 0 8px; }
-      .wrap { display: flex; gap: 16px; flex-wrap: wrap; }
+      .wrap { display: flex; gap: 20px; flex-wrap: wrap; }
+      /* 2x so the priority marks and their colours are actually judgeable. */
+      .zoom { zoom: 2; }
       .pane { width: 300px; height: 200px; border: 1px solid #dad8ce; border-radius: 10px; overflow: hidden; background: #FFFCF0; }
       .pane iframe { width: 100%; height: 100%; border: 0; display: block; }
       .dark .pane { background: #100f0f; border-color: #282726; }
-      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; }
+      .dark h2 { color: #878580; }
       .cap { font-size: 11px; color: #6f6e69; margin: 0 0 6px; }
+      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; }
     </style>
   </head>
   <body>
     <p class="tip">
-      用真实 <code>status/index.html</code> 渲染，宿主用协议桩替代。左：折叠（默认）；右：展开已完成。
+      真实 <code>status/index.html</code> + 协议桩，2× 渲染。
+      优先级：<code>⌃⌃</code> 紫 = 最优先，<code>⌃</code> 蓝 = 次之，<code>·</code> = 普通。
     </p>
+
     <h2>Light</h2>
-    <div class="wrap">
-      <div><p class="cap">折叠（默认）</p><div class="pane"><iframe id="l1"></iframe></div></div>
-      <div><p class="cap">展开已完成</p><div class="pane"><iframe id="l2"></iframe></div></div>
+    <div class="wrap zoom">
+      <div class="pane"><iframe id="l1"></iframe></div>
     </div>
+
     <h2>Dark</h2>
-    <div class="wrap dark">
-      <div><p class="cap">折叠（默认）</p><div class="pane"><iframe id="d1"></iframe></div></div>
+    <div class="wrap zoom dark">
+      <div class="pane"><iframe id="d1"></iframe></div>
     </div>
 
     <script>
@@ -45,15 +50,12 @@
         sessionID: "ses_demo",
         updatedAt: Date.now(),
         todos: [
-          { content: "更新 changelog 与版本号", status: "pending", priority: "low" },
-          { content: "重构支付回调处理", status: "in_progress", priority: "high" },
-          { content: "定位 flaky 用例根因", status: "completed", priority: "high" },
-          { content: "部署到预发环境并验证", status: "pending" },
-          { content: "补 check_out 的回归测试", status: "pending", priority: "high" },
-          { content: "拆分 webhook handler", status: "completed", priority: "medium" },
-          { content: "一条被取消的旧任务", status: "cancelled" },
-          { content: "长文本测试：重构导出模块并把调用点迁移到新接口，同时保持旧签名兼容一个版本",
-            status: "pending", priority: "medium" },
+          { content: "最优先：重构支付回调处理", status: "in_progress", priority: "high" },
+          { content: "次优先：补 check_out 的回归测试", status: "pending", priority: "medium" },
+          { content: "普通：更新 changelog 与版本号", status: "pending", priority: "low" },
+          { content: "无优先级：部署到预发环境并验证", status: "pending" },
+          { content: "次优先长文本：重构导出模块并把调用点迁移到新接口", status: "pending", priority: "medium" },
+          { content: "已完成的最优先项", status: "completed", priority: "high" },
         ],
       }
 
@@ -92,7 +94,6 @@
         }
       }
 
-      // One listener for every frame; route by source.
       const registry = new Map()
 
       window.addEventListener("message", (event) => {
@@ -100,41 +101,31 @@
         if (!entry) return
         const msg = event.data
         if (!msg || msg.channel !== CHANNEL || msg.v !== V) return
+        const answer = (payload) => entry.iframe.contentWindow.postMessage(payload, "*")
 
         if (msg.type === "hello") {
-          entry.iframe.contentWindow.postMessage(
-            { channel: CHANNEL, v: V, type: "ready", payload: readyPayload(entry.tokens) }, "*")
-          if (entry.expand) setTimeout(() => {
-            const btn = entry.iframe.contentDocument.getElementById("fold")
-            if (btn) btn.click()
-          }, 400)
+          answer({ channel: CHANNEL, v: V, type: "ready", payload: readyPayload(entry.tokens) })
           return
         }
-
         if (msg.type === "file-read") {
-          entry.iframe.contentWindow.postMessage(
-            { channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
-              payload: { content: JSON.stringify(DATA) } }, "*")
+          answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
+                   payload: { content: JSON.stringify(DATA) } })
           return
         }
-
-        // Any other guest call: answer with a benign result so nothing hangs.
         if (typeof msg.id === "string") {
-          entry.iframe.contentWindow.postMessage(
-            { channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false,
-              code: "NOT_FOUND", error: "stub: not implemented" }, "*")
+          answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false,
+                   code: "NOT_FOUND", error: "stub: not implemented" })
         }
       })
 
-      function mount(id, tokens, expand) {
+      function mount(id, tokens) {
         const iframe = document.getElementById(id)
-        registry.set(iframe.contentWindow, { iframe, tokens, expand })
+        registry.set(iframe.contentWindow, { iframe, tokens })
         iframe.src = "/status/index.html"
       }
 
-      mount("l1", LIGHT, false)
-      mount("l2", LIGHT, true)
-      mount("d1", DARK, false)
+      mount("l1", LIGHT)
+      mount("d1", DARK)
     </script>
   </body>
 </html>

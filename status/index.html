@@ -110,11 +110,44 @@
       }
       .item.cancelled .dash { width: 6px; height: 1.5px; background: var(--t-muted); }
 
-      /* priority: a quiet dot, not a label */
-      .pri { flex: 0 0 auto; width: 3px; height: 3px; border-radius: 999px; margin-top: 7px; }
-      .pri.high { background: var(--t-error); }
-      .pri.medium { background: var(--t-warning); }
-      .pri.low { background: var(--t-border); }
+      /*
+        Priority reads as a rising mark rather than a label: two chevrons for the
+        top level, one for the next, a dot for ordinary work. These are real
+        characters (U+2303, U+00B7) rather than CSS-drawn shapes: a rotated box
+        has ~7px of ink inside a 5px box, so two of them either overflow the line
+        or fuse into a single blob. A glyph brings its own metrics.
+
+        The host palette has no purple, so the priority colours are defined here.
+        `applyHostReady` sets `data-oc-theme` on the root, which gives the dark
+        variant; the `:root` values are the light ones and double as the
+        pre-theme fallback. Values are Flexoki, the palette the app uses.
+      */
+      :root {
+        --t-pri-high: #5e409d;
+        --t-pri-medium: #205ea6;
+      }
+      [data-oc-theme="dark"] {
+        --t-pri-high: #8b7ec8;
+        --t-pri-medium: #4385be;
+      }
+      .pri {
+        flex: 0 0 auto;
+        min-width: 9px;
+        /*
+          Share the text's line box so the glyph rides the same baseline as the
+          task: `⌃` sits above the baseline and `·` at mid-x-height, which is the
+          natural alignment. An independent line-height here pushed the mark to
+          the top of the row.
+        */
+        font-size: 11px;
+        line-height: 17.4px;
+        text-align: center;
+        color: var(--t-muted);
+      }
+      .pri.high { color: var(--t-pri-high); }
+      .pri.medium { color: var(--t-pri-medium); }
+      /* The pair should read as one mark, not two separate characters. */
+      .pri.high { letter-spacing: -1px; }
 
       /* ---- finished group toggle ---- */
       #fold {

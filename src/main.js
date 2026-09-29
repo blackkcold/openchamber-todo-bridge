@@ -37,6 +37,12 @@ const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
 const STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"])
 const PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" }
+/** Rising mark: one chevron for medium, two for high, a dot for ordinary work. */
+const PRIORITY_MARK = {
+  high: "⌃⌃",
+  medium: "⌃",
+  low: "·",
+}
 
 const el = (id) => document.getElementById(id)
 
@@ -99,15 +105,16 @@ function order(list) {
 }
 
 function itemHtml(todo) {
-  const pri = PRIORITY_CLASS[todo.priority] ? `<span class="pri ${PRIORITY_CLASS[todo.priority]}"></span>` : ""
-  let mark = '<span class="box"></span>'
-  if (todo.status === "completed") mark = '<span class="box"><span class="tick"></span></span>'
-  else if (todo.status === "in_progress") mark = '<span class="box"><span class="dot"></span></span>'
-  else if (todo.status === "cancelled") mark = '<span class="box"><span class="dash"></span></span>'
+  const mark = PRIORITY_MARK[todo.priority] || ""
+  const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : ""
+  let box = '<span class="box"></span>'
+  if (todo.status === "completed") box = '<span class="box"><span class="tick"></span></span>'
+  else if (todo.status === "in_progress") box = '<span class="box"><span class="dot"></span></span>'
+  else if (todo.status === "cancelled") box = '<span class="box"><span class="dash"></span></span>'
 
   return (
     `<div class="item ${esc(todo.status)}">` +
-    mark +
+    box +
     `<span class="txt">${esc(todo.content)}</span>${pri}</div>`
   )
 }
