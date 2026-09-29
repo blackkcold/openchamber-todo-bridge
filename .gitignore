@@ -1,0 +1,7 @@
+node_modules/
+.DS_Store
+*.log
+.probe
+
+# status/main.js is committed on purpose: OpenChamber installs extensions
+# without building them, so the built page has to ship.

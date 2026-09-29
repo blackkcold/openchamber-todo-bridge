@@ -1,0 +1,36 @@
+{
+  "name": "openchamber-todo-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Shows the OpenCode session todo list in OpenChamber's Work Status panel.",
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.0.4"
+    },
+    "contributes": {
+      "panel": {
+        "id": "todo-bridge",
+        "name": "Todos",
+        "icon": "checkbox-circle"
+      },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "Todos",
+        "height": 200
+      },
+      "filesystem": [
+        "~/.config/openchamber/todos/*.json"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "validate": "bun run scripts/validate.ts"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.0.4"
+  }
+}
