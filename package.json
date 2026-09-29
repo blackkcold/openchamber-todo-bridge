@@ -1,6 +1,6 @@
 {
   "name": "openchamber-todo-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -29,7 +29,8 @@
   },
   "scripts": {
     "build": "bun run scripts/build.ts",
-    "validate": "bun run scripts/validate.ts"
+    "validate": "bun run scripts/validate.ts",
+    "test": "node scripts/test-plugin.mjs"
   },
   "devDependencies": {
     "@openchamber/sdk": "^2.0.4"

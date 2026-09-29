@@ -22,6 +22,10 @@
       直接跑 <code>src/plugin-install.js</code> 的导出（经 <code>/src/plugin-install.js</code>
       以模块加载，构建期 define 的常量在浏览器里未定义，因此这里只测纯函数）。
     </p>
+    <p class="tip">
+      插件的纯行为（<code>buildReminder</code> 与工具描述里的行为契约）在
+      <code>scripts/test-plugin.mjs</code> 里测 —— 插件引用 <code>node:fs</code>，无法在页面中加载。
+    </p>
     <div id="out">…</div>
 
     <script type="module">

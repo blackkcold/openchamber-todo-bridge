@@ -1459,6 +1459,90 @@ async function mirror(sessionID, todos) {
   await rename(tmp, target)
 }
 
+/**
+ * The tool description carries the whole behavioral contract.
+ *
+ * OpenCode's system prompt never mentions todos — in v1 every bit of guidance
+ * lived here, in a ~1.6KB description, and that is what made agents reach for
+ * the tool on their own. An earlier revision of this plugin condensed it to a
+ * few lines and agents stopped using the tool proactively, which is expected:
+ * with the contract gone there is nothing telling them when to.
+ *
+ * This is derived from OpenCode v1's \`tool/todowrite.txt\` (MIT), kept close to
+ * the original wording because it is the phrasing that demonstrably worked.
+ */
+export const TODOWRITE_DESCRIPTION = [
+  "Create and maintain a structured task list for the current coding session. Tracks progress, organizes multi-step work, and surfaces status to the user.",
+  "",
+  "## When to use",
+  "Use proactively when:",
+  "- The task requires 3+ distinct steps or actions (not just 3 tool calls for a single conceptual step)",
+  "- The work is non-trivial and benefits from planning",
+  "- The user provides multiple tasks (numbered or comma-separated) or explicitly asks for a todo list",
+  "- New instructions arrive - capture them as todos",
+  "- You start a task - mark it \`in_progress\` (only one at a time) before working",
+  "- You finish a task - mark it \`completed\` and add any follow-ups discovered during the work",
+  "",
+  "## When NOT to use",
+  "Skip when:",
+  "- The work is a single, straightforward task (or <3 trivial steps)",
+  "- The request is purely informational or conversational",
+  "- Tracking adds no organizational value",
+  "",
+  "## States",
+  "- \`pending\` - not started",
+  "- \`in_progress\` - actively working (exactly ONE at a time)",
+  "- \`completed\` - finished successfully",
+  "- \`cancelled\` - no longer needed",
+  "",
+  "## Rules",
+  "- Update status in real time; don't batch completions",
+  "- Mark \`completed\` only after the required work is actually done, including any required verification. Never based on intent.",
+  "- Keep exactly one \`in_progress\` while work remains",
+  "- If blocked or partial, keep it \`in_progress\` and add a follow-up todo describing the blocker",
+  "- Preserve user-provided commands verbatim (flags, args, order)",
+  "- Items should be specific and actionable; break large work into smaller steps",
+  "- Each call replaces the whole list, so always pass every item",
+  "",
+  "When in doubt, use it.",
+].join("\\n")
+
+/** How many unchanged injections before the reminder says so outright. */
+const STALE_AFTER = 3
+
+/**
+ * Builds the per-round reminder.
+ *
+ * Pure so the harness can check the wording and the escalation without a model
+ * or a filesystem. \`repeats\` counts consecutive injections of the same list:
+ * once the agent has seen the same list several rounds running, saying so is
+ * more useful than repeating the same suggestion.
+ */
+export function buildReminder(todos, repeats = 1) {
+  const lines = [
+    "Current todo list for this session:",
+    render(todos),
+    "",
+  ]
+
+  if (repeats >= STALE_AFTER) {
+    lines.push(
+      \`This list has not changed in \${repeats} rounds. If any of it is finished, update it now with todowrite:\`,
+      "- mark finished and verified work \`completed\`",
+      "- move the task you are working on to \`in_progress\` (one at a time)",
+    )
+  } else {
+    lines.push(
+      "Keep this list current with todowrite:",
+      "- mark a task \`completed\` as soon as it is done and verified",
+      "- move the next task to \`in_progress\` before starting it (one at a time)",
+      "- capture follow-ups discovered during the work",
+    )
+  }
+
+  return lines.join("\\n")
+}
+
 const TODOS_INPUT = {
   type: "object",
   properties: {
@@ -1490,13 +1574,7 @@ export default {
     const tools = await ctx.tool.transform((editor) => {
       editor.add({
         name: "todowrite",
-        description: [
-          "Create or replace the session todo list.",
-          "Pass the complete list every time; it replaces any previous one.",
-          "Use it to plan multi-step work and keep status current: keep exactly one task in_progress while working on it,",
-          "mark tasks completed as soon as they are done, and cancel tasks that are no longer needed.",
-          "Prefer short, imperative task descriptions.",
-        ].join(" "),
+        description: TODOWRITE_DESCRIPTION,
         input: TODOS_INPUT,
         options: { codemode: false },
         async execute(input, context) {
@@ -1527,20 +1605,27 @@ export default {
       })
     })
 
-    // Re-inject the current list each round: compaction can drop the older tool
-    // results, and the model would otherwise believe it has no list at all.
+    // Re-inject the current list each round. Two reasons: compaction can drop
+    // the older tool results, and without a reminder a long task tends to run to
+    // the end with the list still showing everything as pending.
+    //
+    // The list is compared by content, so an unchanged list is detected without
+    // asking the model anything. After a few unchanged rounds the reminder says
+    // so outright rather than repeating the same suggestion.
+    const seen = new Map()
     const context = await ctx.session.hook("context", async (event) => {
       const todos = parseRecord(await ctx.storage.get(storageKey(event.sessionID)))
-      if (!hasOpen(todos)) return
-      event.system.push({
-        type: "text",
-        text: [
-          "Current todo list for this session:",
-          render(todos),
-          "",
-          "Keep it current with the todowrite tool as work progresses.",
-        ].join("\\n"),
-      })
+      if (!hasOpen(todos)) {
+        seen.delete(event.sessionID)
+        return
+      }
+
+      const key = JSON.stringify(todos)
+      const previous = seen.get(event.sessionID)
+      const repeats = previous && previous.key === key ? previous.repeats + 1 : 1
+      seen.set(event.sessionID, { key, repeats })
+
+      event.system.push({ type: "text", text: buildReminder(todos, repeats) })
     })
 
     return async () => {
@@ -1552,7 +1637,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",

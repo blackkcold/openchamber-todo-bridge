@@ -162,6 +162,7 @@ package over HTTP at runtime.
 ```bash
 bun install
 bun run validate   # manifest against @openchamber/sdk's parser
+bun run test       # plugin behavior + the tool-description contract
 bun run build      # src/main.js -> status/main.js (IIFE)
 ```
 
@@ -179,6 +180,24 @@ python3 -m http.server 8899    # from the repo root
 - `design/plan-matrix.html` runs the install decision across every state —
   fresh, current, stale, partially written — and prints PASS/FAIL per case.
 
+
+## Why the agent actually uses it
+
+The tool description carries the whole behavioral contract, and it is long on
+purpose. OpenCode's system prompt never mentions todos — in v1 the entire
+guidance lived in a ~1.6KB tool description, and that is what made agents reach
+for the tool unprompted.
+
+An earlier revision of this plugin condensed that description to a few lines.
+Agents then stopped updating the list, which is the expected result: with the
+contract gone there is nothing telling them *when* to use the tool. The
+description is restored close to v1's wording, and `bun run test` asserts that
+the lines driving the behavior are still there, so it cannot quietly shrink
+again.
+
+The list is also re-injected on every model request while tasks are open. When
+it goes unchanged for several rounds, the reminder says so outright instead of
+repeating the same suggestion.
 
 ## License
 
