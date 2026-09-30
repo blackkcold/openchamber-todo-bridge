@@ -40,8 +40,12 @@ design.
 
 ## Install
 
-**One step.** Settings → Extensions → paste this repo's URL → Add, and approve
-the permissions it asks for. That is the whole install.
+**One step.** Settings → Extensions → paste this URL → Add, and approve the
+permissions it asks for. That is the whole install.
+
+```
+https://github.com/blackkcold/openchamber-todo-bridge#v0.3.0
+```
 
 The extension then places the OpenCode plugin itself, into the directory
 OpenCode discovers on its own:
@@ -65,11 +69,16 @@ makes the edit unnecessary.
 
 ### Pinning a version
 
-Add `#v0.2.0` to the URL to follow a tag instead of the default branch:
+Add `#v0.3.0` to the URL to follow a tag instead of the default branch:
 
 ```
-https://github.com/blackkcold/openchamber-todo-bridge#v0.2.0
+https://github.com/blackkcold/openchamber-todo-bridge#v0.3.0
 ```
+
+Pinning means no automatic updates: an update follows the ref you installed, so
+a tag stays where it is. To move to a newer release, install again with the new
+tag. Without a tag, the extension follows the default branch and
+**Settings → Extensions → Check for updates** works as usual.
 
 ### Installing by hand
 
