@@ -450,12 +450,6 @@ function paintSetupNote(reason) {
 
 async function refresh() {
   if (!host) return
-  // The install notice explains an empty panel, so it takes precedence over the
-  // file read until the reader does something.
-  if (setupNote) {
-    paintSetupNote(setupNote)
-    return
-  }
   if (!sessionID) {
     paintMessage("No session.")
     return
@@ -467,10 +461,6 @@ async function refresh() {
     content = result && result.content
   } catch (error) {
     const code = error && error.code
-    if (code === "NOT_FOUND") {
-      paintMessage("No todos for this session.")
-      return
-    }
     if (code === "NOT_GRANTED") {
       paintMessage("This section was not allowed to read the todo file.")
       stop()
@@ -487,7 +477,15 @@ async function refresh() {
       stop()
       return
     }
-    paintMessage("Could not read todos.")
+    // Nothing to read. The install notice explains a panel that is empty
+    // because the plugin was just placed and has not written a list yet — it
+    // never masks a list that does exist, so a version bump that rewrites the
+    // plugin cannot hide the todos behind the notice until a reload.
+    if (setupNote) {
+      paintSetupNote(setupNote)
+      return
+    }
+    paintMessage(code === "NOT_FOUND" ? "No todos for this session." : "Could not read todos.")
     return
   }
 

@@ -87,7 +87,7 @@
     <p class="cap"><button id="peek" type="button">重新读取</button> <span class="m" id="peekAt"></span></p>
     <pre class="cap" id="dump">—</pre>
 
-    <h2>交互自检（9 条）</h2>
+    <h2>交互自检（10 条）</h2>
     <p class="cap">
       <button id="selftest" type="button">跑滚动自检</button>
       <button id="idletest" type="button">回位自检（约 32 秒）</button>
@@ -207,8 +207,14 @@
         }
         if (msg.type === "file-read") {
           if (isPluginEntry(msg.payload && msg.payload.path)) {
+            // A pane flagged stale hands the section an older marker, so it runs
+            // its install path and sets its one-time notice. Check 10 asserts a
+            // real list still wins over that notice.
+            const content = entry.stalePlugin
+              ? `// stub: an older copy\n// ${PLUGIN_ID}@0.0.1\n`
+              : (pluginEntry || "")
             answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
-                     payload: { content: pluginEntry || "" } })
+                     payload: { content } })
             return
           }
           answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
@@ -245,13 +251,14 @@
 
       const log = document.getElementById("log")
 
-      function mount(id, tokens, data, meterId, elastic) {
+      function mount(id, tokens, data, meterId, elastic, stalePlugin = false) {
         const iframe = document.getElementById(id)
         registry.set(iframe.contentWindow, {
           iframe,
           tokens,
           data,
           elastic,
+          stalePlugin,
           label: id,
           pane: iframe.parentElement,
           meter: meterId ? document.getElementById(meterId) : null,
@@ -271,7 +278,7 @@
           mount("a1", LIGHT, MANY, "mA", true)
           mount("b1", DARK, FEW, "mB", true)
           mount("c1", LIGHT, NONE, "mC", true)
-          mount("d1", LIGHT, FEW, null, false)
+          mount("d1", LIGHT, FEW, null, false, true)   // stale plugin: exercises the notice path
           // What each frame actually rendered: same-origin, so the harness can
           // read it back instead of guessing from the outside.
           setTimeout(peek, 2500)
@@ -309,7 +316,7 @@
       document.getElementById("peek").addEventListener("click", peek)
 
       /*
-        Interaction self-check: nine assertions against the scroll model,
+        Interaction self-check: ten assertions against the scroll model,
         driving the frame's own DOM through the same-origin document.
 
         Two things this cannot simulate, and does not try to:
@@ -348,7 +355,7 @@
         const lines = []
         const say = (name, pass, detail) => lines.push(`  ${pass ? "PASS" : "FAIL"}  ${name}  ${detail}`)
         const flush = () => { checkLine.textContent = lines.join("\n") }
-        checkLine.textContent = "  … 9 条滚动自检"
+        checkLine.textContent = "  … 10 条滚动自检"
         await wait(600)
 
         // 1 · 15 rows: the elastic frame stops at the host's 320px cap and scrolls.
@@ -499,6 +506,20 @@
           const ok = Number.isFinite(body.scrollTop) && body.scrollHeight > 0 && body.clientHeight > 0
           say("9 the readout (rows/scrollTop/scrollHeight/clientHeight) is live", ok,
               `rows=${body.children.length} scrollTop=${body.scrollTop} scrollH=${body.scrollHeight} clientH=${body.clientHeight}`)
+          flush()
+        }
+
+        // 10 · a pane that had to (re)install the plugin still shows its list.
+        // The one-time notice explains an empty panel; it must never override a
+        // list that exists — a version bump rewrites the plugin on upgrade, and
+        // that used to hide the todos until a reload.
+        {
+          const { doc } = parts("d1")
+          const text = (doc.body.innerText || "").replace(/\s+/g, " ").trim()
+          const showsList = text.includes("check_out")
+          const showsNote = text.includes("plugin installed") || text.includes("Could not install")
+          say("10 the install notice does not hide an existing list", showsList && !showsNote,
+              showsList ? "list shown over the notice" : `text="${text.slice(0, 64)}"`)
           flush()
         }
       }

@@ -1974,10 +1974,6 @@ export default {
   async function refresh() {
     if (!host)
       return;
-    if (setupNote) {
-      paintSetupNote(setupNote);
-      return;
-    }
     if (!sessionID) {
       paintMessage("No session.");
       return;
@@ -1988,10 +1984,6 @@ export default {
       content = result && result.content;
     } catch (error) {
       const code = error && error.code;
-      if (code === "NOT_FOUND") {
-        paintMessage("No todos for this session.");
-        return;
-      }
       if (code === "NOT_GRANTED") {
         paintMessage("This section was not allowed to read the todo file.");
         stop();
@@ -2007,7 +1999,11 @@ export default {
         stop();
         return;
       }
-      paintMessage("Could not read todos.");
+      if (setupNote) {
+        paintSetupNote(setupNote);
+        return;
+      }
+      paintMessage(code === "NOT_FOUND" ? "No todos for this session." : "Could not read todos.");
       return;
     }
     const todos = parse(content);
