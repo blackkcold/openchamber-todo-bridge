@@ -13,10 +13,20 @@
  *     reader cares about, and a long tail of pending work should not push the
  *     active item out of view.
  *   - Finished items collapse into one summary row that expands on click, so the
- *     200px section spends its height on open work. The state travels with the
+ *     section spends its height on open work. The state travels with the
  *     list, so a re-render does not undo the reader's choice.
  *   - Priority is a 3px dot rather than a text label: it has to be visible at a
  *     glance without competing with the task text.
+ *   - The section is sized to its content, up to the host's 320px ceiling
+ *     (`src/viewport.js` owns the bounds and the arithmetic). The height is
+ *     *measured* from the rows it is about to show rather than estimated from a
+ *     row count, because a row is only approximately the same height as the
+ *     next — the finished-group row is a control, and a long task name wraps.
+ *   - Past that ceiling the list is an ordinary native scroll container: wheel,
+ *     keyboard, touch and the scrollbar all belong to the browser, and the
+ *     section never intercepts them. A scroll rests on a row boundary, or on the
+ *     bottom, so the last row stays reachable; ten seconds after the reader's
+ *     own last scroll the list returns to the top.
  *
  * Notes on the host contract (checked against @openchamber/sdk 2.0.4):
  *   - `applyHostReady` lives at the `@openchamber/sdk/ui` entrypoint and is what
@@ -32,11 +42,35 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady } from "@openchamber/sdk/ui"
 
+import {
+  clamp,
+  clampScroll,
+  MAX_H,
+  MIN_H,
+  nearestIndex,
+} from "./viewport.js"
 import { ensureInstalled, PLUGIN_DIR_PATH } from "./plugin-install.js"
 
 const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
+/** The height in `package.json`. The first paint is exempt from the delta gate. */
+const MANIFEST_H = 56
+/**
+ * Injected by the build. The shipped build (`scripts/build.ts`) sets it false.
+ * The UI-only test build (`scripts/build-test-extension.ts`) sets it true: that
+ * package renders the list and nothing else, reading what the stable
+ * extension's OpenCode plugin already mirrors, and never touches OpenCode.
+ */
+const UI_ONLY = typeof __TODO_BRIDGE_UI_ONLY__ === "boolean" ? __TODO_BRIDGE_UI_ONLY__ : false
+/** A reader idle this long is returned to the top of the list. */
+const IDLE_MS = 10000
+/** Scroll this long settles before snapping to a row start. */
+const SNAP_QUIET_MS = 110
+/** A height change smaller than this is not worth a round trip to the host. */
+const HEIGHT_DELTA = 8
+/** Coalescing window, so a burst of height changes settles into one resize. */
+const HEIGHT_SETTLE_MS = 150
 const STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"])
 const PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" }
 /** Rising mark: one chevron for medium, two for high, a dot for ordinary work. */
@@ -59,6 +93,15 @@ let setupNote = ""
 /** Reader's choice, kept per session so a re-render does not collapse it back. */
 let openFinished = false
 let finishedFor = null
+
+// ---- height and scroll state ----
+/** The list as last painted, so a fold click can relayout without a file read. */
+let painted = []
+/** Last height handed to the host, and the pending coalesced change to it. */
+let lastHeight = MANIFEST_H
+let heightTimer = null
+let idleTimer = null
+let snapTimer = null
 
 function file(sessionID) {
   return `~/.config/openchamber/todos/${sessionID}.json`
@@ -124,50 +167,264 @@ function itemHtml(todo) {
   )
 }
 
-function paint(todos) {
-  const top = el("top")
-  const body = el("body")
+/** Rows for the current list: open work in order, then the finished fold. */
+function buildRows(list) {
+  const open = order(list.filter((todo) => !isFinished(todo)))
+  const finished = list.filter(isFinished)
+  const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: todo.content, todo }))
 
+  if (finished.length) {
+    const expanded = openFinished && finishedFor === sessionID
+    rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded })
+    if (expanded) {
+      for (const todo of finished) {
+        rows.push({ kind: "item", status: todo.status, key: todo.content, todo })
+      }
+    }
+  }
+
+  return rows
+}
+
+function rowHtml(row) {
+  if (row.kind === "fold") {
+    return `<button class="fold" type="button" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`
+  }
+  return itemHtml(row.todo)
+}
+
+/** The rows currently in the list — the scroll container's own children. */
+const rowNodes = () => Array.from(el("body").children)
+
+/** Whether the list is taller than the space the frame gives it. */
+function canScroll() {
+  const body = el("body")
+  return body.scrollHeight > body.clientHeight + 1
+}
+
+const reducedMotion = () =>
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
+
+/** Honour the reader's motion preference; otherwise animate. */
+const smooth = () => (reducedMotion() ? "auto" : "smooth")
+
+/**
+ * The height the section wants: the whole list, measured, up to the host's cap.
+ *
+ * `offsetTop + offsetHeight` of the last row rather than the sum of the rows'
+ * heights: a row can carry a top margin (the fold has 4px), and that gap is part
+ * of the space the rows need. A sum of border-box heights would miss it.
+ *
+ * The frame is elastic — it grows to fit every todo and only stops at the host's
+ * 320px ceiling, past which the list scrolls. Capping at a fixed row count
+ * instead clipped a tall (multi-line) last row even when there was room to show
+ * it whole.
+ */
+function frameHeight(headerH) {
+  const rows = rowNodes()
+  if (rows.length === 0) return MIN_H
+  const last = rows[rows.length - 1]
+  const content = last.offsetTop + last.offsetHeight
+  return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H)
+}
+
+/**
+ * The height the section wants, coalesced and gated.
+ *
+ * Both thresholds are about what the reader sees rather than about the number:
+ * a change under `HEIGHT_DELTA` is a resize nobody can see, and a burst inside
+ * `HEIGHT_SETTLE_MS` is one resize. The first paint is exempt from both — the
+ * frame still carries the manifest's height then, and holding an 8px gate would
+ * leave it visibly wrong for as long as the gate holds.
+ */
+function applyHeight(height) {
+  const wanted = clamp(height, MIN_H, MAX_H)
+  if (wanted === lastHeight) return
+
+  const first = lastHeight === MANIFEST_H
+  if (!first && Math.abs(wanted - lastHeight) < HEIGHT_DELTA) return
+
+  clearTimeout(heightTimer)
+  heightTimer = setTimeout(() => {
+    heightTimer = null
+    if (wanted === lastHeight) return
+    lastHeight = wanted
+    try {
+      // An async rejection is the host going away mid-flight; it is not worth
+      // un-remembering the height we asked for. A synchronous throw means there
+      // is no `setHeight` at all, so nothing was asked for.
+      if (host) void host.setHeight(wanted).catch(() => {})
+    } catch {
+      lastHeight = MANIFEST_H
+    }
+  }, first ? 0 : HEIGHT_SETTLE_MS)
+}
+
+/**
+ * Snap a rested scroll to a row boundary, or to the bottom.
+ *
+ * The gap the browser leaves between the scroll settling and this running is
+ * what makes it feel like a settle rather than a fight: a scroll still in
+ * progress keeps re-arming the timer.
+ *
+ * The bottom is a resting place in its own right. Snapping only to row starts
+ * meant the last row, whose start sits *above* the maximum scroll, could never
+ * be reached — every attempt to scroll to the end sprang back up to that row's
+ * top. So both are candidates and the nearer one wins; at the bottom the last
+ * row is fully visible.
+ */
+function snap() {
+  snapTimer = null
+  const body = el("body")
+  const max = body.scrollHeight - body.clientHeight
+  if (max <= 0) return
+  const here = body.scrollTop
+  const starts = Array.from(body.children).map((node) => node.offsetTop)
+  const rowTarget = clampScroll(starts[nearestIndex(here, starts)], max)
+  const target = Math.max(0, max - here) < Math.abs(rowTarget - here) ? max : rowTarget
+  if (Math.abs(target - here) < 1) return
+  body.scrollTo({ top: target, behavior: smooth() })
+}
+
+/**
+ * Return to the top of the list.
+ *
+ * The in-progress item is always first (`order` pins it), so "where the work
+ * is" is simply the top. `<= 1` rather than `<= 0`: a smooth scroll can settle a
+ * fraction short of zero, and treating that as "not home yet" made the return
+ * fire again every ten seconds forever. Landing home is final — it does not
+ * re-arm.
+ */
+function returnToWork() {
+  idleTimer = null
+  const body = el("body")
+  if (body.scrollTop <= 1) return
+  body.scrollTo({ top: 0, behavior: smooth() })
+}
+
+function clearIdle() {
+  if (idleTimer === null) return
+  clearTimeout(idleTimer)
+  idleTimer = null
+}
+
+/**
+ * Arm the idle return — from the reader's own scrolling, and nothing else.
+ *
+ * The scroll event used to arm it, which was wrong twice over: the snap and the
+ * return itself scroll the container, so each one re-armed the timer (the
+ * return fired again every ten seconds), and a poll-driven repaint could too.
+ * Only a real input counts now.
+ */
+function armIdle() {
+  clearIdle()
+  if (!canScroll()) return
+  idleTimer = setTimeout(returnToWork, IDLE_MS)
+}
+
+/** Keys the browser scrolls a focused box with; arming on them is not intercepting them. */
+const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "])
+
+/**
+ * Input: the fold click, the settle snap, and the signals that arm the idle
+ * return.
+ *
+ * Everything here is passive or non-prevented, so wheel, touch, arrow keys,
+ * PageUp/PageDown and the scrollbar all stay the browser's native scroll
+ * handling on the `overflow-y: auto` body — a short list never takes the rail's
+ * wheel. The extra listeners only mark "the reader scrolled"; they never move
+ * the list or cancel an event.
+ */
+function wireInput() {
+  const body = el("body")
+  /** A drag on the list or its bar: the one manual scroll that fires no wheel. */
+  let pointerDown = false
+
+  body.addEventListener("click", (event) => {
+    const fold = event.target instanceof Element ? event.target.closest(".fold") : null
+    if (!fold) return
+    openFinished = !(openFinished && finishedFor === sessionID)
+    finishedFor = sessionID
+    // The poll's key carries the fold state; clear it so the next read repaints.
+    lastKey = ""
+    if (painted.length) paint(painted)
+  })
+
+  body.addEventListener("scroll", () => {
+    // A drag scrolls the container without a wheel event; the pointer being down
+    // is what distinguishes it from our own snap/return scrolls.
+    if (pointerDown) armIdle()
+    clearTimeout(snapTimer)
+    snapTimer = setTimeout(snap, SNAP_QUIET_MS)
+  }, { passive: true })
+
+  body.addEventListener("wheel", armIdle, { passive: true })
+  body.addEventListener("touchmove", armIdle, { passive: true })
+  body.addEventListener("keydown", (event) => {
+    if (SCROLL_KEYS.has(event.key)) armIdle()
+  })
+  body.addEventListener("pointerdown", () => { pointerDown = true })
+  // Clear on every way a drag can end, including one released outside the frame:
+  // a flag stuck true would let the snap's own scroll re-arm the idle return.
+  const releaseDrag = () => { pointerDown = false }
+  window.addEventListener("pointerup", releaseDrag)
+  window.addEventListener("pointercancel", releaseDrag)
+  window.addEventListener("blur", releaseDrag)
+}
+
+/** Padding the body carries around the list, from its own stylesheet. */
+function bodyPadding() {
+  const style = getComputedStyle(el("body"))
+  return Math.round((parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0))
+}
+
+function paint(todos) {
   if (!todos.length) {
-    top.dataset.empty = "true"
-    body.innerHTML = '<div class="empty">No todos for this session.</div>'
+    paintPlain('<div class="empty">No todos for this session.</div>')
     return
   }
 
-  const done = todos.filter(isFinished).length
-  const active = order(todos.filter((t) => !isFinished(t)))
-  const finished = todos.filter(isFinished)
+  painted = todos
+  el("root").dataset.mode = "work"
 
+  const top = el("top")
+  const done = todos.filter(isFinished).length
   top.dataset.empty = "false"
   el("count").textContent = `${done}/${todos.length}`
   top.querySelector("#bar > i").style.width = `${Math.round((done / todos.length) * 100)}%`
 
-  let html = active.map(itemHtml).join("")
+  // One replacement for the whole list. The scroll container keeps its
+  // `scrollTop` across the swap, so a poll that changes a row does not move the
+  // reader. The height is measured from what just rendered.
+  el("body").innerHTML = buildRows(todos).map(rowHtml).join("")
+  applyHeight(frameHeight(top.offsetHeight || 22))
+}
 
-  if (finished.length) {
-    const expanded = openFinished && finishedFor === sessionID
-    html +=
-      `<button id="fold" type="button" aria-expanded="${expanded}">` +
-      `已完成 ${finished.length} 项</button>` +
-      (expanded ? finished.map(itemHtml).join("") : "")
-  }
+/**
+ * Message-only states — empty list, no session, errors, the setup note.
+ *
+ * Rendered with the body content-sized (`#root[data-mode="empty"]`), so the
+ * body's own height is the honest answer for how tall the section should be:
+ * there is no list and no scroll to feed back into the measurement.
+ */
+function paintPlain(html) {
+  painted = []
+  clearIdle()
+  clearTimeout(snapTimer)
+  snapTimer = null
+  clearTimeout(heightTimer)
+  heightTimer = null
 
-  body.innerHTML = html
+  el("root").dataset.mode = "empty"
+  el("top").dataset.empty = "true"
+  el("body").innerHTML = html
+  el("body").scrollTop = 0
 
-  const fold = el("fold")
-  if (fold) {
-    fold.hidden = false
-    fold.addEventListener("click", () => {
-      openFinished = !(openFinished && finishedFor === sessionID)
-      finishedFor = sessionID
-      paint(todos)
-    })
-  }
+  applyHeight(Math.max(MIN_H, Math.round(el("body").offsetHeight)))
 }
 
 function paintMessage(text) {
-  el("top").dataset.empty = "true"
-  el("body").innerHTML = `<div class="empty">${esc(text)}</div>`
+  paintPlain(`<div class="empty">${esc(text)}</div>`)
 }
 
 /**
@@ -178,10 +435,6 @@ function paintMessage(text) {
  * looking at. Nothing is written when the plugin is already current.
  */
 function paintSetupNote(reason) {
-  const top = el("top")
-  const body = el("body")
-  top.dataset.empty = "true"
-
   const lead =
     reason === "write-failed"
       ? "Could not install the OpenCode plugin."
@@ -192,7 +445,7 @@ function paintSetupNote(reason) {
       ? `The section stays empty until it is there. Install it by hand from <code>opencode-plugin/</code> in the repo.`
       : `Send any message in this session to start a fresh turn — it loads without a restart. Written to <code>${esc(PLUGIN_DIR_PATH)}</code>.`
 
-  body.innerHTML = `<div class="empty"><b>${lead}</b><br>${detail}</div>`
+  paintPlain(`<div class="empty"><b>${lead}</b><br>${detail}</div>`)
 }
 
 async function refresh() {
@@ -294,6 +547,10 @@ function boot() {
     return
   }
 
+  // Registered once, on `#body`, so a repaint that replaces the rows does not
+  // take the handlers with it.
+  wireInput()
+
   host.onReady((ctx) => {
     if (!booted) {
       booted = true
@@ -313,8 +570,10 @@ function boot() {
 
     // Place the OpenCode plugin if this run is the first one, then render.
     // It only runs once per page load, and only writes when the copy on disk is
-    // missing or stale. Nothing here edits `opencode.json`.
-    if (!installChecked) {
+    // missing or stale. Nothing here edits `opencode.json`. The UI-only build
+    // skips this entirely: it has no plugin half and reads the mirror the
+    // stable extension's plugin writes.
+    if (!installChecked && !UI_ONLY) {
       installChecked = true
       void ensureInstalled(host)
         .then((outcome) => {

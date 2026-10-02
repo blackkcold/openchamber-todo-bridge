@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>渲染验证 — 真实数据</title>
+    <title>渲染验证 — 滚动模型</title>
     <style>
       /* Harness: renders the SHIPPED status/index.html in an iframe against a
          stub of the host protocol, so we verify the real markup + CSS rather
@@ -10,43 +10,98 @@
            channel "openchamber.sdk", v 1
            host push : { channel, v, type:'ready', payload }
            guest call: { channel, v, type:'file-read', id, payload:{path} }
+           guest call: { channel, v, type:'resize', id, payload:{height} }
            host reply: { channel, v, type:'result', id, ok:true, payload }
-      */
+
+         The stub answers `resize` the way OpenChamber does: it changes the
+         WRAPPER's height, which the frame fills, and never reloads the iframe.
+         (PluginPane maps the guest's resize message to `onResize`, and the
+         status section renders `<div style={{height}}>` around the frame.) So a
+         scroll position and the idle return survive a height change here,
+         exactly as they have to on the real panel. */
       body { margin: 0; padding: 20px; font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; background: #faf9f5; color: #100f0f; }
       h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: #6f6e69; margin: 0 0 8px; }
-      .wrap { display: flex; gap: 20px; flex-wrap: wrap; }
+      .wrap { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
       /* 2x so the priority marks and their colours are actually judgeable. */
       .zoom { zoom: 2; }
-      .pane { width: 300px; height: 200px; border: 1px solid #dad8ce; border-radius: 10px; overflow: hidden; background: #FFFCF0; }
+      .col { display: flex; flex-direction: column; gap: 4px; }
+      .pane { width: 300px; border: 1px solid #dad8ce; border-radius: 10px; overflow: hidden; background: #FFFCF0; }
       .pane iframe { width: 100%; height: 100%; border: 0; display: block; }
       .dark .pane { background: #100f0f; border-color: #282726; }
-      .dark h2 { color: #878580; }
-      .cap { font-size: 11px; color: #6f6e69; margin: 0 0 6px; }
-      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; }
+      .dark h2, .dark .cap { color: #878580; }
+      .zoom .pane { width: 150px; }
+      .cap { font-size: 11px; color: #6f6e69; margin: 0; }
+      .cap b { color: #100f0f; }
+      .dark .cap b { color: #cecdc3; }
+      .m { font-variant-numeric: tabular-nums; }
+      .tip { color: #6f6e69; font-size: 12px; margin: 0 0 16px; max-width: 78ch; }
+      .tip code { background: #efece2; padding: 1px 3px; border-radius: 3px; }
     </style>
   </head>
   <body>
     <p class="tip">
-      真实 <code>status/index.html</code> + 协议桩，2× 渲染。
-      优先级：<code>⌃⌃</code> 紫 = 最优先，<code>⌃</code> 蓝 = 次之，<code>·</code> = 普通。
+      真实 <code>status/index.html</code> + 协议桩。优先级：<code>⌃⌃</code> 紫 = 最优先，
+      <code>⌃</code> 蓝 = 次之，<code>·</code> = 普通。
+      桩会把 <code>resize</code> 请求落到容器高度上（不重挂 iframe），并回报宿主实际采用的高度。
+      窗口是弹性的：跟着内容撑高，只在到宿主 320px 上限后才滚动 —— 所以短列表（哪怕末行是多行文本）整体可见。
+      滚轮 / ↓ 是浏览器原生滚动，停手后吸附到行首**或底部**（末行能滚到底看全）；
+      只有你**手动滚动**离开顶部后，10 秒才会平滑回顶，且到位后不再反复触发。
     </p>
 
-    <h2>Light</h2>
-    <div class="wrap zoom">
-      <div class="pane"><iframe id="l1"></iframe></div>
+    <h2>Light · 15 条（超出 320px → 原生滚动）</h2>
+    <div class="wrap">
+      <div class="col">
+        <p class="cap"><b>弹性高度</b> — 宿主高度 <span class="m" id="mA">56px</span></p>
+        <div class="pane" id="paneA" style="height: 56px"><iframe id="a1"></iframe></div>
+      </div>
     </div>
 
-    <h2>Dark</h2>
-    <div class="wrap zoom dark">
-      <div class="pane"><iframe id="d1"></iframe></div>
+    <h2>Dark · 3 条（装得下 → 不滚，含折叠行）</h2>
+    <div class="wrap dark">
+      <div class="col">
+        <p class="cap"><b>弹性高度</b> — 宿主高度 <span class="m" id="mB">56px</span></p>
+        <div class="pane" id="paneB" style="height: 56px"><iframe id="b1"></iframe></div>
+      </div>
     </div>
+
+    <h2>Light · 空列表（收缩到一行）</h2>
+    <div class="wrap">
+      <div class="col">
+        <p class="cap"><b>弹性高度</b> — 宿主高度 <span class="m" id="mC">56px</span></p>
+        <div class="pane" id="paneC" style="height: 56px"><iframe id="c1"></iframe></div>
+      </div>
+    </div>
+
+    <h2>2× — 只看优先级标记（不参与改高）</h2>
+    <div class="wrap zoom">
+      <div class="col">
+        <p class="cap"><b>静态 200px</b> — <code>zoom: 2</code> 放大后判断字形与配色</p>
+        <div class="pane" id="paneD" style="height: 200px"><iframe id="d1"></iframe></div>
+      </div>
+    </div>
+
+    <h2>resize 记录（宿主侧）</h2>
+    <p class="cap" id="log">— 等待第一个 resize —</p>
+
+    <h2>各面板实际渲染内容</h2>
+    <p class="cap"><button id="peek" type="button">重新读取</button> <span class="m" id="peekAt"></span></p>
+    <pre class="cap" id="dump">—</pre>
+
+    <h2>交互自检（9 条）</h2>
+    <p class="cap">
+      <button id="selftest" type="button">跑滚动自检</button>
+      <button id="idletest" type="button">回位自检（约 32 秒）</button>
+    </p>
+    <pre class="cap" id="check">—</pre>
 
     <script>
       const CHANNEL = "openchamber.sdk"
       const V = 1
 
-      // Exactly the shape the OpenCode plugin writes.
-      const DATA = {
+      // Exactly the shape the OpenCode plugin writes. 15 open items, so the
+      // list is over the 6-row cap and scrolls; no finished items, so the row
+      // count is exactly the todo count.
+      const MANY = {
         sessionID: "ses_demo",
         updatedAt: Date.now(),
         todos: [
@@ -54,10 +109,32 @@
           { content: "次优先：补 check_out 的回归测试", status: "pending", priority: "medium" },
           { content: "普通：更新 changelog 与版本号", status: "pending", priority: "low" },
           { content: "无优先级：部署到预发环境并验证", status: "pending" },
-          { content: "次优先长文本：重构导出模块并把调用点迁移到新接口", status: "pending", priority: "medium" },
-          { content: "已完成的最优先项", status: "completed", priority: "high" },
+          { content: "次优先长文本：重构导出模块并把调用点迁移到新接口，顺带把两处重复的格式化逻辑收敛成一个函数", status: "pending", priority: "medium" },
+          { content: "补设计文档：高度模型与滚动规则", status: "pending", priority: "low" },
+          { content: "核对 status/main.js 的构建产物已提交", status: "pending" },
+          { content: "清理 design/ 里过期的截图", status: "pending", priority: "low" },
+          { content: "把 README 的安装说明指向新版本", status: "pending", priority: "medium" },
+          { content: "确认空闲回位的 10s 阈值", status: "pending" },
+          { content: "验证滚轮不再被面板拦截", status: "pending", priority: "high" },
+          { content: "把高度改回跟内容走、封顶 6 行", status: "pending", priority: "low" },
+          { content: "把吸附阈值定在 110ms", status: "pending" },
+          { content: "确认 scrollbar-gutter 生效", status: "pending", priority: "medium" },
+          { content: "最后一条：滚动到底部时吸附不把位置往回拉", status: "pending" },
         ],
       }
+
+      // 2 open + 1 finished: three rows, one of them the fold — fits, no scroll.
+      const FEW = {
+        sessionID: "ses_demo",
+        updatedAt: Date.now(),
+        todos: [
+          { content: "次优先：补 check_out 的回归测试", status: "pending", priority: "medium" },
+          { content: "普通：更新 changelog 与版本号", status: "pending", priority: "low" },
+          { content: "已完成：把 CSS 里的颜色收敛到 --oc-*", status: "completed" },
+        ],
+      }
+
+      const NONE = { sessionID: "ses_demo", updatedAt: Date.now(), todos: [] }
 
       const LIGHT = {
         fg: "#100f0f", muted: "#6f6e69", border: "#dad8ce", primary: "#205ea6",
@@ -94,7 +171,28 @@
         }
       }
 
+      // The host's own clamp, so the harness cannot accept a height the real
+      // panel would refuse (`clampFrameHeight`, min 24, max 320).
+      const clampHeight = (value) => {
+        const n = Number.isFinite(value) ? Math.round(value) : 24
+        return Math.min(320, Math.max(24, n))
+      }
+
       const registry = new Map()
+
+      /*
+        The section also places the OpenCode plugin on its first run, and shows
+        a notice instead of the list until that is settled. So the stub answers
+        that too: it reports the plugin already in place, with the exact marker
+        the section builds (`// <id>@<version>`, version from the same manifest
+        the build inlines). Read from the real files rather than hardcoded, so
+        this cannot go stale on the next version bump.
+      */
+      const PLUGIN_ID = "openchamber-todo-bridge"
+      let pluginEntry = ""
+
+      const isPluginEntry = (path) =>
+        typeof path === "string" && path.endsWith(`plugins/${PLUGIN_ID}/index.js`)
 
       window.addEventListener("message", (event) => {
         const entry = registry.get(event.source)
@@ -108,8 +206,35 @@
           return
         }
         if (msg.type === "file-read") {
+          if (isPluginEntry(msg.payload && msg.payload.path)) {
+            answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
+                     payload: { content: pluginEntry || "" } })
+            return
+          }
           answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
-                   payload: { content: JSON.stringify(DATA) } })
+                   payload: { content: JSON.stringify(entry.data) } })
+          return
+        }
+        if (msg.type === "file-write") {
+          // Reachable only if the marker read above did not land; accepting the
+          // write keeps the notice away either way.
+          answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
+                   payload: { written: true } })
+          return
+        }
+        if (msg.type === "resize" && typeof msg.id === "string") {
+          const asked = msg.payload && msg.payload.height
+          const height = clampHeight(asked)
+          const note = `${entry.label} asked ${asked} → ${entry.elastic ? "host applied" : "host ignored (static pane)"} ${height}px`
+          log.textContent = log.textContent.startsWith("—") ? note : `${log.textContent}\n${note}`
+          // Only the wrapper moves, and only where the pane stands in for the
+          // real status section: the iframe keeps its document and its scroll
+          // state, which is what the section relies on.
+          if (entry.elastic) {
+            entry.pane.style.height = `${height}px`
+            if (entry.meter) entry.meter.textContent = `${height}px`
+          }
+          answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true, payload: {} })
           return
         }
         if (typeof msg.id === "string") {
@@ -118,14 +243,310 @@
         }
       })
 
-      function mount(id, tokens) {
+      const log = document.getElementById("log")
+
+      function mount(id, tokens, data, meterId, elastic) {
         const iframe = document.getElementById(id)
-        registry.set(iframe.contentWindow, { iframe, tokens })
+        registry.set(iframe.contentWindow, {
+          iframe,
+          tokens,
+          data,
+          elastic,
+          label: id,
+          pane: iframe.parentElement,
+          meter: meterId ? document.getElementById(meterId) : null,
+        })
         iframe.src = "/status/index.html"
       }
 
-      mount("l1", LIGHT)
-      mount("d1", DARK)
+      // The marker has to be in hand before the first frame boots, or the first
+      // read comes back as a foreign copy and the plugin notice takes the panel.
+      fetch("/opencode-plugin/package.json")
+        .then((response) => response.json())
+        .then((manifest) => {
+          pluginEntry = `// stub: the plugin is already placed\n// ${PLUGIN_ID}@${manifest.version}\n`
+        })
+        .catch(() => {})
+        .then(() => {
+          mount("a1", LIGHT, MANY, "mA", true)
+          mount("b1", DARK, FEW, "mB", true)
+          mount("c1", LIGHT, NONE, "mC", true)
+          mount("d1", LIGHT, FEW, null, false)
+          // What each frame actually rendered: same-origin, so the harness can
+          // read it back instead of guessing from the outside.
+          setTimeout(peek, 2500)
+        })
+
+      const dump = document.getElementById("dump")
+      const peekAt = document.getElementById("peekAt")
+
+      function peek() {
+        const lines = []
+        for (const entry of registry.values()) {
+          const frame = entry.iframe
+          let text = "(no document)"
+          let box = ""
+          try {
+            const doc = frame.contentDocument
+            const body = doc.getElementById("body")
+            const root = doc.getElementById("root")
+            text = JSON.stringify(doc.body.innerText.replace(/\s+/g, " ").trim().slice(0, 220))
+            box = `rows=${body.children.length} scrollTop=${body.scrollTop} ` +
+                  `scrollHeight=${body.scrollHeight} clientHeight=${body.clientHeight}` +
+                  (body.scrollHeight > body.clientHeight ? "  (scrolls)" : "  (fits)")
+            lines.push(
+              `${entry.label}  pane=${entry.pane.style.height} (border-box ${Math.round(entry.pane.getBoundingClientRect().height)}px)  ` +
+              `mode=${root ? root.dataset.mode : "?"}  ${box}\n    ${text}`
+            )
+          } catch (error) {
+            lines.push(`${entry.label}  (unreadable: ${error.message})`)
+          }
+        }
+        dump.textContent = lines.join("\n")
+        peekAt.textContent = new Date().toLocaleTimeString()
+      }
+
+      document.getElementById("peek").addEventListener("click", peek)
+
+      /*
+        Interaction self-check: nine assertions against the scroll model,
+        driving the frame's own DOM through the same-origin document.
+
+        Two things this cannot simulate, and does not try to:
+          - a synthetic `wheel` event does not produce scrolling in Chromium, so
+            the feel of the wheel/keyboard is a manual check; these assertions go
+            through `scrollTop` (setting it fires the real scroll event) and a
+            synthetic `wheel`/`scroll` to arm the idle return, then watch the
+            snap and the return.
+          - a background tab throttles the smooth animation; when this runs in
+            one, the animated-return check says so instead of failing.
+      */
+      const checkLine = document.getElementById("check")
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+      const frameOf = (id) => document.getElementById(id).contentWindow
+      const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches
+
+      /** Resizes are debounced on purpose, so wait for the effect, not a fixed delay. */
+      async function waitFor(predicate, ms) {
+        const until = Date.now() + ms
+        while (Date.now() < until) {
+          if (predicate()) return true
+          await wait(50)
+        }
+        return predicate()
+      }
+
+      const parts = (id) => {
+        const doc = frameOf(id).document
+        return { doc, body: doc.getElementById("body") }
+      }
+
+      /** Row starts inside the scroll container, as the section sees them. */
+      const startsOf = (body) => Array.from(body.children).map((node) => node.offsetTop)
+
+      async function selfTest() {
+        const lines = []
+        const say = (name, pass, detail) => lines.push(`  ${pass ? "PASS" : "FAIL"}  ${name}  ${detail}`)
+        const flush = () => { checkLine.textContent = lines.join("\n") }
+        checkLine.textContent = "  … 9 条滚动自检"
+        await wait(600)
+
+        // 1 · 15 rows: the elastic frame stops at the host's 320px cap and scrolls.
+        {
+          const { body } = parts("a1")
+          const rows = body.children.length
+          const scrolls = body.scrollHeight > body.clientHeight
+          const frame = registry.get(frameOf("a1")).pane.style.height
+          const capped = frame === "320px"
+          say("1 15 rows fill to the host cap and overflow", rows === 15 && scrolls && capped,
+              `rows=${rows} frame=${frame} scrollH=${body.scrollHeight} clientH=${body.clientHeight}`)
+          flush()
+        }
+
+        // 2 · 3 rows (one of them the fold): the elastic frame fits them; the
+        // last row is fully inside, not clipped.
+        {
+          const { body } = parts("b1")
+          const rows = body.children.length
+          const fits = body.scrollHeight <= body.clientHeight + 1
+          const last = body.children[rows - 1]
+          const inside = last.offsetTop + last.offsetHeight <= body.clientHeight + 1
+          say("2 3 rows fit and the last row is inside the frame", rows === 3 && fits && inside,
+              `rows=${rows} last=${last.offsetTop + last.offsetHeight} clientH=${body.clientHeight}`)
+          flush()
+        }
+
+        // 3 · empty list collapses to about a line.
+        {
+          const { body } = parts("c1")
+          const h = Math.round(body.getBoundingClientRect().height)
+          say("3 empty panel collapses to one line", h >= 24 && h <= 32, `body=${h}px`)
+          flush()
+        }
+
+        // 4 · a poll that changes a row does not move the reader.
+        {
+          const { body } = parts("a1")
+          const start = startsOf(body)[3]
+          body.scrollTop = start
+          await wait(300)          // let the snap settle so it is not what moves it
+          const settled = body.scrollTop
+          const before = body.children.length
+          const entry = registry.get(frameOf("a1"))
+          const changed = [...entry.data.todos]
+          changed[6] = { ...changed[6], content: "核对 status/main.js 的产物已经提交" }
+          entry.data = { ...entry.data, todos: changed, updatedAt: Date.now() }
+          const repainted = await waitFor(
+            () => (frameOf("a1").document.body.innerText || "").includes("产物已经提交"),
+            4000,
+          )
+          const after = body.scrollTop
+          say("4 a poll repaint keeps scrollTop", repainted && Math.abs(after - settled) <= 1,
+              `rows=${before}->${body.children.length} scrollTop ${settled}->${after}`)
+          flush()
+        }
+
+        // 5 · a rested scroll snaps to a row start.
+        //
+        // The call is captured, not just its effect: a hidden tab defers real
+        // scroll events and throttles the smooth animation, so the assertion is
+        // that the section computes the right row start and asks for it. Setting
+        // `scrollTop` moves the container for real (checks 4/6/7 read that back);
+        // the synthetic `scroll` just delivers the event a hidden frame withholds.
+        {
+          const { body } = parts("a1")
+          const win = frameOf("a1")
+          const starts = startsOf(body)
+          const target = starts[3]
+          const calls = []
+          const real = body.scrollTo.bind(body)
+          body.scrollTo = (opts) => { calls.push(opts); return real(opts) }
+          body.scrollTop = target + 11          // mid-row
+          body.dispatchEvent(new win.Event("scroll"))
+          await wait(600)                      // snap fires SNAP_QUIET_MS after the scroll
+          body.scrollTo = real
+          const call = calls.find((c) => c && typeof c.top === "number")
+          const aimed = call ? Math.abs(call.top - target) <= 1 : false
+          const detail = call
+            ? `scrollTo(top=${call.top}, ${call.behavior}) rowStart=${target}`
+            : "no scrollTo call"
+          say("5 a rested scroll snaps to a row start", aimed, detail)
+          flush()
+        }
+
+        // 6 · a scroll to the bottom rests at the bottom, not back up at the
+        // last row's top. This is the fix for "can't scroll to the last post".
+        {
+          const { body } = parts("a1")
+          const win = frameOf("a1")
+          const max = body.scrollHeight - body.clientHeight
+          const calls = []
+          const real = body.scrollTo.bind(body)
+          body.scrollTo = (opts) => { calls.push(opts); return real(opts) }
+          body.scrollTop = max
+          body.dispatchEvent(new win.Event("scroll"))
+          await wait(600)
+          body.scrollTo = real
+          const stayed = Math.abs(body.scrollTop - max) <= 1
+          const call = calls.find((c) => c && typeof c.top === "number")
+          const aimedAtBottom = call ? Math.abs(call.top - max) <= 1 : false
+          say("6 scrolling to the bottom stays there", stayed && (!call || aimedAtBottom),
+              `max=${max} landed=${body.scrollTop}` + (call ? ` scrollTo(top=${call.top})` : " (no snap)"))
+          flush()
+        }
+
+        // 7 · the elastic frame fits a list that used to be capped: seven rows
+        // ask for less than the host cap and do not scroll at all.
+        {
+          const { body } = parts("a1")
+          const entry = registry.get(frameOf("a1"))
+          const full = entry.data
+          entry.data = { ...full, todos: full.todos.slice(0, 7), updatedAt: Date.now() }
+          const grew = await waitFor(() => frameOf("a1").document.getElementById("body").children.length === 7, 4000)
+          await wait(400)
+          const b = frameOf("a1").document.getElementById("body")
+          const h = Math.round(b.getBoundingClientRect().height)
+          const fits = b.scrollHeight <= b.clientHeight + 1
+          say("7 seven rows fit without scrolling (elastic)", grew && fits && h < 320,
+              `rows=${b.children.length} body=${h}px scrollH=${b.scrollHeight} clientH=${b.clientHeight}`)
+          // Restore the full list for the checks that follow.
+          entry.data = full
+          await waitFor(() => frameOf("a1").document.getElementById("body").children.length === 15, 4000)
+          flush()
+        }
+
+        // 8 · the fold expands without moving the reader.
+        {
+          const { doc, body } = parts("b1")
+          body.scrollTop = 0
+          await wait(150)
+          const before = body.scrollTop
+          const openBefore = doc.querySelectorAll(".item").length
+          doc.querySelector(".fold").click()
+          await wait(400)
+          const openAfter = doc.querySelectorAll(".item").length
+          const after = body.scrollTop
+          say("8 expanding the fold keeps scrollTop", openAfter > openBefore && Math.abs(after - before) <= 1,
+              `items ${openBefore}->${openAfter} scrollTop ${before}->${after}`)
+          // Put it back so the panel looks as it did.
+          doc.querySelector(".fold").click()
+          flush()
+        }
+
+        // 9 · the readout the dump prints is the one that decides all of this.
+        {
+          const { body } = parts("a1")
+          const ok = Number.isFinite(body.scrollTop) && body.scrollHeight > 0 && body.clientHeight > 0
+          say("9 the readout (rows/scrollTop/scrollHeight/clientHeight) is live", ok,
+              `rows=${body.children.length} scrollTop=${body.scrollTop} scrollH=${body.scrollHeight} clientH=${body.clientHeight}`)
+          flush()
+        }
+      }
+
+      async function idleTest() {
+        const lines = [
+          `  … A: 只设 scrollTop（无手动信号）→ 10s 内不应回顶`,
+          `     B: 再发手动 wheel → 10s 后应回顶一次`,
+          `     C: 再等 10s → 不应反复触发`,
+        ]
+        checkLine.textContent = lines.join("\n")
+        const { body } = parts("a1")
+        const win = frameOf("a1")
+        const calls = []
+        const real = body.scrollTo.bind(body)
+        body.scrollTo = (opts) => { calls.push({ ...opts, at: Date.now() }); return real(opts) }
+        const topCalls = () => calls.filter((c) => c.top === 0).length
+
+        // A · a programmatic scroll with no manual signal must not arm the return.
+        body.scrollTop = startsOf(body)[3]
+        body.dispatchEvent(new win.Event("scroll"))
+        await wait(10800)
+        const aCalls = topCalls()
+
+        // B · a manual scroll signal arms it; exactly one return follows.
+        body.scrollTop = startsOf(body)[3]
+        body.dispatchEvent(new win.WheelEvent("wheel"))
+        await wait(10800)
+        const bCalls = topCalls()
+
+        // C · with no further input, it must not fire again.
+        await wait(10800)
+        const cCalls = topCalls()
+        body.scrollTo = real
+
+        lines.push(`  ${aCalls === 0 ? "PASS" : "FAIL"}  A 无手动信号不回位  回顶调用 ${aCalls} 次`)
+        lines.push(`  ${bCalls === 1 ? "PASS" : "FAIL"}  B 手动后回顶一次  累计 ${bCalls} 次`)
+        lines.push(`  ${cCalls === 1 ? "PASS" : "FAIL"}  C 之后不反复触发  累计 ${cCalls} 次（应仍为 1）`)
+        if (reduced || body.scrollTop <= 1) {
+          lines.push(`  PASS  回到顶部  scrollTop=${body.scrollTop}`)
+        } else {
+          lines.push(`  SKIP  回位动画  (页面非前台，平滑动画被节流；请切到前台重跑  scrollTop=${body.scrollTop})`)
+        }
+        checkLine.textContent = lines.join("\n")
+      }
+
+      document.getElementById("selftest").addEventListener("click", () => { void selfTest() })
+      document.getElementById("idletest").addEventListener("click", () => { void idleTest() })
     </script>
   </body>
 </html>

@@ -38,6 +38,38 @@ design.
   conversations and context compaction
 - A live checklist in the Work Status panel, per session
 
+## How the panel sizes itself
+
+The section tells OpenChamber the height its list needs (`host.setHeight`),
+inside the 24–320px the Work Status rail allows. It is not a fixed box:
+
+- **Empty and message states collapse to one line** instead of holding a 200px
+  box open for a sentence.
+- **The frame is elastic: it grows to fit every todo**, and only stops at the
+  host's 320px ceiling, past which the list scrolls. It measures the rows it is
+  about to show rather than estimating from a row count, because a row is only
+  approximately the same height as the next: the finished-group row is a control,
+  and a long task name wraps. Capping at a fixed row count used to clip a tall,
+  multi-line last row even when there was room to show it whole.
+- **Past 320px the list scrolls natively.** `overflow-y: auto` on the list, and
+  nothing else: the wheel, the keyboard, touch and the scrollbar all belong to
+  the browser. The section never intercepts them, so a short list never takes the
+  rail's own scrolling.
+- **A rested scroll snaps to a row boundary, or to the bottom.** The bottom is a
+  resting place in its own right, so the last row can be scrolled fully into view
+  instead of springing back up to that row's top.
+- **Height changes are debounced**: anything under 8px is not worth a resize,
+  and a burst of them coalesces over 150ms, so the panel does not twitch while
+  the agent works.
+- **Ten idle seconds after the reader's own scroll return the list to the top** —
+  where the in-progress item always sits — with a smooth scroll. Only real input
+  (wheel, touch, a scroll key, a drag on the bar) arms it, so a poll that
+  repaints the list, or the return's own animation, never re-arms it: the return
+  fires once and stops.
+
+The arithmetic lives in `src/viewport.js` — pure functions, no DOM, run under
+Node by `bun run test`.
+
 ## Install
 
 **One step.** Settings → Extensions → paste this URL → Add, and approve the
@@ -155,10 +187,13 @@ is already stored by then.
 ```
 opencode-plugin/         OpenCode plugin — restore tools + mirror to a file
 src/main.js              Extension source (the Work Status section)
+src/viewport.js          Height bounds and scroll arithmetic (pure functions, unit tested)
 src/plugin-install.js    Places the plugin into OpenCode's autodiscovery dir
 status/                  Built extension page (committed; OpenChamber never builds)
 scripts/build.ts         Bundles src/main.js to status/main.js as an IIFE
 scripts/validate.ts      Checks the manifest against the host's own schema
+scripts/test-plugin.mjs  Plugin behavior + the tool-description contract
+scripts/test-viewport.mjs  Height bounds, scroll clamping, snap target
 design/                  Design notes, candidate layouts, and the test harnesses
 ```
 
@@ -171,7 +206,7 @@ package over HTTP at runtime.
 ```bash
 bun install
 bun run validate   # manifest against @openchamber/sdk's parser
-bun run test       # plugin behavior + the tool-description contract
+bun run test       # plugin contract + height/scroll arithmetic
 bun run build      # src/main.js -> status/main.js (IIFE)
 ```
 
@@ -185,7 +220,11 @@ python3 -m http.server 8899    # from the repo root
 ```
 
 - `design/verify.html` renders the shipped section against a stub of the host
-  protocol, at 2×.
+  protocol, and drives it: the stub applies `resize` the way OpenChamber does
+  (it changes the wrapper's height and never reloads the frame), and the page
+  carries nine self-checks for the frame's fit and its 320px cap, a repaint that
+  keeps the reader's scroll, the snap (row start and bottom), the elastic fit,
+  the fold, and the idle return that fires once and never re-arms.
 - `design/plan-matrix.html` runs the install decision across every state —
   fresh, current, stale, partially written — and prints PASS/FAIL per case.
 

@@ -1335,6 +1335,34 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
 .oc-sdk-text a { color: ${primaryText}; text-decoration: underline; text-underline-offset: 2px; }
 .oc-sdk-text img { display: block; max-width: 100%; margin: 8px 0; border-radius: 8px; border: 1px solid ${mix(border, 60)}; }
 `;
+  // src/viewport.js
+  var MIN_H = 24;
+  var MAX_H = 320;
+  var clamp = (value, lo, hi) => {
+    const n = Number.isFinite(value) ? Math.round(value) : lo;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  var clampScroll = (value, max) => {
+    const top = Math.max(0, Number.isFinite(max) ? Math.floor(max) : 0);
+    const n = Number.isFinite(value) ? Math.round(value) : 0;
+    return Math.min(top, Math.max(0, n));
+  };
+  function nearestIndex(offset, starts) {
+    if (!Array.isArray(starts) || starts.length === 0)
+      return 0;
+    const value = Number.isFinite(offset) ? offset : 0;
+    let best = 0;
+    let bestDist = Infinity;
+    for (let i = 0;i < starts.length; i += 1) {
+      const dist = Math.abs(starts[i] - value);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    return best;
+  }
+
   // src/plugin-install.js
   var PLUGIN_ID = "openchamber-todo-bridge";
   var PLUGIN_DIR_PATH = `~/.config/opencode/plugins/${PLUGIN_ID}`;
@@ -1697,6 +1725,12 @@ export default {
   var POLL_MS = 2000;
   var REQUEST_TIMEOUT_MS = 3000;
   var BOOT_WATCHDOG_MS = 1600;
+  var MANIFEST_H = 56;
+  var UI_ONLY = false;
+  var IDLE_MS = 1e4;
+  var SNAP_QUIET_MS = 110;
+  var HEIGHT_DELTA = 8;
+  var HEIGHT_SETTLE_MS = 150;
   var STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
   var PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" };
   var PRIORITY_MARK = {
@@ -1714,6 +1748,11 @@ export default {
   var setupNote = "";
   var openFinished = false;
   var finishedFor = null;
+  var painted = [];
+  var lastHeight = MANIFEST_H;
+  var heightTimer = null;
+  var idleTimer = null;
+  var snapTimer = null;
   function file(sessionID2) {
     return `~/.config/openchamber/todos/${sessionID2}.json`;
   }
@@ -1766,47 +1805,171 @@ export default {
       box = '<span class="box"><span class="dash"></span></span>';
     return `<div class="item ${esc(todo.status)}">` + box + `<span class="txt">${esc(todo.content)}</span>${pri}</div>`;
   }
-  function paint(todos) {
-    const top = el2("top");
+  function buildRows(list) {
+    const open = order(list.filter((todo) => !isFinished(todo)));
+    const finished = list.filter(isFinished);
+    const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: todo.content, todo }));
+    if (finished.length) {
+      const expanded = openFinished && finishedFor === sessionID;
+      rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded });
+      if (expanded) {
+        for (const todo of finished) {
+          rows.push({ kind: "item", status: todo.status, key: todo.content, todo });
+        }
+      }
+    }
+    return rows;
+  }
+  function rowHtml(row) {
+    if (row.kind === "fold") {
+      return `<button class="fold" type="button" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`;
+    }
+    return itemHtml(row.todo);
+  }
+  var rowNodes = () => Array.from(el2("body").children);
+  function canScroll() {
     const body = el2("body");
+    return body.scrollHeight > body.clientHeight + 1;
+  }
+  var reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var smooth = () => reducedMotion() ? "auto" : "smooth";
+  function frameHeight(headerH) {
+    const rows = rowNodes();
+    if (rows.length === 0)
+      return MIN_H;
+    const last = rows[rows.length - 1];
+    const content = last.offsetTop + last.offsetHeight;
+    return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H);
+  }
+  function applyHeight(height) {
+    const wanted = clamp(height, MIN_H, MAX_H);
+    if (wanted === lastHeight)
+      return;
+    const first = lastHeight === MANIFEST_H;
+    if (!first && Math.abs(wanted - lastHeight) < HEIGHT_DELTA)
+      return;
+    clearTimeout(heightTimer);
+    heightTimer = setTimeout(() => {
+      heightTimer = null;
+      if (wanted === lastHeight)
+        return;
+      lastHeight = wanted;
+      try {
+        if (host)
+          host.setHeight(wanted).catch(() => {});
+      } catch {
+        lastHeight = MANIFEST_H;
+      }
+    }, first ? 0 : HEIGHT_SETTLE_MS);
+  }
+  function snap() {
+    snapTimer = null;
+    const body = el2("body");
+    const max = body.scrollHeight - body.clientHeight;
+    if (max <= 0)
+      return;
+    const here = body.scrollTop;
+    const starts = Array.from(body.children).map((node) => node.offsetTop);
+    const rowTarget = clampScroll(starts[nearestIndex(here, starts)], max);
+    const target = Math.max(0, max - here) < Math.abs(rowTarget - here) ? max : rowTarget;
+    if (Math.abs(target - here) < 1)
+      return;
+    body.scrollTo({ top: target, behavior: smooth() });
+  }
+  function returnToWork() {
+    idleTimer = null;
+    const body = el2("body");
+    if (body.scrollTop <= 1)
+      return;
+    body.scrollTo({ top: 0, behavior: smooth() });
+  }
+  function clearIdle() {
+    if (idleTimer === null)
+      return;
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  function armIdle() {
+    clearIdle();
+    if (!canScroll())
+      return;
+    idleTimer = setTimeout(returnToWork, IDLE_MS);
+  }
+  var SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+  function wireInput() {
+    const body = el2("body");
+    let pointerDown = false;
+    body.addEventListener("click", (event) => {
+      const fold = event.target instanceof Element ? event.target.closest(".fold") : null;
+      if (!fold)
+        return;
+      openFinished = !(openFinished && finishedFor === sessionID);
+      finishedFor = sessionID;
+      lastKey = "";
+      if (painted.length)
+        paint(painted);
+    });
+    body.addEventListener("scroll", () => {
+      if (pointerDown)
+        armIdle();
+      clearTimeout(snapTimer);
+      snapTimer = setTimeout(snap, SNAP_QUIET_MS);
+    }, { passive: true });
+    body.addEventListener("wheel", armIdle, { passive: true });
+    body.addEventListener("touchmove", armIdle, { passive: true });
+    body.addEventListener("keydown", (event) => {
+      if (SCROLL_KEYS.has(event.key))
+        armIdle();
+    });
+    body.addEventListener("pointerdown", () => {
+      pointerDown = true;
+    });
+    const releaseDrag = () => {
+      pointerDown = false;
+    };
+    window.addEventListener("pointerup", releaseDrag);
+    window.addEventListener("pointercancel", releaseDrag);
+    window.addEventListener("blur", releaseDrag);
+  }
+  function bodyPadding() {
+    const style = getComputedStyle(el2("body"));
+    return Math.round((parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0));
+  }
+  function paint(todos) {
     if (!todos.length) {
-      top.dataset.empty = "true";
-      body.innerHTML = '<div class="empty">No todos for this session.</div>';
+      paintPlain('<div class="empty">No todos for this session.</div>');
       return;
     }
+    painted = todos;
+    el2("root").dataset.mode = "work";
+    const top = el2("top");
     const done = todos.filter(isFinished).length;
-    const active2 = order(todos.filter((t) => !isFinished(t)));
-    const finished = todos.filter(isFinished);
     top.dataset.empty = "false";
     el2("count").textContent = `${done}/${todos.length}`;
     top.querySelector("#bar > i").style.width = `${Math.round(done / todos.length * 100)}%`;
-    let html = active2.map(itemHtml).join("");
-    if (finished.length) {
-      const expanded = openFinished && finishedFor === sessionID;
-      html += `<button id="fold" type="button" aria-expanded="${expanded}">` + `已完成 ${finished.length} 项</button>` + (expanded ? finished.map(itemHtml).join("") : "");
-    }
-    body.innerHTML = html;
-    const fold = el2("fold");
-    if (fold) {
-      fold.hidden = false;
-      fold.addEventListener("click", () => {
-        openFinished = !(openFinished && finishedFor === sessionID);
-        finishedFor = sessionID;
-        paint(todos);
-      });
-    }
+    el2("body").innerHTML = buildRows(todos).map(rowHtml).join("");
+    applyHeight(frameHeight(top.offsetHeight || 22));
+  }
+  function paintPlain(html) {
+    painted = [];
+    clearIdle();
+    clearTimeout(snapTimer);
+    snapTimer = null;
+    clearTimeout(heightTimer);
+    heightTimer = null;
+    el2("root").dataset.mode = "empty";
+    el2("top").dataset.empty = "true";
+    el2("body").innerHTML = html;
+    el2("body").scrollTop = 0;
+    applyHeight(Math.max(MIN_H, Math.round(el2("body").offsetHeight)));
   }
   function paintMessage(text) {
-    el2("top").dataset.empty = "true";
-    el2("body").innerHTML = `<div class="empty">${esc(text)}</div>`;
+    paintPlain(`<div class="empty">${esc(text)}</div>`);
   }
   function paintSetupNote(reason) {
-    const top = el2("top");
-    const body = el2("body");
-    top.dataset.empty = "true";
     const lead = reason === "write-failed" ? "Could not install the OpenCode plugin." : "OpenCode plugin installed.";
     const detail = reason === "write-failed" ? `The section stays empty until it is there. Install it by hand from <code>opencode-plugin/</code> in the repo.` : `Send any message in this session to start a fresh turn — it loads without a restart. Written to <code>${esc(PLUGIN_DIR_PATH)}</code>.`;
-    body.innerHTML = `<div class="empty"><b>${lead}</b><br>${detail}</div>`;
+    paintPlain(`<div class="empty"><b>${lead}</b><br>${detail}</div>`);
   }
   async function refresh() {
     if (!host)
@@ -1895,6 +2058,7 @@ export default {
       paintMessage(error && error.code === "HOST_UNAVAILABLE" ? "Open this inside OpenChamber to see todos." : "Could not connect to OpenChamber.");
       return;
     }
+    wireInput();
     host.onReady((ctx) => {
       if (!booted) {
         booted = true;
@@ -1908,7 +2072,7 @@ export default {
         openFinished = false;
         finishedFor = null;
       }
-      if (!installChecked) {
+      if (!installChecked && !UI_ONLY) {
         installChecked = true;
         ensureInstalled(host).then((outcome) => {
           if (outcome.ok && outcome.reason === "current")

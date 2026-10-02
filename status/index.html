@@ -66,8 +66,34 @@
       }
       #top[data-empty="true"] { display: none; }
 
-      /* ---- list ---- */
-      #body { flex: 1 1 auto; overflow-y: auto; padding: 0 8px 6px; }
+      /* ---- list ----
+        The frame is elastic: sized to its content by the section itself
+        (`setHeight`), up to the host's 320px ceiling. Past that the body is an
+        ordinary scroll container: the native scrollbar and native wheel/key
+        handling, no paging.
+
+        `min-height: 0` is what lets a column flex child actually scroll — with
+        the default `min-height: auto` the body grows to its content and the
+        overflow never triggers. `scrollbar-gutter: stable` keeps the text
+        column the same width whether or not the bar is there, so a bar
+        appearing cannot re-wrap a row and change the height that caused it.
+
+        In `empty` mode the body is content-sized instead, which is how the
+        section measures its own empty/message state — no list, no scrolling.
+      */
+      #body {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        position: relative;
+        scrollbar-gutter: stable;
+        padding: 0 8px 6px;
+      }
+      #root[data-mode="empty"] #body {
+        flex: 0 0 auto;
+        min-height: auto;
+        overflow: visible;
+      }
 
       .item {
         display: flex;
@@ -149,8 +175,13 @@
       /* The pair should read as one mark, not two separate characters. */
       .pri.high { letter-spacing: -1px; }
 
-      /* ---- finished group toggle ---- */
-      #fold {
+      /* ---- finished group toggle ----
+        Rendered as the last row of the open list: one line box with the same
+        padding as a task row, plus a 4px gap above it. That 4px, and the fold
+        being a control rather than a line of text, is exactly why the frame is
+        measured from the rendered rows instead of trusting `rows x rowH`.
+      */
+      .fold {
         display: block;
         width: 100%;
         margin: 4px 0 0;
@@ -164,25 +195,24 @@
         text-align: left;
         cursor: pointer;
       }
-      #fold:hover { background: var(--t-hover); }
-      #fold::before {
+      .fold:hover { background: var(--t-hover); }
+      .fold::before {
         display: inline-block;
         width: 8px;
         content: "▸";
       }
-      #fold[aria-expanded="true"]::before { content: "▾"; }
-      #fold[hidden] { display: none; }
+      .fold[aria-expanded="true"]::before { content: "▾"; }
 
       .empty { color: var(--t-muted); padding: 2px 0; }
     </style>
   </head>
   <body>
-    <div id="root">
+    <div id="root" data-mode="empty">
       <div id="top" data-empty="true">
         <span id="count"></span>
         <div id="bar"><i></i></div>
       </div>
-      <div id="body"><div class="empty">Loading…</div></div>
+      <div id="body" tabindex="0"><div class="empty">Loading…</div></div>
     </div>
     <script src="main.js"></script>
   </body>

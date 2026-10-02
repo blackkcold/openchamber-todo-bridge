@@ -1,6 +1,6 @@
 {
   "name": "openchamber-todo-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -19,7 +19,7 @@
       "statusSection": {
         "entry": "status/index.html",
         "title": "Todos",
-        "height": 200
+        "height": 56
       },
       "filesystem": [
         "~/.config/openchamber/todos/*.json",
@@ -29,8 +29,9 @@
   },
   "scripts": {
     "build": "bun run scripts/build.ts",
+    "test-extension": "bun run scripts/build-test-extension.ts",
     "validate": "bun run scripts/validate.ts",
-    "test": "node scripts/test-plugin.mjs"
+    "test": "node scripts/test-plugin.mjs && node scripts/test-viewport.mjs"
   },
   "devDependencies": {
     "@openchamber/sdk": "^2.0.4"

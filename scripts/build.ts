@@ -25,6 +25,7 @@ const result = await Bun.build({
   define: {
     __TODO_BRIDGE_PLUGIN_SOURCE__: JSON.stringify(pluginSource),
     __TODO_BRIDGE_PLUGIN_PACKAGE__: JSON.stringify(pluginPackage),
+    __TODO_BRIDGE_UI_ONLY__: "false",
   },
 })
 
