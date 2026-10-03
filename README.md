@@ -76,7 +76,7 @@ Node by `bun run test`.
 permissions it asks for. That is the whole install.
 
 ```
-https://github.com/blackkcold/openchamber-todo-bridge#v0.4.1
+https://github.com/blackkcold/openchamber-todo-bridge#v0.4.2
 ```
 
 The extension then places the OpenCode plugin itself, into the directory
@@ -101,10 +101,10 @@ makes the edit unnecessary.
 
 ### Pinning a version
 
-Add `#v0.4.1` to the URL to follow a tag instead of the default branch:
+Add `#v0.4.2` to the URL to follow a tag instead of the default branch:
 
 ```
-https://github.com/blackkcold/openchamber-todo-bridge#v0.4.1
+https://github.com/blackkcold/openchamber-todo-bridge#v0.4.2
 ```
 
 Pinning means no automatic updates: an update follows the ref you installed, so

@@ -28,6 +28,9 @@
         --t-warning: var(--oc-warning, #bc5215);
         --t-error: var(--oc-error, #af3029);
         --t-hover: var(--oc-hover, rgba(0, 0, 0, .035));
+        --t-motion-fast: 160ms;
+        --t-motion-row: 220ms;
+        --t-motion-ease: cubic-bezier(.22, 1, .36, 1);
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; height: 100%; }
@@ -59,10 +62,12 @@
       #bar > i {
         display: block;
         height: 100%;
-        width: 0;
+        width: 100%;
         border-radius: 999px;
         background: var(--t-success);
-        transition: width 200ms ease-out;
+        transform: scaleX(0);
+        transform-origin: left center;
+        transition: transform 200ms var(--t-motion-ease);
       }
       #top[data-empty="true"] { display: none; }
 
@@ -101,6 +106,7 @@
         align-items: flex-start;
         padding: 3px 2px;
         border-radius: 5px;
+        transition: transform var(--t-motion-row) var(--t-motion-ease), opacity var(--t-motion-fast) ease-out;
       }
       .box {
         flex: 0 0 auto;
@@ -109,8 +115,14 @@
         border: 1.5px solid var(--t-border);
         border-radius: 4px;
         display: flex; align-items: center; justify-content: center;
+        transition: border-color var(--t-motion-fast) ease-out, background-color var(--t-motion-fast) ease-out;
       }
-      .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+      .txt {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-wrap: anywhere;
+        transition: color var(--t-motion-fast) ease-out;
+      }
 
       /* in progress */
       .item.in_progress .txt { font-weight: 600; }
@@ -133,6 +145,12 @@
         border-left: 1.5px solid var(--t-success);
         border-bottom: 1.5px solid var(--t-success);
         transform: rotate(-45deg) translateY(-1px);
+        transform-origin: center;
+      }
+      .item.just-completed .tick { animation: todo-tick-in 180ms var(--t-motion-ease) both; }
+      @keyframes todo-tick-in {
+        from { opacity: 0; transform: rotate(-45deg) translateY(-1px) scale(.45); }
+        to { opacity: 1; transform: rotate(-45deg) translateY(-1px) scale(1); }
       }
       .item.cancelled .dash { width: 6px; height: 1.5px; background: var(--t-muted); }
 
@@ -194,16 +212,23 @@
         font-size: 11px;
         text-align: left;
         cursor: pointer;
+        transition: transform var(--t-motion-row) var(--t-motion-ease);
       }
       .fold:hover { background: var(--t-hover); }
       .fold::before {
         display: inline-block;
         width: 8px;
         content: "▸";
+        transform-origin: center;
+        transition: transform var(--t-motion-fast) var(--t-motion-ease);
       }
-      .fold[aria-expanded="true"]::before { content: "▾"; }
+      .fold[aria-expanded="true"]::before { transform: rotate(90deg); }
 
       .empty { color: var(--t-muted); padding: 2px 0; }
+      @media (prefers-reduced-motion: reduce) {
+        #bar > i, .item, .item .box, .item .txt, .fold, .fold::before { transition: none; }
+        .item.just-completed .tick { animation: none; }
+      }
     </style>
   </head>
   <body>

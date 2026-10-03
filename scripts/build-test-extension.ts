@@ -35,6 +35,7 @@ const STATUS_DIR = `${OUT_DIR}/status`
 
 const pkg = JSON.parse(await readFile("package.json", "utf8"))
 const statusHeight = pkg.openchamber?.contributes?.statusSection?.height ?? 56
+const buildStamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", ".").replace("Z", "")
 
 // --- build the UI-only bundle -------------------------------------------------
 await rm(OUT_DIR, { recursive: true, force: true })
@@ -64,7 +65,7 @@ await cp("status/index.html", `${STATUS_DIR}/index.html`)
 // --- the test manifest --------------------------------------------------------
 const manifest = {
   name: "openchamber-todo-bridge-test",
-  version: `${pkg.version}-test`,
+  version: `${pkg.version}-test.${buildStamp}`,
   private: true,
   type: "module",
   description:

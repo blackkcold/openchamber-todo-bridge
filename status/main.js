@@ -1665,7 +1665,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -1725,6 +1725,8 @@ export default {
   var POLL_MS = 2000;
   var REQUEST_TIMEOUT_MS = 3000;
   var BOOT_WATCHDOG_MS = 1600;
+  var ROW_ENTER_MS = 180;
+  var MOTION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)";
   var MANIFEST_H = 56;
   var UI_ONLY = false;
   var IDLE_MS = 1e4;
@@ -1743,6 +1745,7 @@ export default {
   var sessionID = null;
   var timer = null;
   var lastKey = "";
+  var refreshSequence = 0;
   var booted = false;
   var installChecked = false;
   var setupNote = "";
@@ -1793,28 +1796,37 @@ export default {
       return ra === rb ? a.index - b.index : ra - rb;
     }).map((entry) => entry.todo);
   }
-  function itemHtml(todo) {
+  function statusMarkHtml(status) {
+    if (status === "completed")
+      return '<span class="tick"></span>';
+    if (status === "in_progress")
+      return '<span class="dot"></span>';
+    if (status === "cancelled")
+      return '<span class="dash"></span>';
+    return "";
+  }
+  function itemHtml(todo, key) {
     const mark = PRIORITY_MARK[todo.priority] || "";
     const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : "";
-    let box = '<span class="box"></span>';
-    if (todo.status === "completed")
-      box = '<span class="box"><span class="tick"></span></span>';
-    else if (todo.status === "in_progress")
-      box = '<span class="box"><span class="dot"></span></span>';
-    else if (todo.status === "cancelled")
-      box = '<span class="box"><span class="dash"></span></span>';
-    return `<div class="item ${esc(todo.status)}">` + box + `<span class="txt">${esc(todo.content)}</span>${pri}</div>`;
+    return `<div class="item ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}">` + `<span class="box">${statusMarkHtml(todo.status)}</span>` + `<span class="txt">${esc(todo.content)}</span>${pri}</div>`;
   }
   function buildRows(list) {
+    const occurrences = new Map;
+    const keyByTodo = new Map;
+    for (const todo of list) {
+      const occurrence = occurrences.get(todo.content) || 0;
+      occurrences.set(todo.content, occurrence + 1);
+      keyByTodo.set(todo, `item:${JSON.stringify([todo.content, occurrence])}`);
+    }
     const open = order(list.filter((todo) => !isFinished(todo)));
     const finished = list.filter(isFinished);
-    const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: todo.content, todo }));
+    const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo }));
     if (finished.length) {
       const expanded = openFinished && finishedFor === sessionID;
       rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded });
       if (expanded) {
         for (const todo of finished) {
-          rows.push({ kind: "item", status: todo.status, key: todo.content, todo });
+          rows.push({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo });
         }
       }
     }
@@ -1822,9 +1834,123 @@ export default {
   }
   function rowHtml(row) {
     if (row.kind === "fold") {
-      return `<button class="fold" type="button" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`;
+      return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`;
     }
-    return itemHtml(row.todo);
+    return itemHtml(row.todo, row.key);
+  }
+  function createRowNode(row) {
+    const template = document.createElement("template");
+    template.innerHTML = rowHtml(row);
+    return template.content.firstElementChild;
+  }
+  function updateRowNode(node, row) {
+    if (row.kind === "fold") {
+      const expanded = String(row.expanded);
+      if (node.getAttribute("aria-expanded") !== expanded)
+        node.setAttribute("aria-expanded", expanded);
+      const count = String(row.count);
+      if (node.dataset.count !== count) {
+        node.dataset.count = count;
+        node.textContent = `已完成 ${row.count} 项`;
+      }
+      return;
+    }
+    const todo = row.todo;
+    const previousStatus = node.dataset.status;
+    if (node.dataset.rowKey !== row.key)
+      node.dataset.rowKey = row.key;
+    if (previousStatus !== todo.status) {
+      node.dataset.status = todo.status;
+      node.className = `item ${todo.status}`;
+    }
+    const text = node.querySelector(".txt");
+    if (text.textContent !== todo.content)
+      text.textContent = todo.content;
+    if (previousStatus !== todo.status) {
+      const box = node.querySelector(".box");
+      box.innerHTML = statusMarkHtml(todo.status);
+      if (todo.status === "completed" && !reducedMotion()) {
+        const tick = box.querySelector(".tick");
+        if (tick) {
+          node.classList.add("just-completed");
+          tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+        }
+      }
+    }
+    const mark = PRIORITY_MARK[todo.priority] || "";
+    let priority = node.querySelector(".pri");
+    if (!mark) {
+      priority?.remove();
+    } else {
+      if (!priority) {
+        priority = document.createElement("span");
+        node.append(priority);
+      }
+      const className = `pri ${PRIORITY_CLASS[todo.priority] || ""}`;
+      if (priority.className !== className)
+        priority.className = className;
+      if (priority.textContent !== mark)
+        priority.textContent = mark;
+    }
+  }
+  function reconcileRows(rows) {
+    const body = el2("body");
+    const previous = Array.from(body.children);
+    const byKey = new Map(previous.map((node) => [node.dataset.rowKey, node]));
+    const firstTops = new Map(previous.map((node) => [node, node.getBoundingClientRect().top]));
+    const used = new Set;
+    const entering = [];
+    let cursor = body.firstElementChild;
+    for (const row of rows) {
+      let node = byKey.get(row.key);
+      if (node) {
+        updateRowNode(node, row);
+      } else {
+        node = createRowNode(row);
+        entering.push(node);
+      }
+      used.add(node);
+      if (node !== cursor)
+        body.insertBefore(node, cursor);
+      else
+        cursor = cursor.nextElementSibling;
+    }
+    for (const node of previous) {
+      if (!used.has(node))
+        node.remove();
+    }
+    animateRows(body, firstTops, entering, previous.some((node) => node.dataset.rowKey));
+  }
+  function animateRows(body, firstTops, entering, hadRows) {
+    if (reducedMotion())
+      return;
+    const moved = [];
+    for (const [node, firstTop] of firstTops) {
+      if (!node.isConnected)
+        continue;
+      const deltaY = firstTop - node.getBoundingClientRect().top;
+      if (Math.abs(deltaY) < 1)
+        continue;
+      node.style.transition = "none";
+      node.style.transform = `translateY(${deltaY}px)`;
+      moved.push(node);
+    }
+    if (moved.length) {
+      body.offsetHeight;
+      requestAnimationFrame(() => {
+        for (const node of moved) {
+          node.style.transition = "";
+          node.style.transform = "";
+        }
+      });
+    }
+    if (hadRows && entering.length > 0 && entering.length <= 3) {
+      for (const node of entering) {
+        if (typeof node.animate !== "function")
+          continue;
+        node.animate([{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "translateY(0)" }], { duration: ROW_ENTER_MS, easing: MOTION_EASING });
+      }
+    }
   }
   var rowNodes = () => Array.from(el2("body").children);
   function canScroll() {
@@ -1946,8 +2072,8 @@ export default {
     const done = todos.filter(isFinished).length;
     top.dataset.empty = "false";
     el2("count").textContent = `${done}/${todos.length}`;
-    top.querySelector("#bar > i").style.width = `${Math.round(done / todos.length * 100)}%`;
-    el2("body").innerHTML = buildRows(todos).map(rowHtml).join("");
+    top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`;
+    reconcileRows(buildRows(todos));
     applyHeight(frameHeight(top.offsetHeight || 22));
   }
   function paintPlain(html) {
@@ -1975,14 +2101,20 @@ export default {
     if (!host)
       return;
     if (!sessionID) {
+      refreshSequence += 1;
       paintMessage("No session.");
       return;
     }
+    const sequence = ++refreshSequence;
+    const requestedSessionID = sessionID;
+    const isCurrent = () => sequence === refreshSequence && requestedSessionID === sessionID;
     let content;
     try {
-      const result = await host.readFile(file(sessionID));
+      const result = await host.readFile(file(requestedSessionID));
       content = result && result.content;
     } catch (error) {
+      if (!isCurrent())
+        return;
       const code = error && error.code;
       if (code === "NOT_GRANTED") {
         paintMessage("This section was not allowed to read the todo file.");
@@ -2006,12 +2138,14 @@ export default {
       paintMessage(code === "NOT_FOUND" ? "No todos for this session." : "Could not read todos.");
       return;
     }
+    if (!isCurrent())
+      return;
     const todos = parse(content);
     if (todos === null) {
       paintMessage("Todo list is not valid JSON.");
       return;
     }
-    const key = sessionID + "\x00" + (content || "") + "\x00" + String(openFinished);
+    const key = JSON.stringify([requestedSessionID, todos, openFinished]);
     if (key === lastKey)
       return;
     lastKey = key;
@@ -2025,6 +2159,7 @@ export default {
     }, POLL_MS);
   }
   function stop() {
+    refreshSequence += 1;
     if (timer === null)
       return;
     clearInterval(timer);

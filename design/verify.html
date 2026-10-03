@@ -94,6 +94,10 @@
     </p>
     <pre class="cap" id="check">—</pre>
 
+    <h2>渲染连续性自检（4 条）</h2>
+    <p class="cap"><button id="rendertest" type="button">跑渲染自检</button></p>
+    <pre class="cap" id="renderCheck">—</pre>
+
     <script>
       const CHANNEL = "openchamber.sdk"
       const V = 1
@@ -217,8 +221,21 @@
                      payload: { content } })
             return
           }
-          answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
-                   payload: { content: JSON.stringify(entry.data) } })
+          entry.todoReads += 1
+          const failure = entry.todoReadError
+          entry.todoReadError = null
+          if (failure) {
+            answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false,
+                     code: failure.code, error: failure.error || "stub: read failed" })
+            return
+          }
+          const content = JSON.stringify(entry.data)
+          const delay = entry.todoReadDelay || 0
+          entry.todoReadDelay = 0
+          const reply = () => answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true,
+                                       payload: { content } })
+          if (delay > 0) setTimeout(reply, delay)
+          else reply()
           return
         }
         if (msg.type === "file-write") {
@@ -257,6 +274,9 @@
           iframe,
           tokens,
           data,
+          todoReads: 0,
+          todoReadDelay: 0,
+          todoReadError: null,
           elastic,
           stalePlugin,
           label: id,
@@ -346,6 +366,100 @@
       const parts = (id) => {
         const doc = frameOf(id).document
         return { doc, body: doc.getElementById("body") }
+      }
+
+      async function refreshNow(entry) {
+        const before = entry.todoReads
+        const requested = await waitFor(() => entry.todoReads > before, 2500)
+        if (requested) await wait(80)
+        return requested
+      }
+
+      async function renderTest() {
+        const output = document.getElementById("renderCheck")
+        const lines = []
+        const say = (name, pass, detail) => lines.push(`  ${pass ? "PASS" : "FAIL"}  ${name}  ${detail}`)
+        output.textContent = "  … 4 条渲染连续性自检"
+
+        const entry = registry.get(frameOf("a1"))
+        const { body } = parts("a1")
+        const original = entry.data
+        const originalNodes = Array.from(body.children)
+
+        // A write can change updatedAt without changing the rendered todo state.
+        entry.data = { ...original, updatedAt: Date.now() + 1000 }
+        const read = await refreshNow(entry)
+        const afterMetadata = Array.from(body.children)
+        say("updatedAt-only refresh retains rendered rows",
+          read && originalNodes.length === afterMetadata.length &&
+            originalNodes.every((node, index) => node === afterMetadata[index]),
+          `rows=${originalNodes.length}->${afterMetadata.length}`)
+
+        // Re-ranking one item must move its existing row, not replace the list.
+        const movedContent = original.todos[0].content
+        const movedRow = Array.from(body.children).find(
+          (node) => node.querySelector(".txt")?.textContent === movedContent,
+        )
+        const stableContent = original.todos[2].content
+        const stableRow = Array.from(body.children).find(
+          (node) => node.querySelector(".txt")?.textContent === stableContent,
+        )
+        const changedTodos = original.todos.map((todo, index) => {
+          if (index === 0) return { ...todo, status: "pending" }
+          if (index === 1) return { ...todo, status: "in_progress" }
+          return todo
+        })
+        entry.data = { ...original, todos: changedTodos, updatedAt: Date.now() + 2000 }
+        const updated = await refreshNow(entry)
+        const afterStatus = Array.from(body.children)
+        const movedAfter = afterStatus.find(
+          (node) => node.querySelector(".txt")?.textContent === movedContent,
+        )
+        const stableAfter = afterStatus.find(
+          (node) => node.querySelector(".txt")?.textContent === stableContent,
+        )
+        const movedFrom = afterStatus.indexOf(movedAfter)
+        say("status re-rank retains and moves matching rows",
+          updated && movedAfter === movedRow && movedFrom > 0 && stableAfter === stableRow,
+          `moved row index=${movedFrom}; unchanged row retained=${stableAfter === stableRow}`)
+
+        // A slow older poll must not paint over a newer response.
+        const staleMarker = "迟到的旧响应"
+        const freshMarker = "较新的响应"
+        const readsBeforeSlow = entry.todoReads
+        entry.todoReadDelay = 2800
+        entry.data = {
+          ...original,
+          todos: [{ ...original.todos[0], content: staleMarker }],
+          updatedAt: Date.now() + 3000,
+        }
+        const slowStarted = await waitFor(() => entry.todoReads > readsBeforeSlow, 2500)
+        const firstRead = entry.todoReads
+        entry.data = {
+          ...original,
+          todos: [{ ...original.todos[0], content: freshMarker }],
+          updatedAt: Date.now() + 4000,
+        }
+        const fastStarted = await waitFor(() => entry.todoReads > firstRead, 2500)
+        const freshPainted = await waitFor(() => body.textContent.includes(freshMarker), 500)
+        await wait(1000)
+        const stalePainted = body.textContent.includes(staleMarker)
+        say("late poll cannot overwrite newer data",
+          slowStarted && fastStarted && freshPainted && !stalePainted,
+          `new shown=${freshPainted}; stale shown=${stalePainted}`)
+
+        const readsBeforeError = entry.todoReads
+        entry.todoReadError = { code: "NOT_FOUND", error: "temporary test failure" }
+        const errorRead = await waitFor(() => entry.todoReads > readsBeforeError, 2500)
+        const errorShown = await waitFor(() => body.textContent.includes("No todos for this session."), 500)
+        entry.todoReadDelay = 0
+        entry.data = original
+        const recoveryRead = await refreshNow(entry)
+        const recovered = body.querySelector(".item")?.textContent.includes(original.todos[0].content) || false
+        say("same data returns after a temporary read error",
+          errorRead && errorShown && recoveryRead && recovered,
+          `error shown=${errorShown}; list restored=${recovered}`)
+        output.textContent = lines.join("\n")
       }
 
       /** Row starts inside the scroll container, as the section sees them. */
@@ -568,6 +682,7 @@
 
       document.getElementById("selftest").addEventListener("click", () => { void selfTest() })
       document.getElementById("idletest").addEventListener("click", () => { void idleTest() })
+      document.getElementById("rendertest").addEventListener("click", () => { void renderTest() })
     </script>
   </body>
 </html>
