@@ -98,6 +98,16 @@
     <p class="cap"><button id="rendertest" type="button">跑渲染自检</button></p>
     <pre class="cap" id="renderCheck">—</pre>
 
+    <h2>动画时序自检</h2>
+    <div class="wrap">
+      <div class="col">
+        <p class="cap"><b>独立动画样例</b> — 折叠、完成、新任务与会话切换</p>
+        <div class="pane" id="paneE" style="height: 56px"><iframe id="e1"></iframe></div>
+      </div>
+    </div>
+    <p class="cap"><button id="animationtest" type="button">跑动画自检</button></p>
+    <pre class="cap" id="animationCheck">—</pre>
+
     <script>
       const CHANNEL = "openchamber.sdk"
       const V = 1
@@ -140,6 +150,17 @@
 
       const NONE = { sessionID: "ses_demo", updatedAt: Date.now(), todos: [] }
 
+      const ANIMATION_INITIAL = {
+        sessionID: "ses_anim",
+        updatedAt: Date.now(),
+        todos: [
+          { content: "进行中的任务", status: "in_progress" },
+          { content: "待完成任务", status: "pending" },
+          { content: "已有完成任务 A", status: "completed" },
+          { content: "已有完成任务 B", status: "completed" },
+        ],
+      }
+
       const LIGHT = {
         fg: "#100f0f", muted: "#6f6e69", border: "#dad8ce", primary: "#205ea6",
         success: "#66800b", warning: "#bc5215", error: "#af3029", hover: "rgba(0,0,0,.035)",
@@ -149,7 +170,7 @@
         success: "#879a39", warning: "#da702c", error: "#d14d41", hover: "rgba(255,255,255,.05)",
       }
 
-      function readyPayload(c) {
+      function readyPayload(c, sessionID = "ses_demo") {
         return {
           theme: {
             mode: c === DARK ? "dark" : "light",
@@ -166,7 +187,7 @@
               mono: "ui-monospace, monospace", radius: "9px",
             },
           },
-          session: { id: "ses_demo", title: "demo", busy: false },
+          session: { id: sessionID, title: "demo", busy: false },
           directory: null,
           surface: "status",
           item: null,
@@ -206,7 +227,7 @@
         const answer = (payload) => entry.iframe.contentWindow.postMessage(payload, "*")
 
         if (msg.type === "hello") {
-          answer({ channel: CHANNEL, v: V, type: "ready", payload: readyPayload(entry.tokens) })
+          answer({ channel: CHANNEL, v: V, type: "ready", payload: readyPayload(entry.tokens, entry.data.sessionID) })
           return
         }
         if (msg.type === "file-read") {
@@ -282,6 +303,7 @@
           label: id,
           pane: iframe.parentElement,
           meter: meterId ? document.getElementById(meterId) : null,
+          sessionID: data.sessionID,
         })
         iframe.src = "/status/index.html"
       }
@@ -299,6 +321,7 @@
           mount("b1", DARK, FEW, "mB", true)
           mount("c1", LIGHT, NONE, "mC", true)
           mount("d1", LIGHT, FEW, null, false, true)   // stale plugin: exercises the notice path
+          mount("e1", LIGHT, ANIMATION_INITIAL, null, true)
           // What each frame actually rendered: same-origin, so the harness can
           // read it back instead of guessing from the outside.
           setTimeout(peek, 2500)
@@ -683,6 +706,207 @@
       document.getElementById("selftest").addEventListener("click", () => { void selfTest() })
       document.getElementById("idletest").addEventListener("click", () => { void idleTest() })
       document.getElementById("rendertest").addEventListener("click", () => { void renderTest() })
+
+      async function animationTest() {
+        const output = document.getElementById("animationCheck")
+        const lines = []
+        const say = (name, pass, detail) => lines.push(`  ${pass ? "PASS" : "FAIL"}  ${name}  ${detail}`)
+        const flush = () => { output.textContent = lines.join("\n") }
+        output.textContent = "  … 动画时序自检"
+        const entry = registry.get(frameOf("e1"))
+        const { doc, body } = parts("e1")
+        let nonce = 0
+        const copy = (data) => ({
+          ...data,
+          todos: data.todos.map((todo) => ({ ...todo })),
+          updatedAt: Date.now() + ++nonce,
+        })
+        const update = async (data) => {
+          entry.data = copy(data)
+          entry.sessionID = entry.data.sessionID
+          const before = entry.todoReads
+          entry.iframe.contentWindow.postMessage({
+            channel: CHANNEL,
+            v: V,
+            type: "ready",
+            payload: readyPayload(entry.tokens, entry.sessionID),
+          }, "*")
+          const requested = await waitFor(() => entry.todoReads > before, 2500)
+          if (requested) await wait(80)
+          return requested
+        }
+        const rowFor = (content) => Array.from(body.querySelectorAll(".item"))
+          .find((node) => node.querySelector(".txt")?.textContent === content)
+        const hasHeightAnimation = (node) => node.getAnimations().some((animation) =>
+          animation.effect?.getKeyframes().some((frame) => "height" in frame),
+        )
+        const reducedMotion = frameOf("e1").matchMedia("(prefers-reduced-motion: reduce)").matches
+
+        await waitFor(() => body.querySelector(".fold"), 2500)
+        const initialChars = doc.querySelectorAll(".type-char").length
+        say("首轮加载不打字", initialChars === 0, `字符片段=${initialChars}`)
+
+        if (reducedMotion) {
+          doc.querySelector(".fold")?.click()
+          const expandedRows = Array.from(body.querySelectorAll(".item.completed"))
+          say("减少动态效果：展开直接到最终态", expandedRows.length === 2 &&
+            expandedRows.every((node) => node.getAnimations().length === 0),
+            `完成行=${expandedRows.length}`)
+          doc.querySelector(".fold")?.click()
+          say("减少动态效果：折叠不保留退场行",
+            !body.querySelector(".item.completed") && !doc.querySelector(".completion-ghost"),
+            `完成行=${body.querySelectorAll(".item.completed").length}`)
+
+          const reducedCompletion = copy(ANIMATION_INITIAL)
+          reducedCompletion.todos[1].status = "completed"
+          await update(reducedCompletion)
+          const reducedFoldText = doc.querySelector(".fold")?.textContent || ""
+          say("减少动态效果：完成不等待且不造副本",
+            !rowFor("待完成任务") && reducedFoldText.includes("已完成 3 项") &&
+              !doc.querySelector(".completion-ghost"),
+            `${reducedFoldText}; 副本=${Boolean(doc.querySelector(".completion-ghost"))}`)
+
+          const reducedNew = copy(reducedCompletion)
+          reducedNew.todos.push({ content: "减少动态效果下的新任务", status: "pending" })
+          await update(reducedNew)
+          const reducedNewRow = rowFor("减少动态效果下的新任务")
+          say("减少动态效果：新任务不逐字动画",
+            Boolean(reducedNewRow) && !reducedNewRow.querySelector(".type-char"),
+            `行=${Boolean(reducedNewRow)} 字符片段=${reducedNewRow?.querySelectorAll(".type-char").length || 0}`)
+          say("减少动态效果：当前列表没有活动动画",
+            body.getAnimations({ subtree: true }).length === 0,
+            `活动动画=${body.getAnimations({ subtree: true }).length}`)
+          flush()
+          return
+        }
+
+        // Expanding old completed items must animate their row height; collapsing
+        // keeps the rows in layout until the exit animation settles.
+        doc.querySelector(".fold")?.click()
+        await wait(40)
+        let doneRows = Array.from(body.querySelectorAll(".item.completed"))
+        const entersWithHeight = doneRows.length === 2 && doneRows.every(hasHeightAnimation)
+        say("展开旧任务有高度过渡", entersWithHeight, `完成行=${doneRows.length}`)
+        await wait(280)
+        const exitingRows = Array.from(body.querySelectorAll(".item.completed"))
+        doc.querySelector(".fold")?.click()
+        const exitsInPlace = exitingRows.length === 2 && exitingRows.every((node) =>
+          node.isConnected && hasHeightAnimation(node),
+        )
+        say("折叠时完成行先留在 DOM 做退场", exitsInPlace,
+          `仍连接=${exitingRows.filter((node) => node.isConnected).length}/${exitingRows.length}`)
+        await wait(300)
+        say("折叠动画结束后移除完成行", !body.querySelector(".item.completed"),
+          `完成行=${body.querySelectorAll(".item.completed").length}`)
+        flush()
+
+        // A collapsed completion first draws the strike-through, then flies a
+        // decorative clone to the summary without making it accessible content.
+        const collapsedRow = rowFor("待完成任务")
+        const collapsedData = copy(ANIMATION_INITIAL)
+        collapsedData.todos[1].status = "completed"
+        await update(collapsedData)
+        await wait(35)
+        const marking = collapsedRow?.isConnected && collapsedRow.classList.contains("completion-marking")
+        say("折叠完成先保留原行划线", marking,
+          `保留=${Boolean(collapsedRow?.isConnected)} 阶段=${collapsedRow?.dataset.completionPhase || "无"}`)
+        await wait(190)
+        const ghost = doc.querySelector(".completion-ghost")
+        const ghostIsDecorative = ghost?.getAttribute("aria-hidden") === "true" &&
+          ghost?.getAnimations().length > 0
+        say("折叠完成用 aria-hidden 副本飞向汇总行", Boolean(ghostIsDecorative),
+          `副本=${Boolean(ghost)} aria-hidden=${ghost?.getAttribute("aria-hidden") || "无"}`)
+        await wait(300)
+        const foldText = doc.querySelector(".fold")?.textContent || ""
+        say("折叠完成后汇总数更新且无残留副本",
+          foldText.includes("已完成 3 项") && !doc.querySelector(".completion-ghost") && !rowFor("待完成任务"),
+          `${foldText}; 副本=${Boolean(doc.querySelector(".completion-ghost"))}`)
+        flush()
+
+        // In the expanded list the same row waits through the strike, then FLIPs
+        // to the end of the completed group.
+        await update(ANIMATION_INITIAL)
+        doc.querySelector(".fold")?.click()
+        await wait(280)
+        const movingRow = rowFor("待完成任务")
+        const expandedData = copy(ANIMATION_INITIAL)
+        expandedData.todos[1].status = "completed"
+        await update(expandedData)
+        await wait(35)
+        const staged = movingRow?.isConnected && movingRow.classList.contains("completion-marking")
+        say("展开完成先划线再移动", staged,
+          `保留=${Boolean(movingRow?.isConnected)} 阶段=${movingRow?.dataset.completionPhase || "无"}`)
+        await waitFor(() => movingRow?.dataset.status === "completed", 600)
+        doneRows = Array.from(body.querySelectorAll(".item.completed"))
+        const reusedAtEnd = movingRow?.isConnected && doneRows.at(-1) === movingRow
+        say("展开完成复用原行并移到末尾", reusedAtEnd,
+          `复用=${Boolean(movingRow?.isConnected)} 末行=${doneRows.at(-1)?.querySelector(".txt")?.textContent || "无"}`)
+        flush()
+
+        // A same-session addition gets per-character spans while the whole label
+        // remains accessible and retains its complete layout from the first frame.
+        const newContent = "同会话新增任务"
+        const withNew = copy(expandedData)
+        withNew.todos.push({ content: newContent, status: "pending" })
+        await update(withNew)
+        const newRow = rowFor(newContent)
+        const newText = newRow?.querySelector(".txt")
+        const charCount = newText?.querySelectorAll(".type-char").length || 0
+        const accessibleWholeText = newText?.getAttribute("aria-label") === newContent &&
+          Array.from(newText.querySelectorAll(".type-char")).every((char) => char.getAttribute("aria-hidden") === "true")
+        const fullLayout = newText?.textContent === newContent && newText.getBoundingClientRect().height > 0
+        say("同会话新增任务逐字显示且保留完整布局/读屏文本",
+          charCount === Array.from(newContent).length && accessibleWholeText && fullLayout,
+          `字符=${charCount} aria-label=${newText?.getAttribute("aria-label") || "无"} 高=${newText?.getBoundingClientRect().height || 0}`)
+
+        const existingRow = rowFor("进行中的任务")
+        const stateChange = copy(withNew)
+        stateChange.todos[0].status = "pending"
+        await update(stateChange)
+        const existingAfter = rowFor("进行中的任务")
+        say("已有任务状态变化不触发打字", existingAfter === existingRow &&
+          !existingAfter?.querySelector(".type-char"),
+          `复用=${existingAfter === existingRow} 字符片段=${existingAfter?.querySelectorAll(".type-char").length || 0}`)
+        flush()
+
+        const switched = {
+          sessionID: "ses_anim_next",
+          todos: [{ content: "新会话首轮任务", status: "pending" }],
+        }
+        await update(switched)
+        const switchedRow = rowFor("新会话首轮任务")
+        say("切换会话后首轮不播放旧动画", Boolean(switchedRow) &&
+          !switchedRow?.querySelector(".type-char") && !doc.querySelector(".completion-ghost"),
+          `新会话行=${Boolean(switchedRow)} 打字片段=${switchedRow?.querySelectorAll(".type-char").length || 0}`)
+        flush()
+
+        const completingNow = {
+          sessionID: switched.sessionID,
+          todos: [{ content: "新会话首轮任务", status: "completed" }],
+        }
+        await update(completingNow)
+        await wait(35)
+        const staleStrikeStarted = rowFor("新会话首轮任务")?.classList.contains("completion-marking")
+        const latest = {
+          sessionID: switched.sessionID,
+          todos: [
+            { content: "新会话首轮任务", status: "pending" },
+            { content: "动画期间到达的新任务", status: "pending" },
+          ],
+        }
+        await update(latest)
+        await wait(240)
+        const latestRow = rowFor("新会话首轮任务")
+        const latestSettled = latestRow?.dataset.status === "pending" &&
+          Boolean(rowFor("动画期间到达的新任务")) &&
+          !doc.querySelector(".completion-ghost") &&
+          !doc.querySelector(".completion-marking")
+        say("新数据取消旧动画并落到最新状态", Boolean(staleStrikeStarted) && latestSettled,
+          `划线曾启动=${Boolean(staleStrikeStarted)} 最新状态=${latestRow?.dataset.status || "缺行"} 副本=${Boolean(doc.querySelector(".completion-ghost"))}`)
+        flush()
+      }
+
+      document.getElementById("animationtest").addEventListener("click", () => { void animationTest() })
     </script>
   </body>
 </html>
