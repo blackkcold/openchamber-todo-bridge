@@ -55,6 +55,10 @@ const POLL_MS = 2000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
 const ROW_ENTER_MS = 180
+const ROW_TOGGLE_MS = 220
+const COMPLETION_STRIKE_MS = 180
+const COMPLETION_FLIGHT_MS = 220
+const TYPEWRITER_STEP_MS = 14
 const MOTION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)"
 /** The height in `package.json`. The first paint is exempt from the delta gate. */
 const MANIFEST_H = 56
@@ -96,6 +100,16 @@ let setupNote = ""
 /** Reader's choice, kept per session so a re-render does not collapse it back. */
 let openFinished = false
 let finishedFor = null
+let observedTaskSession = null
+let previousTaskKeys = new Set()
+const pendingTypewriterKeys = new Set()
+const completedAtEnd = new Map()
+let completionSequence = 0
+let motionEpoch = 0
+const completionTransitions = new Map()
+const exitingRows = new Set()
+const completionGhosts = new Set()
+let suppressAnimationsForNextPaint = true
 
 // ---- height and scroll state ----
 /** The list as last painted, so a fold click can relayout without a file read. */
@@ -162,14 +176,30 @@ function statusMarkHtml(status) {
   return ""
 }
 
-function itemHtml(todo, key) {
+function textHtml(content, typing) {
+  if (!typing) return `<span class="txt">${esc(content)}</span>`
+
+  const segmenter = typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null
+  const characters = segmenter
+    ? Array.from(segmenter.segment(content), (part) => part.segment)
+    : Array.from(content)
+  const chars = characters.map((character, index) =>
+    `<span class="type-char" aria-hidden="true" style="--type-delay:${Math.min(index * TYPEWRITER_STEP_MS, 2200)}ms">${esc(character)}</span>`,
+  ).join("")
+
+  return `<span class="txt typewriter" role="text" aria-label="${esc(content)}">${chars}</span>`
+}
+
+function itemHtml(todo, key, typing = false) {
   const mark = PRIORITY_MARK[todo.priority] || ""
   const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : ""
 
   return (
     `<div class="item ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}">` +
     `<span class="box">${statusMarkHtml(todo.status)}</span>` +
-    `<span class="txt">${esc(todo.content)}</span>${pri}</div>`
+    `${textHtml(todo.content, typing)}${pri}</div>`
   )
 }
 
@@ -184,7 +214,14 @@ function buildRows(list) {
   }
 
   const open = order(list.filter((todo) => !isFinished(todo)))
-  const finished = list.filter(isFinished)
+  const finished = list.filter(isFinished).sort((a, b) => {
+    const aOrder = completedAtEnd.get(keyByTodo.get(a))
+    const bOrder = completedAtEnd.get(keyByTodo.get(b))
+    if (aOrder === undefined && bOrder === undefined) return 0
+    if (aOrder === undefined) return -1
+    if (bOrder === undefined) return 1
+    return aOrder - bOrder
+  })
   const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo }))
 
   if (finished.length) {
@@ -200,20 +237,20 @@ function buildRows(list) {
   return rows
 }
 
-function rowHtml(row) {
+function rowHtml(row, typing = false) {
   if (row.kind === "fold") {
     return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`
   }
-  return itemHtml(row.todo, row.key)
+  return itemHtml(row.todo, row.key, typing)
 }
 
-function createRowNode(row) {
+function createRowNode(row, typing = false) {
   const template = document.createElement("template")
-  template.innerHTML = rowHtml(row)
+  template.innerHTML = rowHtml(row, typing)
   return template.content.firstElementChild
 }
 
-function updateRowNode(node, row) {
+function updateRowNode(node, row, animateStatus = true) {
   if (row.kind === "fold") {
     const expanded = String(row.expanded)
     if (node.getAttribute("aria-expanded") !== expanded) node.setAttribute("aria-expanded", expanded)
@@ -231,6 +268,7 @@ function updateRowNode(node, row) {
   if (previousStatus !== todo.status) {
     node.dataset.status = todo.status
     node.className = `item ${todo.status}`
+    node.removeAttribute("data-completion-phase")
   }
   const text = node.querySelector(".txt")
   if (text.textContent !== todo.content) text.textContent = todo.content
@@ -238,7 +276,7 @@ function updateRowNode(node, row) {
   if (previousStatus !== todo.status) {
     const box = node.querySelector(".box")
     box.innerHTML = statusMarkHtml(todo.status)
-    if (todo.status === "completed" && !reducedMotion()) {
+    if (animateStatus && todo.status === "completed" && !reducedMotion()) {
       const tick = box.querySelector(".tick")
       if (tick) {
         node.classList.add("just-completed")
@@ -262,75 +300,288 @@ function updateRowNode(node, row) {
   }
 }
 
-function reconcileRows(rows) {
+function taskKeys(list) {
+  const occurrences = new Map()
+  return new Set(list.map((todo) => {
+    const occurrence = occurrences.get(todo.content) || 0
+    occurrences.set(todo.content, occurrence + 1)
+    return `item:${JSON.stringify([todo.content, occurrence])}`
+  }))
+}
+
+function rememberTaskKeys(list) {
+  const current = taskKeys(list)
+  if (observedTaskSession === sessionID) {
+    for (const key of current) {
+      if (!previousTaskKeys.has(key)) pendingTypewriterKeys.add(key)
+    }
+  } else {
+    pendingTypewriterKeys.clear()
+  }
+  for (const key of pendingTypewriterKeys) {
+    if (!current.has(key)) pendingTypewriterKeys.delete(key)
+  }
+  for (const key of completedAtEnd.keys()) {
+    if (!current.has(key)) completedAtEnd.delete(key)
+  }
+  previousTaskKeys = current
+  observedTaskSession = sessionID
+  return pendingTypewriterKeys
+}
+
+function cancelRowAnimations() {
+  motionEpoch += 1
   const body = el("body")
-  const previous = Array.from(body.children)
-  const byKey = new Map(previous.map((node) => [node.dataset.rowKey, node]))
+  for (const animation of body.getAnimations({ subtree: true })) animation.cancel()
+  for (const node of body.querySelectorAll(".just-completed")) node.classList.remove("just-completed")
+
+  for (const { node, row } of completionTransitions.values()) {
+    completedAtEnd.set(row.key, ++completionSequence)
+    node.querySelector(".strike-sweep")?.remove()
+    node.classList.remove("completion-marking")
+    node.removeAttribute("data-completion-phase")
+    if (node.isConnected) updateRowNode(node, row, false)
+  }
+  completionTransitions.clear()
+
+  for (const node of exitingRows) {
+    node.classList.remove("row-exiting")
+    node.removeAttribute("data-exiting")
+  }
+  exitingRows.clear()
+
+  for (const ghost of completionGhosts) ghost.remove()
+  completionGhosts.clear()
+}
+
+function animateRow(node, from, to, duration, onFinish) {
+  const epoch = motionEpoch
+  const animation = node.animate([from, to], {
+    duration,
+    easing: MOTION_EASING,
+    fill: "both",
+  })
+  animation.finished.then(() => {
+    animation.cancel()
+    if (epoch === motionEpoch && onFinish) onFinish()
+  }, () => {})
+  return animation
+}
+
+function animateRowEnter(node) {
+  const height = node.getBoundingClientRect().height
+  const style = getComputedStyle(node)
+  animateRow(node,
+    { height: "0px", opacity: 0, transform: "translateY(-4px)", paddingTop: "0px", paddingBottom: "0px", overflow: "hidden" },
+    { height: `${height}px`, opacity: 1, transform: "translateY(0)", paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, overflow: "hidden" },
+    ROW_TOGGLE_MS,
+  )
+}
+
+function animateRowExit(node, epoch) {
+  const height = node.getBoundingClientRect().height
+  const style = getComputedStyle(node)
+  node.classList.add("row-exiting")
+  node.dataset.exiting = "true"
+  exitingRows.add(node)
+  const animation = node.animate([
+    { height: `${height}px`, opacity: 1, transform: "translateY(0)", paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, overflow: "hidden" },
+    { height: "0px", opacity: 0, transform: "translateY(-4px)", paddingTop: "0px", paddingBottom: "0px", overflow: "hidden" },
+  ], { duration: ROW_TOGGLE_MS, easing: MOTION_EASING, fill: "both" })
+  animation.finished.then(() => {
+    animation.cancel()
+    if (epoch !== motionEpoch) return
+    exitingRows.delete(node)
+    node.remove()
+    if (exitingRows.size === 0) applyListHeight(true)
+  }, () => {})
+}
+
+function completionGhost(body, source, row) {
+  const sourceRect = source.getBoundingClientRect()
+  const bodyRect = body.getBoundingClientRect()
+  const ghost = source.cloneNode(true)
+  updateRowNode(ghost, row, false)
+  ghost.classList.add("completion-ghost")
+  ghost.removeAttribute("data-row-key")
+  ghost.dataset.motionOnly = "true"
+  ghost.setAttribute("aria-hidden", "true")
+  ghost.inert = true
+  ghost.style.position = "absolute"
+  ghost.style.left = `${sourceRect.left - bodyRect.left + body.scrollLeft}px`
+  ghost.style.top = `${sourceRect.top - bodyRect.top + body.scrollTop}px`
+  ghost.style.width = `${sourceRect.width}px`
+  ghost.style.height = `${sourceRect.height}px`
+  ghost.style.margin = "0"
+  ghost.style.zIndex = "2"
+  ghost.style.pointerEvents = "none"
+  body.append(ghost)
+  completionGhosts.add(ghost)
+  return { ghost, sourceRect }
+}
+
+function animateCompletionGhosts(body, ghosts) {
+  const fold = Array.from(body.children).find((node) => node.dataset.rowKey === "fold")
+  if (!fold) {
+    for (const { ghost } of ghosts) {
+      completionGhosts.delete(ghost)
+      ghost.remove()
+    }
+    return
+  }
+
+  const target = fold.getBoundingClientRect()
+  for (const { ghost, sourceRect } of ghosts) {
+    const deltaX = target.left - sourceRect.left
+    const deltaY = target.top - sourceRect.top
+    animateRow(ghost,
+      { transform: "translate(0, 0) scale(1)", opacity: 1 },
+      { transform: `translate(${deltaX}px, ${deltaY}px) scale(.82)`, opacity: 0 },
+      COMPLETION_FLIGHT_MS,
+      () => {
+        completionGhosts.delete(ghost)
+        ghost.remove()
+      },
+    )
+  }
+}
+
+function finishCompletionTransitions(entries, animateStructure) {
+  const epoch = motionEpoch
+  const animations = entries.map(({ node, row }) => {
+    completionTransitions.set(row.key, { node, row })
+    node.classList.add("completion-marking")
+    node.dataset.completionPhase = "strike"
+    const sweep = document.createElement("span")
+    sweep.className = "strike-sweep"
+    sweep.setAttribute("aria-hidden", "true")
+    node.querySelector(".txt").append(sweep)
+    return sweep.animate(
+      [{ transform: "scaleX(0)" }, { transform: "scaleX(1)" }],
+      { duration: COMPLETION_STRIKE_MS, easing: "linear", fill: "both" },
+    )
+  })
+
+  Promise.all(animations.map((animation) => animation.finished.catch(() => null))).then(() => {
+    for (const animation of animations) animation.cancel()
+    if (epoch !== motionEpoch) return
+
+    for (const { node, row } of entries) {
+      completedAtEnd.set(row.key, ++completionSequence)
+      completionTransitions.delete(row.key)
+      node.querySelector(".strike-sweep")?.remove()
+      node.classList.remove("completion-marking")
+      node.removeAttribute("data-completion-phase")
+    }
+
+    const foldCollapsed = !(openFinished && finishedFor === sessionID)
+    const ghostRows = foldCollapsed
+      ? new Map(entries.map(({ row }) => [row.key, row]))
+      : new Map()
+    const result = reconcileRows(buildRows(painted), {
+      animate: animateStructure,
+      newTaskKeys: pendingTypewriterKeys,
+      skipCompletionDetection: true,
+      ghostRows,
+    })
+    applyListHeight(result.entering.length > 0)
+  })
+}
+
+function reconcileRows(rows, options = {}) {
+  const body = el("body")
+  const animate = options.animate !== false && !reducedMotion()
+  const previous = Array.from(body.children).filter((node) => node.dataset.motionOnly !== "true")
+  const byKey = new Map(previous.filter((node) => node.dataset.rowKey).map((node) => [node.dataset.rowKey, node]))
+
+  if (animate && !options.skipCompletionDetection) {
+    const occurrences = new Map()
+    const completing = painted
+      .filter((todo) => todo.status === "completed")
+      .map((todo) => {
+        const occurrence = occurrences.get(todo.content) || 0
+        occurrences.set(todo.content, occurrence + 1)
+        const row = { kind: "item", status: todo.status, key: `item:${JSON.stringify([todo.content, occurrence])}`, todo }
+        return { node: byKey.get(row.key), row }
+      })
+      .filter(({ node }) => node && node.dataset.status !== "completed")
+    if (completing.length) {
+      finishCompletionTransitions(completing, animate)
+      return { staged: true, entering: [] }
+    }
+  }
+
   const firstTops = new Map(previous.map((node) => [node, node.getBoundingClientRect().top]))
   const used = new Set()
   const entering = []
   let cursor = body.firstElementChild
+  while (cursor && cursor.dataset.motionOnly === "true") cursor = cursor.nextElementSibling
 
   for (const row of rows) {
     let node = byKey.get(row.key)
     if (node) {
       updateRowNode(node, row)
     } else {
-      node = createRowNode(row)
+      const isNewTask = row.kind === "item" && options.newTaskKeys?.has(row.key)
+      node = createRowNode(row, isNewTask && animate)
+      if (isNewTask) pendingTypewriterKeys.delete(row.key)
       entering.push(node)
     }
     used.add(node)
 
     if (node !== cursor) body.insertBefore(node, cursor)
     else cursor = cursor.nextElementSibling
+    while (cursor && cursor.dataset.motionOnly === "true") cursor = cursor.nextElementSibling
   }
 
+  const ghosts = []
+  const epoch = motionEpoch
   for (const node of previous) {
-    if (!used.has(node)) node.remove()
+    if (used.has(node)) continue
+    const ghostRow = options.ghostRows?.get(node.dataset.rowKey)
+    if (ghostRow) {
+      ghosts.push(completionGhost(body, node, ghostRow))
+      node.remove()
+    } else if (animate) {
+      animateRowExit(node, epoch)
+    } else {
+      node.remove()
+    }
   }
 
-  animateRows(body, firstTops, entering, previous.some((node) => node.dataset.rowKey))
+  if (ghosts.length) animateCompletionGhosts(body, ghosts)
+  animateRows(body, firstTops, entering, previous.some((node) => node.dataset.rowKey), used, animate)
+  return { staged: false, entering }
 }
 
-function animateRows(body, firstTops, entering, hadRows) {
-  if (reducedMotion()) return
+function animateRows(body, firstTops, entering, hadRows, used, animate) {
+  if (!animate || reducedMotion()) return
 
-  const moved = []
   for (const [node, firstTop] of firstTops) {
-    if (!node.isConnected) continue
+    if (!used.has(node) || !node.isConnected) continue
     const deltaY = firstTop - node.getBoundingClientRect().top
     if (Math.abs(deltaY) < 1) continue
-    node.style.transition = "none"
-    node.style.transform = `translateY(${deltaY}px)`
-    moved.push(node)
+    animateRow(node,
+      { transform: `translateY(${deltaY}px)` },
+      { transform: "translateY(0)" },
+      ROW_ENTER_MS,
+    )
   }
 
-  if (moved.length) {
-    // Read once after the batched writes so the inverse positions take effect
-    // before transitioning back to the new layout.
-    void body.offsetHeight
+  if (hadRows && entering.length > 0) {
+    const epoch = motionEpoch
     requestAnimationFrame(() => {
-      for (const node of moved) {
-        node.style.transition = ""
-        node.style.transform = ""
+      if (epoch !== motionEpoch || reducedMotion()) return
+      for (const node of entering) {
+        if (node.isConnected) animateRowEnter(node)
       }
     })
-  }
-
-  // A newly opened large finished group should not cascade row after row.
-  if (hadRows && entering.length > 0 && entering.length <= 3) {
-    for (const node of entering) {
-      if (typeof node.animate !== "function") continue
-      node.animate(
-        [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "translateY(0)" }],
-        { duration: ROW_ENTER_MS, easing: MOTION_EASING },
-      )
-    }
   }
 }
 
 /** The rows currently in the list — the scroll container's own children. */
 const rowNodes = () => Array.from(el("body").children)
+  .filter((node) => node.dataset.motionOnly !== "true")
 
 /** Whether the list is taller than the space the frame gives it. */
 function canScroll() {
@@ -373,7 +624,7 @@ function frameHeight(headerH) {
  * frame still carries the manifest's height then, and holding an 8px gate would
  * leave it visibly wrong for as long as the gate holds.
  */
-function applyHeight(height) {
+function applyHeight(height, immediate = false) {
   const wanted = clamp(height, MIN_H, MAX_H)
   if (wanted === lastHeight) return
 
@@ -393,7 +644,12 @@ function applyHeight(height) {
     } catch {
       lastHeight = MANIFEST_H
     }
-  }, first ? 0 : HEIGHT_SETTLE_MS)
+  }, first || immediate ? 0 : HEIGHT_SETTLE_MS)
+}
+
+function applyListHeight(immediate = false) {
+  const top = el("top")
+  applyHeight(frameHeight(top.offsetHeight || 22), immediate)
 }
 
 /**
@@ -415,7 +671,7 @@ function snap() {
   const max = body.scrollHeight - body.clientHeight
   if (max <= 0) return
   const here = body.scrollTop
-  const starts = Array.from(body.children).map((node) => node.offsetTop)
+  const starts = rowNodes().map((node) => node.offsetTop)
   const rowTarget = clampScroll(starts[nearestIndex(here, starts)], max)
   const target = Math.max(0, max - here) < Math.abs(rowTarget - here) ? max : rowTarget
   if (Math.abs(target - here) < 1) return
@@ -515,12 +771,17 @@ function bodyPadding() {
 }
 
 function paint(todos) {
+  cancelRowAnimations()
   if (!todos.length) {
+    rememberTaskKeys(todos)
     paintPlain('<div class="empty">No todos for this session.</div>')
     return
   }
 
   painted = todos
+  const newTaskKeys = rememberTaskKeys(todos)
+  const animate = !suppressAnimationsForNextPaint
+  suppressAnimationsForNextPaint = false
   el("root").dataset.mode = "work"
 
   const top = el("top")
@@ -529,8 +790,8 @@ function paint(todos) {
   el("count").textContent = `${done}/${todos.length}`
   top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`
 
-  reconcileRows(buildRows(todos))
-  applyHeight(frameHeight(top.offsetHeight || 22))
+  const result = reconcileRows(buildRows(todos), { animate, newTaskKeys })
+  if (!result.staged) applyListHeight(result.entering.length > 0)
 }
 
 /**
@@ -541,6 +802,7 @@ function paint(todos) {
  * there is no list and no scroll to feed back into the measurement.
  */
 function paintPlain(html) {
+  cancelRowAnimations()
   painted = []
   clearIdle()
   clearTimeout(snapTimer)
@@ -700,10 +962,17 @@ function boot() {
 
     const next = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     if (next !== sessionID) {
+      cancelRowAnimations()
       sessionID = next
       lastKey = ""
       openFinished = false
       finishedFor = null
+      observedTaskSession = null
+      previousTaskKeys.clear()
+      pendingTypewriterKeys.clear()
+      completedAtEnd.clear()
+      completionSequence = 0
+      suppressAnimationsForNextPaint = true
     }
 
     // Place the OpenCode plugin if this run is the first one, then render.
@@ -735,7 +1004,20 @@ function boot() {
     start()
   })
 
-  host.onSession(() => {
+  host.onSession((session) => {
+    const next = session && typeof session.id === "string" ? session.id : null
+    if (next !== sessionID) {
+      cancelRowAnimations()
+      sessionID = next
+      openFinished = false
+      finishedFor = null
+      observedTaskSession = null
+      previousTaskKeys.clear()
+      pendingTypewriterKeys.clear()
+      completedAtEnd.clear()
+      completionSequence = 0
+      suppressAnimationsForNextPaint = true
+    }
     lastKey = ""
     void refresh()
   })
