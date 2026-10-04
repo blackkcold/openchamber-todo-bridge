@@ -20,7 +20,7 @@ Send a message in an OpenCode session to start using the todo tools.
 
 ### Install a specific version
 
-Append a release tag to the URL, for example `#v0.4.3`. Pinned versions do not update automatically.
+Append a release tag to the URL, for example `#v0.4.3`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
 
 ```text
 https://github.com/blackkcold/openchamber-todo-bridge#v0.4.3
@@ -56,6 +56,17 @@ bun run build
 ```
 
 The built extension in `status/` is committed because OpenChamber installs it without building.
+
+### Releasing
+
+OpenChamber checks a git install by fetching the ref in its URL — the default branch when the URL has none — and reading `package.json` there. A release therefore has to reach `main`, not just a tag:
+
+1. Bump `version` in `package.json` and `opencode-plugin/package.json`.
+2. Run `bun run build` and commit the rebuilt `status/main.js`.
+3. Merge to `main`, tag `vX.Y.Z` on `main`, and push the branch, `main`, and the tag.
+4. Create the GitHub Release.
+
+A tag that lives only on a side branch leaves `main` on the old version, and unpinned installs never see the update.
 
 ## License
 
