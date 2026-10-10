@@ -798,6 +798,8 @@
         await wait(300)
         say("折叠动画结束后移除完成行", !body.querySelector(".item.completed"),
           `完成行=${body.querySelectorAll(".item.completed").length}`)
+        say("无残留退场标记", !body.querySelector(".row-exiting") && !doc.querySelector("[data-exiting]"),
+          `残留=${body.querySelectorAll(".row-exiting").length}`)
         flush()
 
         // A collapsed completion first draws the strike-through, then flies a
@@ -816,6 +818,13 @@
           ghost?.getAnimations().length > 0
         say("折叠完成用 aria-hidden 副本飞向汇总行", Boolean(ghostIsDecorative),
           `副本=${Boolean(ghost)} aria-hidden=${ghost?.getAttribute("aria-hidden") || "无"}`)
+        // Cloned nodes restart CSS animations; the ghost must carry no per-char
+        // spans, or its text re-types from opacity 0 and arrives incomplete.
+        const ghostText = ghost?.querySelector(".txt") || null
+        say("飞行副本不带逐字片段且文字完整",
+          Boolean(ghost) && ghost.querySelectorAll(".type-char").length === 0 &&
+            ghostText?.textContent === "待完成任务",
+          `片段=${ghost?.querySelectorAll(".type-char").length || 0} 文本="${ghostText?.textContent || "无"}"`)
         await wait(300)
         const foldText = doc.querySelector(".fold")?.textContent || ""
         say("折叠完成后汇总数更新且无残留副本",
@@ -867,6 +876,18 @@
         say("已有任务状态变化不触发打字", existingAfter === existingRow &&
           !existingAfter?.querySelector(".type-char"),
           `复用=${existingAfter === existingRow} 字符片段=${existingAfter?.querySelectorAll(".type-char").length || 0}`)
+        flush()
+
+        // The typewriter must not outlive its animation: after a repaint the
+        // typed row collapses to plain text, so the frozen-fill bug (characters
+        // stuck at opacity 0 mid-row) has nothing left to freeze.
+        const newAfter = rowFor(newContent)
+        const newAfterText = newAfter?.querySelector(".txt") || null
+        say("刷新后打字行收敛为纯文本且无缺字",
+          Boolean(newAfter) && newAfter.querySelectorAll(".type-char").length === 0 &&
+            newAfterText?.classList.contains("typewriter") === false &&
+            newAfterText?.textContent === newContent,
+          `片段=${newAfter?.querySelectorAll(".type-char").length || 0} 文本完整=${newAfterText?.textContent === newContent}`)
         flush()
 
         const switched = {

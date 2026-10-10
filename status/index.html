@@ -30,7 +30,15 @@
         --t-hover: var(--oc-hover, rgba(0, 0, 0, .035));
         --t-motion-fast: 160ms;
         --t-motion-row: 220ms;
-        --t-motion-ease: cubic-bezier(.22, 1, .36, 1);
+        /*
+          Springs sampled from a damped harmonic (the same curve src/main.js uses
+          for WAAPI), so CSS transitions and JS animations share one physics:
+          travel eases ~9% overshoot, the tick/absorb pulse ~20%. `linear()` is
+          supported from Chrome 113; older hosts fall back to a plain linear ramp,
+          which still animates, just without the bounce.
+        */
+        --t-motion-spring: linear(0, 0.03 3.1%, 0.106 6.3%, 0.211 9.4%, 0.333 12.5%, 0.459 15.6%, 0.582 18.8%, 0.695 21.9%, 0.795 25%, 0.88 28.1%, 0.949 31.3%, 1.002 34.4%, 1.041 37.5%, 1.067 40.6%, 1.082 43.8%, 1.089 46.9%, 1.088 50%, 1.083 53.1%, 1.075 56.3%, 1.065 59.4%, 1.053 62.5%, 1.042 65.6%, 1.032 68.8%, 1.022 71.9%, 1.014 75%, 1.007 78.1%, 1.002 81.3%, 0.998 84.4%, 0.995 87.5%, 0.993 90.6%, 0.992 93.8%, 0.992 96.9%, 0.992 100%);
+        --t-motion-spring-snappy: linear(0, 0.038 3.1%, 0.137 6.3%, 0.275 9.4%, 0.434 12.5%, 0.597 15.6%, 0.752 18.8%, 0.889 21.9%, 1.002 25%, 1.089 28.1%, 1.15 31.3%, 1.185 34.4%, 1.199 37.5%, 1.196 40.6%, 1.179 43.8%, 1.153 46.9%, 1.122 50%, 1.089 53.1%, 1.057 56.3%, 1.029 59.4%, 1.005 62.5%, 0.986 65.6%, 0.973 68.8%, 0.964 71.9%, 0.96 75%, 0.96 78.1%, 0.963 81.3%, 0.968 84.4%, 0.974 87.5%, 0.98 90.6%, 0.987 93.8%, 0.993 96.9%, 0.998 100%);
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; height: 100%; }
@@ -58,6 +66,7 @@
         border-radius: 999px;
         background: var(--t-border);
         overflow: hidden;
+        position: relative;
       }
       #bar > i {
         display: block;
@@ -67,7 +76,23 @@
         background: var(--t-success);
         transform: scaleX(0);
         transform-origin: left center;
-        transition: transform 200ms var(--t-motion-ease);
+        transition: transform 260ms var(--t-motion-spring, linear);
+      }
+      /* All done: one light sweep across the bar, replayed only when the state
+         changes (data-full toggles, not repaints). */
+      #bar::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, .65) 50%, transparent 80%);
+        transform: translateX(-120%);
+        pointer-events: none;
+      }
+      #bar[data-full="true"]::after { animation: todo-bar-shine 700ms ease-out 180ms both; }
+      @keyframes todo-bar-shine {
+        from { transform: translateX(-120%); }
+        to { transform: translateX(120%); }
       }
       #top[data-empty="true"] { display: none; }
 
@@ -106,7 +131,7 @@
         align-items: flex-start;
         padding: 3px 2px;
         border-radius: 5px;
-        transition: transform var(--t-motion-row) var(--t-motion-ease), opacity var(--t-motion-fast) ease-out;
+        transition: transform var(--t-motion-row) var(--t-motion-spring, linear), opacity var(--t-motion-fast) ease-out;
       }
       .box {
         flex: 0 0 auto;
@@ -151,6 +176,11 @@
       .item.in_progress .dot {
         width: 5px; height: 5px; border-radius: 999px;
         background: var(--t-primary);
+        animation: todo-dot-breathe 2200ms ease-in-out infinite;
+      }
+      @keyframes todo-dot-breathe {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.45); }
       }
 
       /* finished (completed + cancelled) */
@@ -168,7 +198,7 @@
         transform: rotate(-45deg) translateY(-1px);
         transform-origin: center;
       }
-      .item.just-completed .tick { animation: todo-tick-in 180ms var(--t-motion-ease) both; }
+      .item.just-completed .tick { animation: todo-tick-in 260ms var(--t-motion-spring-snappy, linear) both; }
       @keyframes todo-tick-in {
         from { opacity: 0; transform: rotate(-45deg) translateY(-1px) scale(.45); }
         to { opacity: 1; transform: rotate(-45deg) translateY(-1px) scale(1); }
@@ -241,13 +271,14 @@
         width: 8px;
         content: "▸";
         transform-origin: center;
-        transition: transform var(--t-motion-fast) var(--t-motion-ease);
+        transition: transform 240ms var(--t-motion-spring, linear);
       }
       .fold[aria-expanded="true"]::before { transform: rotate(90deg); }
 
       .empty { color: var(--t-muted); padding: 2px 0; }
       @media (prefers-reduced-motion: reduce) {
         #bar > i, .item, .item .box, .item .txt, .fold, .fold::before { transition: none; }
+        #bar::after, .item.in_progress .dot { animation: none; }
         .item.just-completed .tick { animation: none; }
         .type-char { animation: none !important; opacity: 1; }
         .strike-sweep { display: none; }
