@@ -1665,7 +1665,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -1730,7 +1730,15 @@ export default {
   var COMPLETION_STRIKE_MS = 180;
   var COMPLETION_FLIGHT_MS = 220;
   var TYPEWRITER_STEP_MS = 14;
-  var MOTION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)";
+  var TYPEWRITER_CHAR_MS = 18;
+  var TYPEWRITER_DELAY_CAP_MS = 2200;
+  var TYPEWRITER_CLEANUP_MIN_MS = 300;
+  var MOVE_STAGGER_MS = 30;
+  var MOVE_STAGGER_CAP_MS = 90;
+  var ENTER_STAGGER_MS = 40;
+  var ENTER_STAGGER_CAP_MS = 160;
+  var MOTION_EASING = "linear(0, 0.03 3.1%, 0.106 6.3%, 0.211 9.4%, 0.333 12.5%, 0.459 15.6%, 0.582 18.8%, 0.695 21.9%, 0.795 25%, 0.88 28.1%, 0.949 31.3%, 1.002 34.4%, 1.041 37.5%, 1.067 40.6%, 1.082 43.8%, 1.089 46.9%, 1.088 50%, 1.083 53.1%, 1.075 56.3%, 1.065 59.4%, 1.053 62.5%, 1.042 65.6%, 1.032 68.8%, 1.022 71.9%, 1.014 75%, 1.007 78.1%, 1.002 81.3%, 0.998 84.4%, 0.995 87.5%, 0.993 90.6%, 0.992 93.8%, 0.992 96.9%, 0.992 100%)";
+  var MOTION_EASING_PULSE = "linear(0, 0.038 3.1%, 0.137 6.3%, 0.275 9.4%, 0.434 12.5%, 0.597 15.6%, 0.752 18.8%, 0.889 21.9%, 1.002 25%, 1.089 28.1%, 1.15 31.3%, 1.185 34.4%, 1.199 37.5%, 1.196 40.6%, 1.179 43.8%, 1.153 46.9%, 1.122 50%, 1.089 53.1%, 1.057 56.3%, 1.029 59.4%, 1.005 62.5%, 0.986 65.6%, 0.973 68.8%, 0.964 71.9%, 0.96 75%, 0.96 78.1%, 0.963 81.3%, 0.968 84.4%, 0.974 87.5%, 0.98 90.6%, 0.987 93.8%, 0.993 96.9%, 0.998 100%)";
   var MANIFEST_H = 56;
   var UI_ONLY = false;
   var IDLE_MS = 1e4;
@@ -1824,8 +1832,29 @@ export default {
       return `<span class="txt">${esc(content)}</span>`;
     const segmenter = typeof Intl !== "undefined" && typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
     const characters = segmenter ? Array.from(segmenter.segment(content), (part) => part.segment) : Array.from(content);
-    const chars = characters.map((character, index) => `<span class="type-char" aria-hidden="true" style="--type-delay:${Math.min(index * TYPEWRITER_STEP_MS, 2200)}ms">${esc(character)}</span>`).join("");
+    const chars = characters.map((character, index) => `<span class="type-char" aria-hidden="true" style="--type-delay:${Math.min(index * TYPEWRITER_STEP_MS, TYPEWRITER_DELAY_CAP_MS)}ms">${esc(character)}</span>`).join("");
     return `<span class="txt typewriter" role="text" aria-label="${esc(content)}">${chars}</span>`;
+  }
+  function normalizeTypewriter(text) {
+    const content = text.getAttribute("aria-label") ?? text.textContent;
+    text.classList.remove("typewriter");
+    text.removeAttribute("role");
+    text.removeAttribute("aria-label");
+    text.textContent = content;
+  }
+  function normalizeTypewriters(body) {
+    for (const text of body.querySelectorAll(".txt.typewriter"))
+      normalizeTypewriter(text);
+  }
+  function scheduleTypewriterCleanup(node, content) {
+    const chars = Array.from(content).length;
+    const settle = Math.min(Math.max(chars - 1, 0) * TYPEWRITER_STEP_MS, TYPEWRITER_DELAY_CAP_MS) + TYPEWRITER_CHAR_MS;
+    setTimeout(() => {
+      const text = node.querySelector(".txt.typewriter");
+      if (!text || !node.isConnected || text.textContent !== content)
+        return;
+      normalizeTypewriter(text);
+    }, Math.max(settle + 80, TYPEWRITER_CLEANUP_MIN_MS));
   }
   function itemHtml(todo, key, typing = false) {
     const mark = PRIORITY_MARK[todo.priority] || "";
@@ -1866,7 +1895,7 @@ export default {
   }
   function rowHtml(row, typing = false) {
     if (row.kind === "fold") {
-      return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`;
+      return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`;
     }
     return itemHtml(row.todo, row.key, typing);
   }
@@ -1882,8 +1911,16 @@ export default {
         node.setAttribute("aria-expanded", expanded);
       const count = String(row.count);
       if (node.dataset.count !== count) {
+        const grew = node.dataset.count !== "" && Number(count) > Number(node.dataset.count);
         node.dataset.count = count;
-        node.textContent = `已完成 ${row.count} 项`;
+        const n = node.querySelector(".n");
+        if (n) {
+          n.textContent = count;
+          if (grew && !reducedMotion())
+            animateCountFlip(n);
+        } else {
+          node.textContent = `已完成 ${row.count} 项`;
+        }
       }
       return;
     }
@@ -1959,8 +1996,10 @@ export default {
   function cancelRowAnimations() {
     motionEpoch += 1;
     const body = el2("body");
-    for (const animation of body.getAnimations({ subtree: true }))
-      animation.cancel();
+    for (const animation of body.getAnimations({ subtree: true })) {
+      if (animation.effect?.getComputedTiming?.().iterations !== Infinity)
+        animation.cancel();
+    }
     for (const node of body.querySelectorAll(".just-completed"))
       node.classList.remove("just-completed");
     for (const { node, row } of completionTransitions.values()) {
@@ -1975,16 +2014,19 @@ export default {
     for (const node of exitingRows) {
       node.classList.remove("row-exiting");
       node.removeAttribute("data-exiting");
+      node.remove();
     }
     exitingRows.clear();
     for (const ghost of completionGhosts)
       ghost.remove();
     completionGhosts.clear();
+    normalizeTypewriters(body);
   }
-  function animateRow(node, from, to, duration, onFinish) {
+  function animateRow(node, from, to, duration, onFinish, delay = 0) {
     const epoch = motionEpoch;
     const animation = node.animate([from, to], {
       duration,
+      delay,
       easing: MOTION_EASING,
       fill: "both"
     });
@@ -1995,10 +2037,19 @@ export default {
     }, () => {});
     return animation;
   }
-  function animateRowEnter(node) {
+  function animateCountFlip(n) {
+    animateRow(n, { transform: "translateY(5px)", opacity: 0 }, { transform: "translateY(0)", opacity: 1 }, ROW_TOGGLE_MS);
+  }
+  function pulseFold(fold) {
+    if (!fold || reducedMotion())
+      return;
+    const animation = fold.animate([{ transform: "scale(1)" }, { transform: "scale(1.05)", offset: 0.4 }, { transform: "scale(1)" }], { duration: 300, easing: MOTION_EASING_PULSE, fill: "none" });
+    animation.finished.then(() => animation.cancel(), () => {});
+  }
+  function animateRowEnter(node, delay = 0) {
     const height = node.getBoundingClientRect().height;
     const style = getComputedStyle(node);
-    animateRow(node, { height: "0px", opacity: 0, transform: "translateY(-4px)", paddingTop: "0px", paddingBottom: "0px", overflow: "hidden" }, { height: `${height}px`, opacity: 1, transform: "translateY(0)", paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, overflow: "hidden" }, ROW_TOGGLE_MS);
+    animateRow(node, { height: "0px", opacity: 0, transform: "translateY(-4px)", paddingTop: "0px", paddingBottom: "0px", overflow: "hidden" }, { height: `${height}px`, opacity: 1, transform: "translateY(0)", paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, overflow: "hidden" }, ROW_TOGGLE_MS, undefined, delay);
   }
   function animateRowExit(node, epoch) {
     const height = node.getBoundingClientRect().height;
@@ -2025,6 +2076,9 @@ export default {
     const bodyRect = body.getBoundingClientRect();
     const ghost = source.cloneNode(true);
     updateRowNode(ghost, row, false);
+    const ghostText = ghost.querySelector(".txt.typewriter");
+    if (ghostText)
+      normalizeTypewriter(ghostText);
     ghost.classList.add("completion-ghost");
     ghost.removeAttribute("data-row-key");
     ghost.dataset.motionOnly = "true";
@@ -2052,12 +2106,17 @@ export default {
       return;
     }
     const target = fold.getBoundingClientRect();
+    let landed = false;
     for (const { ghost, sourceRect } of ghosts) {
       const deltaX = target.left - sourceRect.left;
       const deltaY = target.top - sourceRect.top;
       animateRow(ghost, { transform: "translate(0, 0) scale(1)", opacity: 1 }, { transform: `translate(${deltaX}px, ${deltaY}px) scale(.82)`, opacity: 0 }, COMPLETION_FLIGHT_MS, () => {
         completionGhosts.delete(ghost);
         ghost.remove();
+        if (!landed) {
+          landed = true;
+          pulseFold(fold);
+        }
       });
     }
   }
@@ -2127,8 +2186,11 @@ export default {
       } else {
         const isNewTask = row.kind === "item" && options.newTaskKeys?.has(row.key);
         node = createRowNode(row, isNewTask && animate);
-        if (isNewTask)
+        if (isNewTask) {
           pendingTypewriterKeys.delete(row.key);
+          if (animate)
+            scheduleTypewriterCleanup(node, row.todo.content);
+        }
         entering.push(node);
       }
       used.add(node);
@@ -2162,23 +2224,24 @@ export default {
   function animateRows(body, firstTops, entering, hadRows, used, animate) {
     if (!animate || reducedMotion())
       return;
+    let moveIndex = 0;
     for (const [node, firstTop] of firstTops) {
       if (!used.has(node) || !node.isConnected)
         continue;
       const deltaY = firstTop - node.getBoundingClientRect().top;
       if (Math.abs(deltaY) < 1)
         continue;
-      animateRow(node, { transform: `translateY(${deltaY}px)` }, { transform: "translateY(0)" }, ROW_ENTER_MS);
+      animateRow(node, { transform: `translateY(${deltaY}px)` }, { transform: "translateY(0)" }, ROW_ENTER_MS, undefined, Math.min(moveIndex++ * MOVE_STAGGER_MS, MOVE_STAGGER_CAP_MS));
     }
     if (hadRows && entering.length > 0) {
       const epoch = motionEpoch;
       requestAnimationFrame(() => {
         if (epoch !== motionEpoch || reducedMotion())
           return;
-        for (const node of entering) {
+        entering.forEach((node, index) => {
           if (node.isConnected)
-            animateRowEnter(node);
-        }
+            animateRowEnter(node, Math.min(index * ENTER_STAGGER_MS, ENTER_STAGGER_CAP_MS));
+        });
       });
     }
   }
@@ -2311,6 +2374,7 @@ export default {
     const done = todos.filter(isFinished).length;
     top.dataset.empty = "false";
     el2("count").textContent = `${done}/${todos.length}`;
+    top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false";
     top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`;
     const result = reconcileRows(buildRows(todos), { animate, newTaskKeys });
     if (!result.staged)

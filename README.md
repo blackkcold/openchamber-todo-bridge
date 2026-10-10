@@ -20,10 +20,10 @@ Send a message in an OpenCode session to start using the todo tools.
 
 ### Install a specific version
 
-Append a release tag to the URL, for example `#v0.4.3`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
+Append a release tag to the URL, for example `#v0.5.0`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
 
 ```text
-https://github.com/blackkcold/openchamber-todo-bridge#v0.4.3
+https://github.com/blackkcold/openchamber-todo-bridge#v0.5.0
 ```
 
 ### Manual plugin setup

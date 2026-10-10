@@ -59,7 +59,24 @@ const ROW_TOGGLE_MS = 220
 const COMPLETION_STRIKE_MS = 180
 const COMPLETION_FLIGHT_MS = 220
 const TYPEWRITER_STEP_MS = 14
-const MOTION_EASING = "cubic-bezier(0.22, 1, 0.36, 1)"
+/** The `.type-char` animation's duration in status/index.html, mirrored for cleanup timing. */
+const TYPEWRITER_CHAR_MS = 18
+/** The per-character delay cap `textHtml` applies, mirrored so cleanup knows the longest wait. */
+const TYPEWRITER_DELAY_CAP_MS = 2200
+/** Cleanup never fires sooner than this, so the visible typing window stays stable. */
+const TYPEWRITER_CLEANUP_MIN_MS = 300
+/** A repaint staggers multi-row moves/enters, so a change reads as a cascade, not a jump. */
+const MOVE_STAGGER_MS = 30
+const MOVE_STAGGER_CAP_MS = 90
+const ENTER_STAGGER_MS = 40
+const ENTER_STAGGER_CAP_MS = 160
+/**
+ * Springs sampled from a damped harmonic, so motion reads as physics rather
+ * than a preset: ~9% overshoot for travel, ~20% for the tick and the fold's
+ * absorb pulse. `linear()` is accepted by both WAAPI `easing` and CSS.
+ */
+const MOTION_EASING = "linear(0, 0.03 3.1%, 0.106 6.3%, 0.211 9.4%, 0.333 12.5%, 0.459 15.6%, 0.582 18.8%, 0.695 21.9%, 0.795 25%, 0.88 28.1%, 0.949 31.3%, 1.002 34.4%, 1.041 37.5%, 1.067 40.6%, 1.082 43.8%, 1.089 46.9%, 1.088 50%, 1.083 53.1%, 1.075 56.3%, 1.065 59.4%, 1.053 62.5%, 1.042 65.6%, 1.032 68.8%, 1.022 71.9%, 1.014 75%, 1.007 78.1%, 1.002 81.3%, 0.998 84.4%, 0.995 87.5%, 0.993 90.6%, 0.992 93.8%, 0.992 96.9%, 0.992 100%)"
+const MOTION_EASING_PULSE = "linear(0, 0.038 3.1%, 0.137 6.3%, 0.275 9.4%, 0.434 12.5%, 0.597 15.6%, 0.752 18.8%, 0.889 21.9%, 1.002 25%, 1.089 28.1%, 1.15 31.3%, 1.185 34.4%, 1.199 37.5%, 1.196 40.6%, 1.179 43.8%, 1.153 46.9%, 1.122 50%, 1.089 53.1%, 1.057 56.3%, 1.029 59.4%, 1.005 62.5%, 0.986 65.6%, 0.973 68.8%, 0.964 71.9%, 0.96 75%, 0.96 78.1%, 0.963 81.3%, 0.968 84.4%, 0.974 87.5%, 0.98 90.6%, 0.987 93.8%, 0.993 96.9%, 0.998 100%)"
 /** The height in `package.json`. The first paint is exempt from the delta gate. */
 const MANIFEST_H = 56
 /**
@@ -186,10 +203,49 @@ function textHtml(content, typing) {
     ? Array.from(segmenter.segment(content), (part) => part.segment)
     : Array.from(content)
   const chars = characters.map((character, index) =>
-    `<span class="type-char" aria-hidden="true" style="--type-delay:${Math.min(index * TYPEWRITER_STEP_MS, 2200)}ms">${esc(character)}</span>`,
+    `<span class="type-char" aria-hidden="true" style="--type-delay:${Math.min(index * TYPEWRITER_STEP_MS, TYPEWRITER_DELAY_CAP_MS)}ms">${esc(character)}</span>`,
   ).join("")
 
   return `<span class="txt typewriter" role="text" aria-label="${esc(content)}">${chars}</span>`
+}
+
+/**
+ * Collapse a finished typewriter's per-character spans into plain text.
+ *
+ * The spans exist to run the per-character reveal animation; afterwards they are
+ * pure cost. Worse, they are landmines: a cancelled CSS animation never restarts,
+ * so a clone of the row (the completion ghost) would re-type from opacity 0, and
+ * a Chromium fill bug can freeze mid-flight characters at opacity 0 forever —
+ * exactly the "missing middle characters" the typewriter used to leave behind on
+ * refreshes. Replacing the spans with a text node ends both: there is no
+ * animation left to restart and no fill left to freeze.
+ */
+function normalizeTypewriter(text) {
+  const content = text.getAttribute("aria-label") ?? text.textContent
+  text.classList.remove("typewriter")
+  text.removeAttribute("role")
+  text.removeAttribute("aria-label")
+  text.textContent = content
+}
+
+function normalizeTypewriters(body) {
+  for (const text of body.querySelectorAll(".txt.typewriter")) normalizeTypewriter(text)
+}
+
+/**
+ * Schedule the collapse once the last character has landed: the whole text is
+ * already laid out from the first frame, so this changes nothing the reader can
+ * see — it only retires the animation scaffolding.
+ */
+function scheduleTypewriterCleanup(node, content) {
+  const chars = Array.from(content).length
+  const settle = Math.min(Math.max(chars - 1, 0) * TYPEWRITER_STEP_MS, TYPEWRITER_DELAY_CAP_MS)
+    + TYPEWRITER_CHAR_MS
+  setTimeout(() => {
+    const text = node.querySelector(".txt.typewriter")
+    if (!text || !node.isConnected || text.textContent !== content) return
+    normalizeTypewriter(text)
+  }, Math.max(settle + 80, TYPEWRITER_CLEANUP_MIN_MS))
 }
 
 function itemHtml(todo, key, typing = false) {
@@ -239,7 +295,7 @@ function buildRows(list) {
 
 function rowHtml(row, typing = false) {
   if (row.kind === "fold") {
-    return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 ${row.count} 项</button>`
+    return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`
   }
   return itemHtml(row.todo, row.key, typing)
 }
@@ -256,8 +312,15 @@ function updateRowNode(node, row, animateStatus = true) {
     if (node.getAttribute("aria-expanded") !== expanded) node.setAttribute("aria-expanded", expanded)
     const count = String(row.count)
     if (node.dataset.count !== count) {
+      const grew = node.dataset.count !== "" && Number(count) > Number(node.dataset.count)
       node.dataset.count = count
-      node.textContent = `已完成 ${row.count} 项`
+      const n = node.querySelector(".n")
+      if (n) {
+        n.textContent = count
+        if (grew && !reducedMotion()) animateCountFlip(n)
+      } else {
+        node.textContent = `已完成 ${row.count} 项`
+      }
     }
     return
   }
@@ -332,7 +395,11 @@ function rememberTaskKeys(list) {
 function cancelRowAnimations() {
   motionEpoch += 1
   const body = el("body")
-  for (const animation of body.getAnimations({ subtree: true })) animation.cancel()
+  for (const animation of body.getAnimations({ subtree: true })) {
+    // Ambient loops (the in-progress dot's breathing) belong to no single paint:
+    // cancelling a CSS animation is permanent, so they ride out the repaint.
+    if (animation.effect?.getComputedTiming?.().iterations !== Infinity) animation.cancel()
+  }
   for (const node of body.querySelectorAll(".just-completed")) node.classList.remove("just-completed")
 
   for (const { node, row } of completionTransitions.values()) {
@@ -347,17 +414,26 @@ function cancelRowAnimations() {
   for (const node of exitingRows) {
     node.classList.remove("row-exiting")
     node.removeAttribute("data-exiting")
+    // The exit's finished promise never settles once cancelled, so without this
+    // the row would come back to full height and wait for a paint that may
+    // never come — a zombie in the middle of the list.
+    node.remove()
   }
   exitingRows.clear()
 
   for (const ghost of completionGhosts) ghost.remove()
   completionGhosts.clear()
+
+  // A repaint must never leave typing mid-flight: characters frozen at opacity 0
+  // by the ancestor-cancel fill bug (and clones that would re-type) both end here.
+  normalizeTypewriters(body)
 }
 
-function animateRow(node, from, to, duration, onFinish) {
+function animateRow(node, from, to, duration, onFinish, delay = 0) {
   const epoch = motionEpoch
   const animation = node.animate([from, to], {
     duration,
+    delay,
     easing: MOTION_EASING,
     fill: "both",
   })
@@ -368,13 +444,34 @@ function animateRow(node, from, to, duration, onFinish) {
   return animation
 }
 
-function animateRowEnter(node) {
+/** The fold's count tick: the new number steps up into place rather than jumping. */
+function animateCountFlip(n) {
+  animateRow(n,
+    { transform: "translateY(5px)", opacity: 0 },
+    { transform: "translateY(0)", opacity: 1 },
+    ROW_TOGGLE_MS,
+  )
+}
+
+/** One step of "the fold swallowed it": a small scale pulse on the summary row. */
+function pulseFold(fold) {
+  if (!fold || reducedMotion()) return
+  const animation = fold.animate(
+    [{ transform: "scale(1)" }, { transform: "scale(1.05)", offset: 0.4 }, { transform: "scale(1)" }],
+    { duration: 300, easing: MOTION_EASING_PULSE, fill: "none" },
+  )
+  animation.finished.then(() => animation.cancel(), () => {})
+}
+
+function animateRowEnter(node, delay = 0) {
   const height = node.getBoundingClientRect().height
   const style = getComputedStyle(node)
   animateRow(node,
     { height: "0px", opacity: 0, transform: "translateY(-4px)", paddingTop: "0px", paddingBottom: "0px", overflow: "hidden" },
     { height: `${height}px`, opacity: 1, transform: "translateY(0)", paddingTop: style.paddingTop, paddingBottom: style.paddingBottom, overflow: "hidden" },
     ROW_TOGGLE_MS,
+    undefined,
+    delay,
   )
 }
 
@@ -402,6 +499,10 @@ function completionGhost(body, source, row) {
   const bodyRect = body.getBoundingClientRect()
   const ghost = source.cloneNode(true)
   updateRowNode(ghost, row, false)
+  // Cloned nodes restart CSS animations, so a cloned typewriter would re-type
+  // from opacity 0 mid-flight and arrive mostly invisible.
+  const ghostText = ghost.querySelector(".txt.typewriter")
+  if (ghostText) normalizeTypewriter(ghostText)
   ghost.classList.add("completion-ghost")
   ghost.removeAttribute("data-row-key")
   ghost.dataset.motionOnly = "true"
@@ -431,6 +532,7 @@ function animateCompletionGhosts(body, ghosts) {
   }
 
   const target = fold.getBoundingClientRect()
+  let landed = false
   for (const { ghost, sourceRect } of ghosts) {
     const deltaX = target.left - sourceRect.left
     const deltaY = target.top - sourceRect.top
@@ -441,6 +543,10 @@ function animateCompletionGhosts(body, ghosts) {
       () => {
         completionGhosts.delete(ghost)
         ghost.remove()
+        if (!landed) {
+          landed = true
+          pulseFold(fold)
+        }
       },
     )
   }
@@ -524,7 +630,10 @@ function reconcileRows(rows, options = {}) {
     } else {
       const isNewTask = row.kind === "item" && options.newTaskKeys?.has(row.key)
       node = createRowNode(row, isNewTask && animate)
-      if (isNewTask) pendingTypewriterKeys.delete(row.key)
+      if (isNewTask) {
+        pendingTypewriterKeys.delete(row.key)
+        if (animate) scheduleTypewriterCleanup(node, row.todo.content)
+      }
       entering.push(node)
     }
     used.add(node)
@@ -557,6 +666,7 @@ function reconcileRows(rows, options = {}) {
 function animateRows(body, firstTops, entering, hadRows, used, animate) {
   if (!animate || reducedMotion()) return
 
+  let moveIndex = 0
   for (const [node, firstTop] of firstTops) {
     if (!used.has(node) || !node.isConnected) continue
     const deltaY = firstTop - node.getBoundingClientRect().top
@@ -565,6 +675,8 @@ function animateRows(body, firstTops, entering, hadRows, used, animate) {
       { transform: `translateY(${deltaY}px)` },
       { transform: "translateY(0)" },
       ROW_ENTER_MS,
+      undefined,
+      Math.min(moveIndex++ * MOVE_STAGGER_MS, MOVE_STAGGER_CAP_MS),
     )
   }
 
@@ -572,9 +684,9 @@ function animateRows(body, firstTops, entering, hadRows, used, animate) {
     const epoch = motionEpoch
     requestAnimationFrame(() => {
       if (epoch !== motionEpoch || reducedMotion()) return
-      for (const node of entering) {
-        if (node.isConnected) animateRowEnter(node)
-      }
+      entering.forEach((node, index) => {
+        if (node.isConnected) animateRowEnter(node, Math.min(index * ENTER_STAGGER_MS, ENTER_STAGGER_CAP_MS))
+      })
     })
   }
 }
@@ -788,6 +900,7 @@ function paint(todos) {
   const done = todos.filter(isFinished).length
   top.dataset.empty = "false"
   el("count").textContent = `${done}/${todos.length}`
+  top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false"
   top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`
 
   const result = reconcileRows(buildRows(todos), { animate, newTaskKeys })
