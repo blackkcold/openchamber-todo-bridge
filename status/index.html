@@ -195,13 +195,14 @@
         width: 7px; height: 4px;
         border-left: 1.5px solid var(--t-success);
         border-bottom: 1.5px solid var(--t-success);
-        transform: rotate(-45deg) translateY(-1px);
+        position: relative; top: -0.5px;
+        transform: rotate(-45deg);
         transform-origin: center;
       }
       .item.just-completed .tick { animation: todo-tick-in 260ms var(--t-motion-spring-snappy, linear) both; }
       @keyframes todo-tick-in {
-        from { opacity: 0; transform: rotate(-45deg) translateY(-1px) scale(.45); }
-        to { opacity: 1; transform: rotate(-45deg) translateY(-1px) scale(1); }
+        from { opacity: 0; transform: rotate(-45deg) scale(.45); }
+        to { opacity: 1; transform: rotate(-45deg) scale(1); }
       }
       .item.cancelled .dash { width: 6px; height: 1.5px; background: var(--t-muted); }
 
