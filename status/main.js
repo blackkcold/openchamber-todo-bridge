@@ -1665,7 +1665,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -1778,8 +1778,8 @@ export default {
   var heightTimer = null;
   var idleTimer = null;
   var snapTimer = null;
-  function file(sessionID2) {
-    return `~/.config/openchamber/todos/${sessionID2}.json`;
+  function file(sessionID) {
+    return `~/.config/openchamber/todos/${sessionID}.json`;
   }
   function esc(value) {
     return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
