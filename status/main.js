@@ -1363,6 +1363,305 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return best;
   }
 
+  // src/doc.js
+  var STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
+  var isFinished = (todo) => todo.status === "completed" || todo.status === "cancelled";
+  function normalizeDoc(data) {
+    const raw = data && Array.isArray(data.todos) ? data.todos : [];
+    const todos = [];
+    for (const entry of raw) {
+      if (entry === null || typeof entry !== "object")
+        continue;
+      const text = typeof entry.content === "string" ? entry.content.trim() : "";
+      if (!text)
+        continue;
+      if (!STATUSES.has(entry.status))
+        continue;
+      const todo = {
+        content: text,
+        status: entry.status,
+        priority: typeof entry.priority === "string" ? entry.priority : ""
+      };
+      if (typeof entry.id === "string" && entry.id !== "")
+        todo.id = entry.id;
+      if (typeof entry.parentId === "string" && entry.parentId !== "")
+        todo.parentId = entry.parentId;
+      if (typeof entry.phase === "string" && entry.phase !== "")
+        todo.phase = entry.phase;
+      if (Array.isArray(entry.dependsOn)) {
+        todo.dependsOn = entry.dependsOn.filter((dep) => typeof dep === "string" && dep !== "");
+      }
+      todos.push(todo);
+    }
+    const phases = data && Array.isArray(data.phases) ? data.phases.filter((phase) => typeof phase === "string" && phase !== "") : [];
+    return { todos, phases };
+  }
+  function parseDoc(content) {
+    let data;
+    try {
+      data = JSON.parse(content);
+    } catch {
+      return null;
+    }
+    return normalizeDoc(data);
+  }
+
+  // src/graph.js
+  var INDENT = 9;
+  var MAX_DEPTH = 6;
+  var PHASE_TOKENS = [
+    "var(--oc-syntax-keyword, var(--oc-primary))",
+    "var(--oc-syntax-string, var(--oc-info))",
+    "var(--oc-syntax-number, var(--oc-success))",
+    "var(--oc-syntax-function, var(--oc-warning))",
+    "var(--oc-syntax-type, var(--oc-error))"
+  ];
+  var phaseColor = (index) => {
+    const n = Number.isFinite(index) ? Math.trunc(index) : 0;
+    const len = PHASE_TOKENS.length;
+    return PHASE_TOKENS[(n % len + len) % len];
+  };
+  var phaseColorIndex = (phase, list) => {
+    const i = Array.isArray(list) ? list.indexOf(phase) : -1;
+    return i < 0 ? 0 : i;
+  };
+  function phaseList(declared, todos) {
+    const out = [];
+    const seen = new Set;
+    const add = (p) => {
+      if (typeof p === "string" && p !== "" && !seen.has(p)) {
+        seen.add(p);
+        out.push(p);
+      }
+    };
+    if (Array.isArray(declared))
+      for (const p of declared)
+        add(p);
+    for (const todo of todos)
+      add(todo && todo.phase);
+    return out;
+  }
+  function hasStructure(todos) {
+    return todos.some((t) => {
+      if (!t)
+        return false;
+      if (t.parentId !== undefined && t.parentId !== null)
+        return true;
+      return typeof t.phase === "string" && t.phase !== "";
+    });
+  }
+  function buildTree(todos, declared = []) {
+    const list = Array.isArray(todos) ? todos : [];
+    const phases = phaseList(declared, list);
+    const taken = new Set;
+    const nodes = list.map((todo, index) => {
+      const id = typeof todo.id === "string" ? todo.id : "";
+      let key = `#${index}`;
+      if (id !== "") {
+        key = taken.has(id) ? `${id}#${index}` : id;
+        taken.add(id);
+      }
+      return {
+        key,
+        index,
+        content: todo.content,
+        status: todo.status,
+        priority: todo.priority || "",
+        phase: typeof todo.phase === "string" ? todo.phase : "",
+        colorIndex: phaseColorIndex(todo.phase, phases),
+        dependsOn: Array.isArray(todo.dependsOn) ? todo.dependsOn : [],
+        synthetic: todo.synthetic === true,
+        parent: null,
+        children: []
+      };
+    });
+    const byId = new Map;
+    for (const node of nodes) {
+      const id = list[node.index].id;
+      if (typeof id === "string" && id !== "" && !byId.has(id))
+        byId.set(id, node);
+    }
+    for (const node of nodes) {
+      const pid = list[node.index].parentId;
+      if (typeof pid !== "string" || pid === "")
+        continue;
+      const parent = byId.get(pid);
+      if (parent && parent !== node)
+        node.parent = parent;
+    }
+    const nested = list.some((todo) => typeof todo.parentId === "string" && todo.parentId !== "");
+    if (!nested && phases.length > 0) {
+      const used = new Set(list.map((todo) => typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : ""));
+      const groups = new Map;
+      for (const phase of phases) {
+        if (!used.has(phase))
+          continue;
+        const group = {
+          key: `phase:${phase}`,
+          index: -1,
+          content: phase,
+          status: "",
+          priority: "",
+          phase,
+          colorIndex: phaseColorIndex(phase, phases),
+          dependsOn: [],
+          synthetic: true,
+          parent: null,
+          children: []
+        };
+        groups.set(phase, group);
+        nodes.push(group);
+      }
+      for (const node of nodes) {
+        if (node.synthetic || node.parent)
+          continue;
+        const phase = list[node.index].phase;
+        if (typeof phase === "string" && phase !== "" && groups.has(phase))
+          node.parent = groups.get(phase);
+      }
+    }
+    const state = new Map;
+    for (const start of nodes) {
+      if (state.get(start) === 2)
+        continue;
+      const path = [];
+      let cur = start;
+      while (cur && state.get(cur) !== 2 && state.get(cur) !== 1) {
+        state.set(cur, 1);
+        path.push(cur);
+        cur = cur.parent;
+      }
+      if (cur && state.get(cur) === 1) {
+        const from = path.indexOf(cur);
+        for (let i = from;i < path.length; i += 1)
+          path[i].parent = null;
+      }
+      for (const node of path)
+        state.set(node, 2);
+    }
+    const roots = [];
+    for (const node of nodes) {
+      if (node.parent)
+        node.parent.children.push(node);
+      else
+        roots.push(node);
+    }
+    const rows = [];
+    const visit = (node, depth, isLast, ancestorLast) => {
+      rows.push({
+        key: node.key,
+        index: node.index,
+        content: node.content,
+        status: node.status,
+        priority: node.priority,
+        phase: node.phase,
+        colorIndex: node.colorIndex,
+        depth: Math.min(depth, MAX_DEPTH),
+        isLast,
+        ancestorLast,
+        synthetic: node.synthetic === true,
+        blocked: node.dependsOn.some((dep) => {
+          const target = byId.get(dep);
+          return Boolean(target) && target.status !== "completed";
+        })
+      });
+      const kids = node.children;
+      for (let i = 0;i < kids.length; i += 1) {
+        visit(kids[i], depth + 1, i === kids.length - 1, ancestorLast.concat([isLast]));
+      }
+    };
+    for (const root of roots)
+      visit(root, 0, root === roots[roots.length - 1], []);
+    return { rows, hasStructure: hasStructure(list), phases };
+  }
+  function pruneFinished(todos) {
+    const list = Array.isArray(todos) ? todos : [];
+    const indexById = new Map;
+    for (let i = 0;i < list.length; i += 1) {
+      const id = list[i].id;
+      if (typeof id === "string" && id !== "" && !indexById.has(id))
+        indexById.set(id, i);
+    }
+    const keep = new Set;
+    for (let i = 0;i < list.length; i += 1)
+      if (!isFinished(list[i]))
+        keep.add(i);
+    const addAncestors = (index) => {
+      let parentId = list[index].parentId;
+      while (typeof parentId === "string" && parentId !== "" && indexById.has(parentId)) {
+        const parent = indexById.get(parentId);
+        if (keep.has(parent))
+          break;
+        keep.add(parent);
+        parentId = list[parent].parentId;
+      }
+    };
+    for (const index of [...keep])
+      addAncestors(index);
+    return list.filter((_, index) => keep.has(index));
+  }
+
+  // src/gutter.js
+  var GUT_NODE = 11;
+  var NODE_Y = 11;
+  var GUT_CSS = `
+.gut { flex: 0 0 auto; align-self: stretch; position: relative; min-height: 18px; }
+.gut-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.gut-svg line { stroke: var(--oc-muted, #6f6e69); stroke-width: 1.4; opacity: .5; }
+.gut-halo { transform-box: fill-box; transform-origin: center; animation: todo-gut-halo 2200ms ease-in-out infinite; }
+@keyframes todo-gut-halo {
+  0%, 100% { transform: scale(1); opacity: .85; }
+  50% { transform: scale(1.55); opacity: .28; }
+}
+@media (prefers-reduced-motion: reduce) { .gut-halo { animation: none; } }
+`;
+  function ensureGutStyle(doc) {
+    if (doc.getElementById("gut-style"))
+      return;
+    const style = doc.createElement("style");
+    style.id = "gut-style";
+    style.textContent = GUT_CSS;
+    doc.head.append(style);
+  }
+  function symbolSvg(status, x, y, color) {
+    const r = 4;
+    if (status === "completed") {
+      return `<circle cx="${x}" cy="${y}" r="${r}" fill="${color}"/>` + `<path class="gut-tick" d="M${x - 2.1} ${y + 0.1} L${x - 0.5} ${y + 1.7} L${x + 2.3} ${y - 1.7}"` + ` fill="none" stroke="var(--oc-bg, #fff)" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>`;
+    }
+    if (status === "cancelled") {
+      return `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="${color}" stroke-width="1.6" stroke-dasharray="2 2" opacity=".7"/>` + `<line x1="${x - 2.2}" y1="${y - 2.2}" x2="${x + 2.2}" y2="${y + 2.2}" stroke="${color}" stroke-width="1.4" opacity=".7"/>`;
+    }
+    if (status === "in_progress") {
+      return `<circle class="gut-halo" cx="${x}" cy="${y}" r="${r}" fill="none" stroke="${color}" stroke-width="1.6"/>` + `<circle cx="${x}" cy="${y}" r="${r - 1.4}" fill="${color}"/>`;
+    }
+    return `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="${color}" stroke-width="1.6"/>`;
+  }
+  function gutterSvg(tree, status) {
+    const d = tree.depth;
+    const cx = (lane) => lane * INDENT + GUT_NODE / 2;
+    const color = phaseColor(tree.colorIndex);
+    const last = tree.isLast;
+    let body = "";
+    for (let lane = 0;lane < d; lane += 1) {
+      const x = cx(lane);
+      if (lane === d - 1) {
+        body += `<line x1="${x}" y1="0" x2="${x}" y2="${last ? NODE_Y : "100%"}" stroke="${color}" opacity=".8"/>`;
+        body += `<line x1="${x}" y1="${NODE_Y}" x2="${cx(d)}" y2="${NODE_Y}" stroke="${color}" opacity=".8"/>`;
+      } else if (tree.ancestorLast[lane + 1] === false) {
+        body += `<line x1="${x}" y1="0" x2="${x}" y2="100%"/>`;
+      }
+    }
+    if (tree.synthetic) {
+      body += `<rect x="${cx(d) - 3.5}" y="${NODE_Y - 3.5}" width="7" height="7" rx="2" fill="${color}"/>`;
+    } else {
+      body += symbolSvg(status, cx(d), NODE_Y, color);
+      if (tree.blocked) {
+        body += `<circle cx="${cx(d)}" cy="${NODE_Y}" r="6.6" fill="none" stroke="var(--oc-error, #af3029)"` + ` stroke-width="1.3" stroke-dasharray="2 2"><title>受阻：依赖未完成</title></circle>`;
+      }
+    }
+    return `<svg class="gut-svg" aria-hidden="true">${body}</svg>`;
+  }
+
   // src/plugin-install.js
   var PLUGIN_ID = "openchamber-todo-bridge";
   var PLUGIN_DIR_PATH = `~/.config/opencode/plugins/${PLUGIN_ID}`;
@@ -1393,16 +1692,21 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
  *
  * Data file:
  *   <TODO_BRIDGE_DIR>/<sessionID>.json     (default ~/.config/openchamber/todos)
- *   { sessionID, todos: [{ content, status, priority? }], updatedAt }
+ *   { version: 2, sessionID, phases?, todos: [{ content, status, priority?, id?,
+ *     parentId?, phase?, dependsOn? }], updatedAt }
+ *   A v1 file (no \`version\`, flat items) is still read; the extra fields are
+ *   optional and only drive the visual task tree.
  */
 
-import { mkdir, rename, writeFile } from "node:fs/promises"
+import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"]
 const TODO_PRIORITIES = ["high", "medium", "low"]
 const STORAGE_PREFIX = "todos/"
+/** The session index the board reads (the board may not \`listDir\` the folder). */
+const INDEX_NAME = "_index.json"
 const MARK = { pending: "[ ]", in_progress: "[•]", completed: "[x]", cancelled: "[-]" }
 
 /** Where the mirror writes. Override for testing with TODO_BRIDGE_DIR. */
@@ -1414,35 +1718,68 @@ function mirrorDir() {
 
 const storageKey = (sessionID) => \`\${STORAGE_PREFIX}\${sessionID}\`
 
+/** A non-empty trimmed string, or a readable error for the model to correct. */
+function requireString(value, what) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(\`\${what} must be a non-empty string\`)
+  }
+  return value.trim()
+}
+
 /**
  * Validates a \`todowrite\` payload. Throws with a readable message so the model
  * can correct itself instead of silently losing the list.
+ *
+ * The structure fields (\`id\`, \`parentId\`, \`phase\`, \`dependsOn\`, top-level
+ * \`phases\`) are optional and drive the visual task tree; a present one is still
+ * validated, so a typo is caught rather than drawn as a broken tree.
  */
-function normalize(input) {
+export function normalize(input) {
   if (input === null || typeof input !== "object" || !("todos" in input)) {
     throw new Error("todowrite requires a \`todos\` array")
   }
   const raw = input.todos
   if (!Array.isArray(raw)) throw new Error("\`todos\` must be an array")
 
-  return raw.map((entry, index) => {
+  const todos = raw.map((entry, index) => {
+    const at = \`todo #\${index + 1}\`
     if (entry === null || typeof entry !== "object") {
-      throw new Error(\`todo #\${index + 1} must be an object\`)
+      throw new Error(\`\${at} must be an object\`)
     }
     const content = typeof entry.content === "string" ? entry.content.trim() : ""
-    if (!content) throw new Error(\`todo #\${index + 1} requires a non-empty \\\`content\\\` string\`)
+    if (!content) throw new Error(\`\${at} requires a non-empty \\\`content\\\` string\`)
     if (!TODO_STATUSES.includes(entry.status)) {
-      throw new Error(\`todo #\${index + 1} has invalid \\\`status\\\` (expected: \${TODO_STATUSES.join(", ")})\`)
+      throw new Error(\`\${at} has invalid \\\`status\\\` (expected: \${TODO_STATUSES.join(", ")})\`)
     }
     const todo = { content, status: entry.status }
     if (entry.priority !== undefined) {
       if (!TODO_PRIORITIES.includes(entry.priority)) {
-        throw new Error(\`todo #\${index + 1} has invalid \\\`priority\\\` (expected: \${TODO_PRIORITIES.join(", ")})\`)
+        throw new Error(\`\${at} has invalid \\\`priority\\\` (expected: \${TODO_PRIORITIES.join(", ")})\`)
       }
       todo.priority = entry.priority
     }
+    if (entry.id !== undefined) todo.id = requireString(entry.id, \`\${at} \\\`id\\\`\`)
+    if (entry.parentId !== undefined && entry.parentId !== null) {
+      todo.parentId = requireString(entry.parentId, \`\${at} \\\`parentId\\\`\`)
+    }
+    if (entry.phase !== undefined) todo.phase = requireString(entry.phase, \`\${at} \\\`phase\\\`\`)
+    if (entry.dependsOn !== undefined) {
+      if (!Array.isArray(entry.dependsOn) || entry.dependsOn.some((dep) => typeof dep !== "string" || dep.trim() === "")) {
+        throw new Error(\`\${at} \\\`dependsOn\\\` must be an array of non-empty strings\`)
+      }
+      todo.dependsOn = entry.dependsOn.map((dep) => dep.trim())
+    }
     return todo
   })
+
+  const result = { todos }
+  if (input.phases !== undefined) {
+    if (!Array.isArray(input.phases) || input.phases.some((p) => typeof p !== "string" || p.trim() === "")) {
+      throw new Error("\`phases\` must be an array of non-empty strings")
+    }
+    result.phases = input.phases.map((p) => p.trim())
+  }
+  return result
 }
 
 /**
@@ -1459,6 +1796,12 @@ function parseRecord(value) {
     if (!TODO_STATUSES.includes(entry.status)) continue
     const todo = { content: entry.content, status: entry.status }
     if (TODO_PRIORITIES.includes(entry.priority)) todo.priority = entry.priority
+    if (typeof entry.id === "string" && entry.id !== "") todo.id = entry.id
+    if (typeof entry.parentId === "string" && entry.parentId !== "") todo.parentId = entry.parentId
+    if (typeof entry.phase === "string" && entry.phase !== "") todo.phase = entry.phase
+    if (Array.isArray(entry.dependsOn)) {
+      todo.dependsOn = entry.dependsOn.filter((dep) => typeof dep === "string" && dep !== "")
+    }
     todos.push(todo)
   }
   return todos
@@ -1468,8 +1811,9 @@ function render(todos) {
   if (todos.length === 0) return "(the todo list is empty)"
   return todos
     .map((todo, index) => {
+      const phase = todo.phase ? \` [\${todo.phase}]\` : ""
       const priority = todo.priority ? \` — \${todo.priority} priority\` : ""
-      return \`\${index + 1}. \${MARK[todo.status]} \${todo.content}\${priority}\`
+      return \`\${index + 1}. \${MARK[todo.status]} \${todo.content}\${phase}\${priority}\`
     })
     .join("\\n")
 }
@@ -1477,14 +1821,54 @@ function render(todos) {
 const hasOpen = (todos) => todos.some((t) => t.status === "pending" || t.status === "in_progress")
 
 /** Writes atomically so the extension never reads a half-written file. */
-async function mirror(sessionID, todos) {
+async function mirror(sessionID, todos, phases) {
   const dir = mirrorDir()
   await mkdir(dir, { recursive: true })
-  const payload = JSON.stringify({ sessionID, todos, updatedAt: Date.now() }, null, 2)
+  const body = { version: 2, sessionID, todos, updatedAt: Date.now() }
+  if (Array.isArray(phases) && phases.length) body.phases = phases
+  const payload = JSON.stringify(body, null, 2)
   const target = join(dir, \`\${sessionID}.json\`)
   const tmp = join(dir, \`.\${sessionID}.\${process.pid}.tmp\`)
   await writeFile(tmp, payload, "utf8")
   await rename(tmp, target)
+  // Keep the board's session index current. Best-effort: the mirror is already
+  // durable, so a failed index write must not fail the todo write.
+  try {
+    await writeIndex(dir)
+  } catch {
+    /* the board falls back to whatever the index last held */
+  }
+}
+
+/**
+ * Writes \`_index.json\`, the list of sessions the board reads.
+ *
+ * The board's \`filesystem\` grant covers the files (\`todos/*.json\`), not the
+ * directory, so the board cannot \`listDir\`. The plugin runs with full access, so
+ * it writes the index instead — which keeps the grant file-level.
+ */
+async function writeIndex(dir) {
+  let names = []
+  try {
+    names = await readdir(dir)
+  } catch {
+    return
+  }
+  const sessions = []
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === INDEX_NAME) continue
+    try {
+      const info = await stat(join(dir, name))
+      sessions.push({ sessionID: name.slice(0, -".json".length), updatedAt: Math.round(info.mtimeMs) })
+    } catch {
+      /* a file that vanished mid-scan is skipped */
+    }
+  }
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  const payload = JSON.stringify({ version: 1, sessions, updatedAt: Date.now() }, null, 2)
+  const tmp = join(dir, \`.\${INDEX_NAME}.\${process.pid}.tmp\`)
+  await writeFile(tmp, payload, "utf8")
+  await rename(tmp, join(dir, INDEX_NAME))
 }
 
 /**
@@ -1532,6 +1916,13 @@ export const TODOWRITE_DESCRIPTION = [
   "- Items should be specific and actionable; break large work into smaller steps",
   "- Each call replaces the whole list, so always pass every item",
   "",
+  "## Structure (optional, for the visual task tree)",
+  "- Give each item a short stable \`id\`, and keep it the same across updates.",
+  "- Use \`parentId\` to nest a step under the task it belongs to (a subtask); leave it out for a top-level task.",
+  "- Use \`phase\` to name the stage a task belongs to (e.g. \\"调研\\", \\"实现\\", \\"验证\\"). Phases are drawn as colour bands.",
+  "- \`dependsOn: [ids]\` records a cross-task dependency (shown on the full task board).",
+  "- A flat list still works, but a tree is what makes progress legible at a glance.",
+  "",
   "When in doubt, use it.",
 ].join("\\n")
 
@@ -1558,6 +1949,7 @@ export function buildReminder(todos, repeats = 1) {
       \`This list has not changed in \${repeats} rounds. If any of it is finished, update it now with todowrite:\`,
       "- mark finished and verified work \`completed\`",
       "- move the task you are working on to \`in_progress\` (one at a time)",
+      "- nest subtasks with \`parentId\` and set each \`phase\`, so the tree stays readable",
     )
   } else {
     lines.push(
@@ -1565,6 +1957,7 @@ export function buildReminder(todos, repeats = 1) {
       "- mark a task \`completed\` as soon as it is done and verified",
       "- move the next task to \`in_progress\` before starting it (one at a time)",
       "- capture follow-ups discovered during the work",
+      "- keep the tree meaningful: nest subtasks with \`parentId\` and name each task's \`phase\`",
     )
   }
 
@@ -1574,6 +1967,12 @@ export function buildReminder(todos, repeats = 1) {
 const TODOS_INPUT = {
   type: "object",
   properties: {
+    phases: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Optional: the run's stages in order (e.g. [\\"调研\\", \\"实现\\", \\"验证\\"]). Sets the colour order of the task tree.",
+    },
     todos: {
       type: "array",
       description: "The complete todo list. This replaces any previous list.",
@@ -1583,6 +1982,10 @@ const TODOS_INPUT = {
           content: { type: "string", description: "Brief description of the task." },
           status: { type: "string", enum: TODO_STATUSES, description: "Current state of the task." },
           priority: { type: "string", enum: TODO_PRIORITIES, description: "Optional priority." },
+          id: { type: "string", description: "Optional stable id for this task; used to nest subtasks." },
+          parentId: { type: "string", description: "Optional id of the parent task, to nest this as a subtask." },
+          phase: { type: "string", description: "Optional stage name; phases are drawn as colour bands." },
+          dependsOn: { type: "array", items: { type: "string" }, description: "Optional ids this task depends on." },
         },
         required: ["content", "status"],
         additionalProperties: false,
@@ -1606,11 +2009,11 @@ export default {
         input: TODOS_INPUT,
         options: { codemode: false },
         async execute(input, context) {
-          const todos = normalize(input)
-          await ctx.storage.set(storageKey(context.sessionID), { todos, updatedAt: Date.now() })
+          const { todos, phases } = normalize(input)
+          await ctx.storage.set(storageKey(context.sessionID), { todos, phases: phases || [], updatedAt: Date.now() })
           // Mirror after the durable write: a mirror failure must not lose the list.
           try {
-            await mirror(context.sessionID, todos)
+            await mirror(context.sessionID, todos, phases)
           } catch {
             /* the list is already stored; the panel is best-effort */
           }
@@ -1665,7 +2068,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.5.1",
+  "version": "0.7.1",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -1685,13 +2088,38 @@ export default {
 // ${PLUGIN_ID}@${PLUGIN_VERSION}
 `;
   var ENTRY_CONTENT = SOURCE + VERSION_MARKER;
-  function planInstall(entry) {
+  var markerFor = (version) => `
+// ${PLUGIN_ID}@${version}
+`;
+  function versionFromMarker(entry) {
+    const match = new RegExp(`\\n// ${PLUGIN_ID}@([^\\n]+)\\n$`).exec(entry);
+    return match ? match[1].trim() : null;
+  }
+  function compareVersions(a, b) {
+    const parse = (value) => {
+      const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(value));
+      return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+    };
+    const left = parse(a);
+    const right = parse(b);
+    if (!left || !right)
+      return null;
+    for (let i = 0;i < 3; i += 1) {
+      if (left[i] !== right[i])
+        return left[i] < right[i] ? -1 : 1;
+    }
+    return 0;
+  }
+  function planInstall(entry, current = PLUGIN_VERSION) {
     if (typeof entry !== "string")
       return { action: "write", reason: "missing" };
     if (!entry.includes(PLUGIN_ID))
       return { action: "write", reason: "foreign" };
-    if (entry.endsWith(VERSION_MARKER))
+    if (entry.endsWith(markerFor(current)))
       return { action: "none", reason: "current" };
+    const onDisk = versionFromMarker(entry);
+    if (onDisk && compareVersions(onDisk, current) > 0)
+      return { action: "none", reason: "newer-on-disk" };
     return { action: "write", reason: "outdated" };
   }
   async function ensureInstalled(host) {
@@ -1745,7 +2173,6 @@ export default {
   var SNAP_QUIET_MS = 110;
   var HEIGHT_DELTA = 8;
   var HEIGHT_SETTLE_MS = 150;
-  var STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
   var PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" };
   var PRIORITY_MARK = {
     high: "⌃⌃",
@@ -1774,42 +2201,17 @@ export default {
   var completionGhosts = new Set;
   var suppressAnimationsForNextPaint = true;
   var painted = [];
+  var paintedPhases = [];
   var lastHeight = MANIFEST_H;
   var heightTimer = null;
   var idleTimer = null;
   var snapTimer = null;
-  function file(sessionID) {
-    return `~/.config/openchamber/todos/${sessionID}.json`;
+  function file(sessionID2) {
+    return `~/.config/openchamber/todos/${sessionID2}.json`;
   }
   function esc(value) {
     return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
   }
-  function parse(content) {
-    let data;
-    try {
-      data = JSON.parse(content);
-    } catch {
-      return null;
-    }
-    const raw = data && Array.isArray(data.todos) ? data.todos : [];
-    const todos = [];
-    for (const entry of raw) {
-      if (entry === null || typeof entry !== "object")
-        continue;
-      const text = typeof entry.content === "string" ? entry.content.trim() : "";
-      if (!text)
-        continue;
-      if (!STATUSES.has(entry.status))
-        continue;
-      todos.push({
-        content: text,
-        status: entry.status,
-        priority: typeof entry.priority === "string" ? entry.priority : ""
-      });
-    }
-    return todos;
-  }
-  var isFinished = (t) => t.status === "completed" || t.status === "cancelled";
   function order(list) {
     const rank = { in_progress: 0, pending: 1 };
     return list.map((todo, index) => ({ todo, index })).sort((a, b) => {
@@ -1856,23 +2258,39 @@ export default {
       normalizeTypewriter(text);
     }, Math.max(settle + 80, TYPEWRITER_CLEANUP_MIN_MS));
   }
-  function itemHtml(todo, key, typing = false) {
+  function priorityHtml(todo) {
     const mark = PRIORITY_MARK[todo.priority] || "";
-    const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : "";
+    if (!mark)
+      return "";
+    return `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>`;
+  }
+  function itemHtml(todo, key, typing = false, tree = null) {
+    const pri = priorityHtml(todo);
+    if (tree && tree.synthetic) {
+      const width = tree.depth * INDENT + GUT_NODE;
+      return `<div class="item tree group" data-row-key="${esc(key)}" data-status=""` + ` data-depth="${tree.depth}" data-last="${tree.isLast ? 1 : 0}" data-color="${tree.colorIndex}">` + `<span class="gut" style="width:${width}px">${gutterSvg(tree, "")}</span>` + `<span class="txt group-label" style="color:${phaseColor(tree.colorIndex)}">${esc(todo.content)}</span></div>`;
+    }
+    if (tree) {
+      const width = tree.depth * INDENT + GUT_NODE;
+      return `<div class="item tree ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}"` + ` data-depth="${tree.depth}" data-last="${tree.isLast ? 1 : 0}" data-color="${tree.colorIndex}">` + `<span class="gut" style="width:${width}px">${gutterSvg(tree, todo.status)}</span>` + `${textHtml(todo.content, typing)}${pri}</div>`;
+    }
     return `<div class="item ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}">` + `<span class="box">${statusMarkHtml(todo.status)}</span>` + `${textHtml(todo.content, typing)}${pri}</div>`;
   }
-  function buildRows(list) {
+  function rowKeys(list) {
     const occurrences = new Map;
-    const keyByTodo = new Map;
-    for (const todo of list) {
+    return list.map((todo) => {
       const occurrence = occurrences.get(todo.content) || 0;
       occurrences.set(todo.content, occurrence + 1);
-      keyByTodo.set(todo, `item:${JSON.stringify([todo.content, occurrence])}`);
-    }
+      return `item:${JSON.stringify([todo.content, occurrence])}`;
+    });
+  }
+  function buildRows(list) {
+    const keys = rowKeys(list);
+    const keyOf = new Map(list.map((todo, index) => [todo, keys[index]]));
     const open = order(list.filter((todo) => !isFinished(todo)));
     const finished = list.filter(isFinished).sort((a, b) => {
-      const aOrder = completedAtEnd.get(keyByTodo.get(a));
-      const bOrder = completedAtEnd.get(keyByTodo.get(b));
+      const aOrder = completedAtEnd.get(keyOf.get(a));
+      const bOrder = completedAtEnd.get(keyOf.get(b));
       if (aOrder === undefined && bOrder === undefined)
         return 0;
       if (aOrder === undefined)
@@ -1881,23 +2299,46 @@ export default {
         return 1;
       return aOrder - bOrder;
     });
-    const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo }));
+    const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyOf.get(todo), todo }));
     if (finished.length) {
       const expanded = openFinished && finishedFor === sessionID;
       rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded });
       if (expanded) {
         for (const todo of finished) {
-          rows.push({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo });
+          rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo });
         }
       }
     }
     return rows;
   }
+  function treeRows(list, phases) {
+    const keys = rowKeys(list);
+    const keyOf = new Map(list.map((todo, index) => [todo, keys[index]]));
+    const kept = pruneFinished(list);
+    const expanded = openFinished && finishedFor === sessionID;
+    const shown = expanded ? list : kept;
+    const { rows } = buildTree(shown, phases);
+    const out = rows.map((tree) => {
+      const todo = tree.synthetic ? { content: tree.content, status: "", priority: "", phase: tree.phase } : shown[tree.index];
+      const key = tree.synthetic ? tree.key : keyOf.get(todo);
+      return { kind: "item", status: tree.status, key, todo, tree };
+    });
+    const hidden = list.length - kept.length;
+    if (hidden) {
+      out.push({ kind: "fold", status: "fold", key: "fold", count: hidden, expanded });
+    }
+    return out;
+  }
+  function currentRows() {
+    if (!painted.length)
+      return [];
+    return hasStructure(painted) ? treeRows(painted, paintedPhases) : buildRows(painted);
+  }
   function rowHtml(row, typing = false) {
     if (row.kind === "fold") {
       return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`;
     }
-    return itemHtml(row.todo, row.key, typing);
+    return itemHtml(row.todo, row.key, typing, row.tree || null);
   }
   function createRowNode(row, typing = false) {
     const template = document.createElement("template");
@@ -1930,20 +2371,35 @@ export default {
       node.dataset.rowKey = row.key;
     if (previousStatus !== todo.status) {
       node.dataset.status = todo.status;
-      node.className = `item ${todo.status}`;
+      node.className = row.tree ? row.tree.synthetic ? "item tree group" : `item tree ${todo.status}` : `item ${todo.status}`;
       node.removeAttribute("data-completion-phase");
     }
     const text = node.querySelector(".txt");
     if (text.textContent !== todo.content)
       text.textContent = todo.content;
-    if (previousStatus !== todo.status) {
-      const box = node.querySelector(".box");
-      box.innerHTML = statusMarkHtml(todo.status);
-      if (animateStatus && todo.status === "completed" && !reducedMotion()) {
-        const tick = box.querySelector(".tick");
-        if (tick) {
-          node.classList.add("just-completed");
-          tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+    const recolor = row.tree && node.dataset.color !== String(row.tree.colorIndex);
+    if (previousStatus !== todo.status || recolor) {
+      if (row.tree) {
+        node.dataset.color = String(row.tree.colorIndex);
+        const gut = node.querySelector(".gut");
+        if (gut)
+          gut.innerHTML = gutterSvg(row.tree, todo.status);
+        if (previousStatus !== todo.status && animateStatus && todo.status === "completed" && !reducedMotion()) {
+          const tick = node.querySelector(".gut .gut-tick");
+          if (tick) {
+            node.classList.add("just-completed");
+            tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+          }
+        }
+      } else {
+        const box = node.querySelector(".box");
+        box.innerHTML = statusMarkHtml(todo.status);
+        if (animateStatus && todo.status === "completed" && !reducedMotion()) {
+          const tick = box.querySelector(".tick");
+          if (tick) {
+            node.classList.add("just-completed");
+            tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+          }
         }
       }
     }
@@ -2146,7 +2602,7 @@ export default {
       }
       const foldCollapsed = !(openFinished && finishedFor === sessionID);
       const ghostRows = foldCollapsed ? new Map(entries.map(({ row }) => [row.key, row])) : new Map;
-      const result = reconcileRows(buildRows(painted), {
+      const result = reconcileRows(currentRows(), {
         animate: animateStructure,
         newTaskKeys: pendingTypewriterKeys,
         skipCompletionDetection: true,
@@ -2330,7 +2786,7 @@ export default {
       finishedFor = sessionID;
       lastKey = "";
       if (painted.length)
-        paint(painted);
+        paint(painted, paintedPhases);
     });
     body.addEventListener("scroll", () => {
       if (pointerDown)
@@ -2358,7 +2814,10 @@ export default {
     const style = getComputedStyle(el2("body"));
     return Math.round((parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0));
   }
-  function paint(todos) {
+  function legendHtml(phases) {
+    return phases.map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`).join("");
+  }
+  function paint(todos, phases = []) {
     cancelRowAnimations();
     if (!todos.length) {
       rememberTaskKeys(todos);
@@ -2366,23 +2825,44 @@ export default {
       return;
     }
     painted = todos;
+    paintedPhases = phases;
+    const structured = hasStructure(todos);
     const newTaskKeys = rememberTaskKeys(todos);
     const animate = !suppressAnimationsForNextPaint;
     suppressAnimationsForNextPaint = false;
     el2("root").dataset.mode = "work";
+    const view = structured ? "tree" : "flat";
+    if (el2("root").dataset.view && el2("root").dataset.view !== view) {
+      el2("body").innerHTML = "";
+    }
+    el2("root").dataset.view = view;
     const top = el2("top");
     const done = todos.filter(isFinished).length;
     top.dataset.empty = "false";
     el2("count").textContent = `${done}/${todos.length}`;
     top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false";
     top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`;
-    const result = reconcileRows(buildRows(todos), { animate, newTaskKeys });
+    const legend = el2("legend");
+    if (structured && phases.length) {
+      legend.innerHTML = legendHtml(phases);
+      legend.hidden = false;
+    } else {
+      legend.innerHTML = "";
+      legend.hidden = true;
+    }
+    const result = reconcileRows(currentRows(), { animate, newTaskKeys });
     if (!result.staged)
       applyListHeight(result.entering.length > 0);
   }
   function paintPlain(html) {
     cancelRowAnimations();
     painted = [];
+    paintedPhases = [];
+    const legend = el2("legend");
+    if (legend) {
+      legend.innerHTML = "";
+      legend.hidden = true;
+    }
     clearIdle();
     clearTimeout(snapTimer);
     snapTimer = null;
@@ -2445,16 +2925,16 @@ export default {
     }
     if (!isCurrent())
       return;
-    const todos = parse(content);
-    if (todos === null) {
+    const doc = parseDoc(content);
+    if (doc === null) {
       paintMessage("Todo list is not valid JSON.");
       return;
     }
-    const key = JSON.stringify([requestedSessionID, todos, openFinished]);
+    const key = JSON.stringify([requestedSessionID, doc.todos, doc.phases, openFinished]);
     if (key === lastKey)
       return;
     lastKey = key;
-    paint(todos);
+    paint(doc.todos, doc.phases);
   }
   function start() {
     if (timer !== null)
@@ -2478,6 +2958,7 @@ export default {
     }
   }
   function boot() {
+    ensureGutStyle(document);
     if (!insideHostFrame()) {
       paintMessage("Open this inside OpenChamber to see todos.");
       return;
@@ -2513,6 +2994,7 @@ export default {
         pendingTypewriterKeys.clear();
         completedAtEnd.clear();
         completionSequence = 0;
+        paintedPhases = [];
         suppressAnimationsForNextPaint = true;
       }
       if (!installChecked && !UI_ONLY) {
@@ -2547,6 +3029,7 @@ export default {
         pendingTypewriterKeys.clear();
         completedAtEnd.clear();
         completionSequence = 0;
+        paintedPhases = [];
         suppressAnimationsForNextPaint = true;
       }
       lastKey = "";

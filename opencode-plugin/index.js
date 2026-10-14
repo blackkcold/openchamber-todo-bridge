@@ -23,16 +23,21 @@
  *
  * Data file:
  *   <TODO_BRIDGE_DIR>/<sessionID>.json     (default ~/.config/openchamber/todos)
- *   { sessionID, todos: [{ content, status, priority? }], updatedAt }
+ *   { version: 2, sessionID, phases?, todos: [{ content, status, priority?, id?,
+ *     parentId?, phase?, dependsOn? }], updatedAt }
+ *   A v1 file (no `version`, flat items) is still read; the extra fields are
+ *   optional and only drive the visual task tree.
  */
 
-import { mkdir, rename, writeFile } from "node:fs/promises"
+import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
 const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"]
 const TODO_PRIORITIES = ["high", "medium", "low"]
 const STORAGE_PREFIX = "todos/"
+/** The session index the board reads (the board may not `listDir` the folder). */
+const INDEX_NAME = "_index.json"
 const MARK = { pending: "[ ]", in_progress: "[•]", completed: "[x]", cancelled: "[-]" }
 
 /** Where the mirror writes. Override for testing with TODO_BRIDGE_DIR. */
@@ -44,35 +49,68 @@ function mirrorDir() {
 
 const storageKey = (sessionID) => `${STORAGE_PREFIX}${sessionID}`
 
+/** A non-empty trimmed string, or a readable error for the model to correct. */
+function requireString(value, what) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${what} must be a non-empty string`)
+  }
+  return value.trim()
+}
+
 /**
  * Validates a `todowrite` payload. Throws with a readable message so the model
  * can correct itself instead of silently losing the list.
+ *
+ * The structure fields (`id`, `parentId`, `phase`, `dependsOn`, top-level
+ * `phases`) are optional and drive the visual task tree; a present one is still
+ * validated, so a typo is caught rather than drawn as a broken tree.
  */
-function normalize(input) {
+export function normalize(input) {
   if (input === null || typeof input !== "object" || !("todos" in input)) {
     throw new Error("todowrite requires a `todos` array")
   }
   const raw = input.todos
   if (!Array.isArray(raw)) throw new Error("`todos` must be an array")
 
-  return raw.map((entry, index) => {
+  const todos = raw.map((entry, index) => {
+    const at = `todo #${index + 1}`
     if (entry === null || typeof entry !== "object") {
-      throw new Error(`todo #${index + 1} must be an object`)
+      throw new Error(`${at} must be an object`)
     }
     const content = typeof entry.content === "string" ? entry.content.trim() : ""
-    if (!content) throw new Error(`todo #${index + 1} requires a non-empty \`content\` string`)
+    if (!content) throw new Error(`${at} requires a non-empty \`content\` string`)
     if (!TODO_STATUSES.includes(entry.status)) {
-      throw new Error(`todo #${index + 1} has invalid \`status\` (expected: ${TODO_STATUSES.join(", ")})`)
+      throw new Error(`${at} has invalid \`status\` (expected: ${TODO_STATUSES.join(", ")})`)
     }
     const todo = { content, status: entry.status }
     if (entry.priority !== undefined) {
       if (!TODO_PRIORITIES.includes(entry.priority)) {
-        throw new Error(`todo #${index + 1} has invalid \`priority\` (expected: ${TODO_PRIORITIES.join(", ")})`)
+        throw new Error(`${at} has invalid \`priority\` (expected: ${TODO_PRIORITIES.join(", ")})`)
       }
       todo.priority = entry.priority
     }
+    if (entry.id !== undefined) todo.id = requireString(entry.id, `${at} \`id\``)
+    if (entry.parentId !== undefined && entry.parentId !== null) {
+      todo.parentId = requireString(entry.parentId, `${at} \`parentId\``)
+    }
+    if (entry.phase !== undefined) todo.phase = requireString(entry.phase, `${at} \`phase\``)
+    if (entry.dependsOn !== undefined) {
+      if (!Array.isArray(entry.dependsOn) || entry.dependsOn.some((dep) => typeof dep !== "string" || dep.trim() === "")) {
+        throw new Error(`${at} \`dependsOn\` must be an array of non-empty strings`)
+      }
+      todo.dependsOn = entry.dependsOn.map((dep) => dep.trim())
+    }
     return todo
   })
+
+  const result = { todos }
+  if (input.phases !== undefined) {
+    if (!Array.isArray(input.phases) || input.phases.some((p) => typeof p !== "string" || p.trim() === "")) {
+      throw new Error("`phases` must be an array of non-empty strings")
+    }
+    result.phases = input.phases.map((p) => p.trim())
+  }
+  return result
 }
 
 /**
@@ -89,6 +127,12 @@ function parseRecord(value) {
     if (!TODO_STATUSES.includes(entry.status)) continue
     const todo = { content: entry.content, status: entry.status }
     if (TODO_PRIORITIES.includes(entry.priority)) todo.priority = entry.priority
+    if (typeof entry.id === "string" && entry.id !== "") todo.id = entry.id
+    if (typeof entry.parentId === "string" && entry.parentId !== "") todo.parentId = entry.parentId
+    if (typeof entry.phase === "string" && entry.phase !== "") todo.phase = entry.phase
+    if (Array.isArray(entry.dependsOn)) {
+      todo.dependsOn = entry.dependsOn.filter((dep) => typeof dep === "string" && dep !== "")
+    }
     todos.push(todo)
   }
   return todos
@@ -98,8 +142,9 @@ function render(todos) {
   if (todos.length === 0) return "(the todo list is empty)"
   return todos
     .map((todo, index) => {
+      const phase = todo.phase ? ` [${todo.phase}]` : ""
       const priority = todo.priority ? ` — ${todo.priority} priority` : ""
-      return `${index + 1}. ${MARK[todo.status]} ${todo.content}${priority}`
+      return `${index + 1}. ${MARK[todo.status]} ${todo.content}${phase}${priority}`
     })
     .join("\n")
 }
@@ -107,14 +152,54 @@ function render(todos) {
 const hasOpen = (todos) => todos.some((t) => t.status === "pending" || t.status === "in_progress")
 
 /** Writes atomically so the extension never reads a half-written file. */
-async function mirror(sessionID, todos) {
+async function mirror(sessionID, todos, phases) {
   const dir = mirrorDir()
   await mkdir(dir, { recursive: true })
-  const payload = JSON.stringify({ sessionID, todos, updatedAt: Date.now() }, null, 2)
+  const body = { version: 2, sessionID, todos, updatedAt: Date.now() }
+  if (Array.isArray(phases) && phases.length) body.phases = phases
+  const payload = JSON.stringify(body, null, 2)
   const target = join(dir, `${sessionID}.json`)
   const tmp = join(dir, `.${sessionID}.${process.pid}.tmp`)
   await writeFile(tmp, payload, "utf8")
   await rename(tmp, target)
+  // Keep the board's session index current. Best-effort: the mirror is already
+  // durable, so a failed index write must not fail the todo write.
+  try {
+    await writeIndex(dir)
+  } catch {
+    /* the board falls back to whatever the index last held */
+  }
+}
+
+/**
+ * Writes `_index.json`, the list of sessions the board reads.
+ *
+ * The board's `filesystem` grant covers the files (`todos/*.json`), not the
+ * directory, so the board cannot `listDir`. The plugin runs with full access, so
+ * it writes the index instead — which keeps the grant file-level.
+ */
+async function writeIndex(dir) {
+  let names = []
+  try {
+    names = await readdir(dir)
+  } catch {
+    return
+  }
+  const sessions = []
+  for (const name of names) {
+    if (!name.endsWith(".json") || name === INDEX_NAME) continue
+    try {
+      const info = await stat(join(dir, name))
+      sessions.push({ sessionID: name.slice(0, -".json".length), updatedAt: Math.round(info.mtimeMs) })
+    } catch {
+      /* a file that vanished mid-scan is skipped */
+    }
+  }
+  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  const payload = JSON.stringify({ version: 1, sessions, updatedAt: Date.now() }, null, 2)
+  const tmp = join(dir, `.${INDEX_NAME}.${process.pid}.tmp`)
+  await writeFile(tmp, payload, "utf8")
+  await rename(tmp, join(dir, INDEX_NAME))
 }
 
 /**
@@ -162,6 +247,13 @@ export const TODOWRITE_DESCRIPTION = [
   "- Items should be specific and actionable; break large work into smaller steps",
   "- Each call replaces the whole list, so always pass every item",
   "",
+  "## Structure (optional, for the visual task tree)",
+  "- Give each item a short stable `id`, and keep it the same across updates.",
+  "- Use `parentId` to nest a step under the task it belongs to (a subtask); leave it out for a top-level task.",
+  "- Use `phase` to name the stage a task belongs to (e.g. \"调研\", \"实现\", \"验证\"). Phases are drawn as colour bands.",
+  "- `dependsOn: [ids]` records a cross-task dependency (shown on the full task board).",
+  "- A flat list still works, but a tree is what makes progress legible at a glance.",
+  "",
   "When in doubt, use it.",
 ].join("\n")
 
@@ -188,6 +280,7 @@ export function buildReminder(todos, repeats = 1) {
       `This list has not changed in ${repeats} rounds. If any of it is finished, update it now with todowrite:`,
       "- mark finished and verified work `completed`",
       "- move the task you are working on to `in_progress` (one at a time)",
+      "- nest subtasks with `parentId` and set each `phase`, so the tree stays readable",
     )
   } else {
     lines.push(
@@ -195,6 +288,7 @@ export function buildReminder(todos, repeats = 1) {
       "- mark a task `completed` as soon as it is done and verified",
       "- move the next task to `in_progress` before starting it (one at a time)",
       "- capture follow-ups discovered during the work",
+      "- keep the tree meaningful: nest subtasks with `parentId` and name each task's `phase`",
     )
   }
 
@@ -204,6 +298,12 @@ export function buildReminder(todos, repeats = 1) {
 const TODOS_INPUT = {
   type: "object",
   properties: {
+    phases: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Optional: the run's stages in order (e.g. [\"调研\", \"实现\", \"验证\"]). Sets the colour order of the task tree.",
+    },
     todos: {
       type: "array",
       description: "The complete todo list. This replaces any previous list.",
@@ -213,6 +313,10 @@ const TODOS_INPUT = {
           content: { type: "string", description: "Brief description of the task." },
           status: { type: "string", enum: TODO_STATUSES, description: "Current state of the task." },
           priority: { type: "string", enum: TODO_PRIORITIES, description: "Optional priority." },
+          id: { type: "string", description: "Optional stable id for this task; used to nest subtasks." },
+          parentId: { type: "string", description: "Optional id of the parent task, to nest this as a subtask." },
+          phase: { type: "string", description: "Optional stage name; phases are drawn as colour bands." },
+          dependsOn: { type: "array", items: { type: "string" }, description: "Optional ids this task depends on." },
         },
         required: ["content", "status"],
         additionalProperties: false,
@@ -236,11 +340,11 @@ export default {
         input: TODOS_INPUT,
         options: { codemode: false },
         async execute(input, context) {
-          const todos = normalize(input)
-          await ctx.storage.set(storageKey(context.sessionID), { todos, updatedAt: Date.now() })
+          const { todos, phases } = normalize(input)
+          await ctx.storage.set(storageKey(context.sessionID), { todos, phases: phases || [], updatedAt: Date.now() })
           // Mirror after the durable write: a mirror failure must not lose the list.
           try {
-            await mirror(context.sessionID, todos)
+            await mirror(context.sessionID, todos, phases)
           } catch {
             /* the list is already stored; the panel is best-effort */
           }

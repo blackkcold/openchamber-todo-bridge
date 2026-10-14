@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>任务图</title>
+    <style>
+      /*
+        The task board: every session's task view, side by side, with a
+        cross-session summary, filters, a view switch (tree / phase swimlanes),
+        a session selector, and a node detail. Opened full-screen from Extension
+        pages. Colour comes from the host's --oc-* variables via applyHostReady.
+        The `.gut*` CSS is injected by src/gutter.js; the toolbar controls are
+        mounted from @openchamber/sdk/ui so they match the app.
+      */
+      :root { --b-border: var(--oc-border, #dad8ce); --b-muted: var(--oc-muted, #6f6e69); --b-fg: var(--oc-fg, #100f0f); }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        font: 12px/1.45 var(--oc-font, ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif);
+        background: var(--oc-bg, transparent); color: var(--b-fg); overflow: hidden;
+      }
+      #root { height: 100%; display: flex; flex-direction: column; }
+      #toolbar {
+        flex: 0 0 auto; display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+        padding: 10px 14px; border-bottom: 1px solid var(--b-border);
+      }
+      #searchHost { flex: 1 1 180px; min-width: 150px; max-width: 300px; }
+      #sessionHost { min-width: 180px; }
+      #viewHost { min-width: 120px; }
+      #statusHost, #phaseHost { min-width: 130px; }
+      #finishedHost { flex: 0 0 auto; }
+      #legend { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--b-muted); font-size: 11px; margin-left: auto; }
+      .lg { display: inline-flex; align-items: center; gap: 4px; }
+      .lg > i { width: 8px; height: 8px; border-radius: 999px; }
+
+      #summary {
+        flex: 0 0 auto; padding: 10px 14px; border-bottom: 1px solid var(--b-border);
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      #summary .stats { display: flex; gap: 16px; flex-wrap: wrap; color: var(--b-muted); align-items: baseline; }
+      #summary .stats b { color: var(--b-fg); }
+      #summary .blocked { color: var(--oc-error, #af3029); }
+      #summary .phases { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+      #summary .pg { display: inline-flex; align-items: center; gap: 5px; color: var(--b-muted); }
+      #summary .pg > i { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
+      #summary .pg > b { color: var(--b-fg); font-weight: 600; }
+
+      #main { flex: 1 1 auto; min-height: 0; display: flex; }
+      #sessions { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 12px 16px; }
+      #details { flex: 0 0 280px; border-left: 1px solid var(--b-border); padding: 14px; overflow-y: auto; }
+
+      .sess { margin-bottom: 22px; max-width: 900px; }
+      .sess-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+      .sess-head h3 { margin: 0; font-size: 12px; font-weight: 600; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .sess-head .cnt { color: var(--b-muted); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+      .prog { height: 2px; border-radius: 999px; background: var(--b-border); overflow: hidden; margin-bottom: 6px; }
+      .prog > i { display: block; height: 100%; background: var(--oc-success, #66800b); }
+
+      .row { display: flex; gap: 7px; align-items: flex-start; padding: 3px 6px; border-radius: 6px; cursor: pointer; }
+      .row:hover { background: var(--oc-hover, rgba(0, 0, 0, .04)); }
+      .row.sel { background: var(--oc-selection, var(--oc-hover, rgba(0, 0, 0, .06))); }
+      .row .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+      .row.completed .txt, .row.cancelled .txt { color: var(--b-muted); text-decoration: line-through; }
+      .row.in_progress .txt { font-weight: 600; }
+      .row.group .txt { font-weight: 600; }
+      .row.group { cursor: default; }
+      .row.dim { opacity: .3; }
+      .pill { flex: 0 0 auto; font-size: 10px; color: var(--b-muted); border: 1px solid var(--b-border); border-radius: 999px; padding: 0 6px; }
+      .pill.blocked { color: var(--oc-error, #af3029); border-color: var(--oc-error, #af3029); border-style: dashed; }
+
+      .swim { overflow: auto; max-height: 62vh; border: 1px solid var(--b-border); border-radius: 8px; background: var(--oc-subtle, transparent); }
+      .swim svg { display: block; }
+
+      #details h3 { margin: 0 0 10px; font-size: 12px; }
+      #details .content { font-weight: 600; margin: 6px 0 10px; overflow-wrap: anywhere; }
+      #details .kv { color: var(--b-muted); font-size: 11px; margin: 3px 0; }
+      #details .kv a { color: var(--oc-primary, #205ea6); cursor: pointer; text-decoration: underline; }
+      #details .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+      .note { color: var(--b-muted); padding: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="toolbar">
+        <div id="searchHost"></div>
+        <div id="sessionHost"></div>
+        <div id="viewHost"></div>
+        <div id="statusHost"></div>
+        <div id="phaseHost"></div>
+        <div id="finishedHost"></div>
+        <div id="legend"></div>
+      </div>
+      <div id="summary"></div>
+      <div id="main">
+        <div id="sessions"><div class="note">Loading…</div></div>
+        <div id="details"></div>
+      </div>
+    </div>
+    <script src="main.js"></script>
+  </body>
+</html>

@@ -56,6 +56,14 @@
       </div>
     </div>
 
+    <h2>Light · 任务树（结构 + 阶段配色 + gutter）</h2>
+    <div class="wrap">
+      <div class="col">
+        <p class="cap"><b>弹性高度</b> — 宿主高度 <span class="m" id="mF">56px</span></p>
+        <div class="pane" id="paneF" style="height: 56px"><iframe id="f1"></iframe></div>
+      </div>
+    </div>
+
     <h2>Dark · 3 条（装得下 → 不滚，含折叠行）</h2>
     <div class="wrap dark">
       <div class="col">
@@ -149,6 +157,26 @@
       }
 
       const NONE = { sessionID: "ses_demo", updatedAt: Date.now(), todos: [] }
+
+      // A structured mirror: `id`/`parentId` nest subtasks, `phase` colours the
+      // bands, `phases` fixes the colour order. Exercises a non-last ancestor
+      // (t1 has a following root, t2 has following siblings) so the vertical
+      // trunks are drawn, and a three-deep branch (t5).
+      const TREE = {
+        sessionID: "ses_tree",
+        updatedAt: Date.now(),
+        phases: ["调研", "设计", "实现", "验证"],
+        todos: [
+          { content: "调研：现有渲染管线与高度模型", status: "completed", id: "t1", phase: "调研" },
+          { content: "设计：树的布局与 gutter 方案", status: "completed", id: "t2", parentId: "t1", phase: "设计" },
+          { content: "实现：graph.js 建树与布局", status: "completed", id: "t3", parentId: "t2", phase: "实现" },
+          { content: "实现：区块行级 SVG gutter", status: "in_progress", id: "t4", parentId: "t2", phase: "实现" },
+          { content: "实现：肘形连接线与祖先主干", status: "pending", id: "t5", parentId: "t4", phase: "实现" },
+          { content: "实现：阶段配色与图例", status: "pending", id: "t6", parentId: "t2", phase: "实现" },
+          { content: "验证：verify.html 树窗格", status: "pending", id: "t7", phase: "验证" },
+          { content: "验证：暗色主题下的对比度", status: "pending", id: "t8", parentId: "t7", phase: "验证", dependsOn: ["t4"] },
+        ],
+      }
 
       const ANIMATION_INITIAL = {
         sessionID: "ses_anim",
@@ -318,6 +346,7 @@
         .catch(() => {})
         .then(() => {
           mount("a1", LIGHT, MANY, "mA", true)
+          mount("f1", LIGHT, TREE, "mF", true)
           mount("b1", DARK, FEW, "mB", true)
           mount("c1", LIGHT, NONE, "mC", true)
           mount("d1", LIGHT, FEW, null, false, true)   // stale plugin: exercises the notice path

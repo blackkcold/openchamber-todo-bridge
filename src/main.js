@@ -49,6 +49,15 @@ import {
   MIN_H,
   nearestIndex,
 } from "./viewport.js"
+import {
+  buildTree,
+  hasStructure,
+  INDENT,
+  phaseColor,
+  pruneFinished,
+} from "./graph.js"
+import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
+import { isFinished, parseDoc } from "./doc.js"
 import { ensureInstalled, PLUGIN_DIR_PATH } from "./plugin-install.js"
 
 const POLL_MS = 2000
@@ -94,7 +103,6 @@ const SNAP_QUIET_MS = 110
 const HEIGHT_DELTA = 8
 /** Coalescing window, so a burst of height changes settles into one resize. */
 const HEIGHT_SETTLE_MS = 150
-const STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"])
 const PRIORITY_CLASS = { high: "high", medium: "medium", low: "low" }
 /** Rising mark: one chevron for medium, two for high, a dot for ordinary work. */
 const PRIORITY_MARK = {
@@ -131,6 +139,8 @@ let suppressAnimationsForNextPaint = true
 // ---- height and scroll state ----
 /** The list as last painted, so a fold click can relayout without a file read. */
 let painted = []
+/** The phases declared by the last painted mirror, for colour order. */
+let paintedPhases = []
 /** Last height handed to the host, and the pending coalesced change to it. */
 let lastHeight = MANIFEST_H
 let heightTimer = null
@@ -146,32 +156,6 @@ function esc(value) {
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
   ))
 }
-
-/** Defensive read: the file is written by another process and may be partial. */
-function parse(content) {
-  let data
-  try {
-    data = JSON.parse(content)
-  } catch {
-    return null
-  }
-  const raw = data && Array.isArray(data.todos) ? data.todos : []
-  const todos = []
-  for (const entry of raw) {
-    if (entry === null || typeof entry !== "object") continue
-    const text = typeof entry.content === "string" ? entry.content.trim() : ""
-    if (!text) continue
-    if (!STATUSES.has(entry.status)) continue
-    todos.push({
-      content: text,
-      status: entry.status,
-      priority: typeof entry.priority === "string" ? entry.priority : "",
-    })
-  }
-  return todos
-}
-
-const isFinished = (t) => t.status === "completed" || t.status === "cancelled"
 
 /** Work in progress first, then pending, then whatever order they arrived in. */
 function order(list) {
@@ -248,10 +232,33 @@ function scheduleTypewriterCleanup(node, content) {
   }, Math.max(settle + 80, TYPEWRITER_CLEANUP_MIN_MS))
 }
 
-function itemHtml(todo, key, typing = false) {
+/** The rising priority mark, shared by a flat row and a tree row. */
+function priorityHtml(todo) {
   const mark = PRIORITY_MARK[todo.priority] || ""
-  const pri = mark ? `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>` : ""
+  if (!mark) return ""
+  return `<span class="pri ${PRIORITY_CLASS[todo.priority] || ""}">${mark}</span>`
+}
 
+function itemHtml(todo, key, typing = false, tree = null) {
+  const pri = priorityHtml(todo)
+  if (tree && tree.synthetic) {
+    const width = tree.depth * INDENT + GUT_NODE
+    return (
+      `<div class="item tree group" data-row-key="${esc(key)}" data-status=""` +
+      ` data-depth="${tree.depth}" data-last="${tree.isLast ? 1 : 0}" data-color="${tree.colorIndex}">` +
+      `<span class="gut" style="width:${width}px">${gutterSvg(tree, "")}</span>` +
+      `<span class="txt group-label" style="color:${phaseColor(tree.colorIndex)}">${esc(todo.content)}</span></div>`
+    )
+  }
+  if (tree) {
+    const width = tree.depth * INDENT + GUT_NODE
+    return (
+      `<div class="item tree ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}"` +
+      ` data-depth="${tree.depth}" data-last="${tree.isLast ? 1 : 0}" data-color="${tree.colorIndex}">` +
+      `<span class="gut" style="width:${width}px">${gutterSvg(tree, todo.status)}</span>` +
+      `${textHtml(todo.content, typing)}${pri}</div>`
+    )
+  }
   return (
     `<div class="item ${esc(todo.status)}" data-row-key="${esc(key)}" data-status="${esc(todo.status)}">` +
     `<span class="box">${statusMarkHtml(todo.status)}</span>` +
@@ -259,33 +266,43 @@ function itemHtml(todo, key, typing = false) {
   )
 }
 
-/** Rows for the current list: open work in order, then the finished fold. */
-function buildRows(list) {
+/**
+ * Identity for a row across repaints: content plus its occurrence at that
+ * content. `todowrite` replaces the whole list each call, so this is what keeps
+ * an unchanged task's row — and its animation state — stable while everything
+ * around it moves.
+ */
+function rowKeys(list) {
   const occurrences = new Map()
-  const keyByTodo = new Map()
-  for (const todo of list) {
+  return list.map((todo) => {
     const occurrence = occurrences.get(todo.content) || 0
     occurrences.set(todo.content, occurrence + 1)
-    keyByTodo.set(todo, `item:${JSON.stringify([todo.content, occurrence])}`)
-  }
+    return `item:${JSON.stringify([todo.content, occurrence])}`
+  })
+}
+
+/** Rows for the flat list: open work in order, then the finished fold. */
+function buildRows(list) {
+  const keys = rowKeys(list)
+  const keyOf = new Map(list.map((todo, index) => [todo, keys[index]]))
 
   const open = order(list.filter((todo) => !isFinished(todo)))
   const finished = list.filter(isFinished).sort((a, b) => {
-    const aOrder = completedAtEnd.get(keyByTodo.get(a))
-    const bOrder = completedAtEnd.get(keyByTodo.get(b))
+    const aOrder = completedAtEnd.get(keyOf.get(a))
+    const bOrder = completedAtEnd.get(keyOf.get(b))
     if (aOrder === undefined && bOrder === undefined) return 0
     if (aOrder === undefined) return -1
     if (bOrder === undefined) return 1
     return aOrder - bOrder
   })
-  const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo }))
+  const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyOf.get(todo), todo }))
 
   if (finished.length) {
     const expanded = openFinished && finishedFor === sessionID
     rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded })
     if (expanded) {
       for (const todo of finished) {
-        rows.push({ kind: "item", status: todo.status, key: keyByTodo.get(todo), todo })
+        rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo })
       }
     }
   }
@@ -293,11 +310,44 @@ function buildRows(list) {
   return rows
 }
 
+/**
+ * Rows for the structured list: a DFS walk of the task tree. Finished work is
+ * hidden by default (kept only when it leads to unfinished work) and summarised
+ * by one "finished" fold, so the open tasks are not buried under a done tail.
+ * The key is the same content+occurrence identity the flat list uses.
+ */
+function treeRows(list, phases) {
+  const keys = rowKeys(list)
+  const keyOf = new Map(list.map((todo, index) => [todo, keys[index]]))
+  const kept = pruneFinished(list)
+  const expanded = openFinished && finishedFor === sessionID
+  const shown = expanded ? list : kept
+  const { rows } = buildTree(shown, phases)
+  const out = rows.map((tree) => {
+    const todo = tree.synthetic
+      ? { content: tree.content, status: "", priority: "", phase: tree.phase }
+      : shown[tree.index]
+    const key = tree.synthetic ? tree.key : keyOf.get(todo)
+    return { kind: "item", status: tree.status, key, todo, tree }
+  })
+  const hidden = list.length - kept.length
+  if (hidden) {
+    out.push({ kind: "fold", status: "fold", key: "fold", count: hidden, expanded })
+  }
+  return out
+}
+
+/** The rows for whatever is currently painted — tree or flat. */
+function currentRows() {
+  if (!painted.length) return []
+  return hasStructure(painted) ? treeRows(painted, paintedPhases) : buildRows(painted)
+}
+
 function rowHtml(row, typing = false) {
   if (row.kind === "fold") {
     return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`
   }
-  return itemHtml(row.todo, row.key, typing)
+  return itemHtml(row.todo, row.key, typing, row.tree || null)
 }
 
 function createRowNode(row, typing = false) {
@@ -330,20 +380,37 @@ function updateRowNode(node, row, animateStatus = true) {
   if (node.dataset.rowKey !== row.key) node.dataset.rowKey = row.key
   if (previousStatus !== todo.status) {
     node.dataset.status = todo.status
-    node.className = `item ${todo.status}`
+    node.className = row.tree
+      ? (row.tree.synthetic ? "item tree group" : `item tree ${todo.status}`)
+      : `item ${todo.status}`
     node.removeAttribute("data-completion-phase")
   }
   const text = node.querySelector(".txt")
   if (text.textContent !== todo.content) text.textContent = todo.content
 
-  if (previousStatus !== todo.status) {
-    const box = node.querySelector(".box")
-    box.innerHTML = statusMarkHtml(todo.status)
-    if (animateStatus && todo.status === "completed" && !reducedMotion()) {
-      const tick = box.querySelector(".tick")
-      if (tick) {
-        node.classList.add("just-completed")
-        tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true })
+  // The mark changed with the status, or a phase re-coloured it.
+  const recolor = row.tree && node.dataset.color !== String(row.tree.colorIndex)
+  if (previousStatus !== todo.status || recolor) {
+    if (row.tree) {
+      node.dataset.color = String(row.tree.colorIndex)
+      const gut = node.querySelector(".gut")
+      if (gut) gut.innerHTML = gutterSvg(row.tree, todo.status)
+      if (previousStatus !== todo.status && animateStatus && todo.status === "completed" && !reducedMotion()) {
+        const tick = node.querySelector(".gut .gut-tick")
+        if (tick) {
+          node.classList.add("just-completed")
+          tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true })
+        }
+      }
+    } else {
+      const box = node.querySelector(".box")
+      box.innerHTML = statusMarkHtml(todo.status)
+      if (animateStatus && todo.status === "completed" && !reducedMotion()) {
+        const tick = box.querySelector(".tick")
+        if (tick) {
+          node.classList.add("just-completed")
+          tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true })
+        }
       }
     }
   }
@@ -584,7 +651,7 @@ function finishCompletionTransitions(entries, animateStructure) {
     const ghostRows = foldCollapsed
       ? new Map(entries.map(({ row }) => [row.key, row]))
       : new Map()
-    const result = reconcileRows(buildRows(painted), {
+    const result = reconcileRows(currentRows(), {
       animate: animateStructure,
       newTaskKeys: pendingTypewriterKeys,
       skipCompletionDetection: true,
@@ -851,7 +918,7 @@ function wireInput() {
     finishedFor = sessionID
     // The poll's key carries the fold state; clear it so the next read repaints.
     lastKey = ""
-    if (painted.length) paint(painted)
+    if (painted.length) paint(painted, paintedPhases)
   })
 
   body.addEventListener("scroll", () => {
@@ -882,7 +949,14 @@ function bodyPadding() {
   return Math.round((parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0))
 }
 
-function paint(todos) {
+/** One colour chip per phase, so "colour = stage" needs no explaining. */
+function legendHtml(phases) {
+  return phases
+    .map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`)
+    .join("")
+}
+
+function paint(todos, phases = []) {
   cancelRowAnimations()
   if (!todos.length) {
     rememberTaskKeys(todos)
@@ -891,10 +965,19 @@ function paint(todos) {
   }
 
   painted = todos
+  paintedPhases = phases
+  const structured = hasStructure(todos)
   const newTaskKeys = rememberTaskKeys(todos)
   const animate = !suppressAnimationsForNextPaint
   suppressAnimationsForNextPaint = false
   el("root").dataset.mode = "work"
+  const view = structured ? "tree" : "flat"
+  if (el("root").dataset.view && el("root").dataset.view !== view) {
+    // Switching between tree and flat changes a row's markup, not just its
+    // text; drop the rows so they are rebuilt in the new shape.
+    el("body").innerHTML = ""
+  }
+  el("root").dataset.view = view
 
   const top = el("top")
   const done = todos.filter(isFinished).length
@@ -903,7 +986,16 @@ function paint(todos) {
   top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false"
   top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`
 
-  const result = reconcileRows(buildRows(todos), { animate, newTaskKeys })
+  const legend = el("legend")
+  if (structured && phases.length) {
+    legend.innerHTML = legendHtml(phases)
+    legend.hidden = false
+  } else {
+    legend.innerHTML = ""
+    legend.hidden = true
+  }
+
+  const result = reconcileRows(currentRows(), { animate, newTaskKeys })
   if (!result.staged) applyListHeight(result.entering.length > 0)
 }
 
@@ -917,6 +1009,12 @@ function paint(todos) {
 function paintPlain(html) {
   cancelRowAnimations()
   painted = []
+  paintedPhases = []
+  const legend = el("legend")
+  if (legend) {
+    legend.innerHTML = ""
+    legend.hidden = true
+  }
   clearIdle()
   clearTimeout(snapTimer)
   snapTimer = null
@@ -1003,18 +1101,18 @@ async function refresh() {
   }
 
   if (!isCurrent()) return
-  const todos = parse(content)
-  if (todos === null) {
+  const doc = parseDoc(content)
+  if (doc === null) {
     paintMessage("Todo list is not valid JSON.")
     return
   }
 
   // Skip the DOM write when nothing changed, so a poll does not disturb
   // scrolling or the finished-group toggle.
-  const key = JSON.stringify([requestedSessionID, todos, openFinished])
+  const key = JSON.stringify([requestedSessionID, doc.todos, doc.phases, openFinished])
   if (key === lastKey) return
   lastKey = key
-  paint(todos)
+  paint(doc.todos, doc.phases)
 }
 
 function start() {
@@ -1039,6 +1137,7 @@ function insideHostFrame() {
 }
 
 function boot() {
+  ensureGutStyle(document)
   // Not framed: there is no host to talk to, so say so instead of waiting.
   if (!insideHostFrame()) {
     paintMessage("Open this inside OpenChamber to see todos.")
@@ -1085,6 +1184,7 @@ function boot() {
       pendingTypewriterKeys.clear()
       completedAtEnd.clear()
       completionSequence = 0
+      paintedPhases = []
       suppressAnimationsForNextPaint = true
     }
 
@@ -1129,6 +1229,7 @@ function boot() {
       pendingTypewriterKeys.clear()
       completedAtEnd.clear()
       completionSequence = 0
+      paintedPhases = []
       suppressAnimationsForNextPaint = true
     }
     lastKey = ""
