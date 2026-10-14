@@ -24,6 +24,8 @@ Finished work is hidden by default: the section and the panel show only in-progr
 
 A list that names stages (`phase`) but does not nest them still becomes a tree: the renderer adds one **group row per stage** and hangs the tasks under it, so a flat-but-phased list indents and draws connectors instead of reading as a plain list. Explicit nesting (`parentId`) always wins.
 
+Dead sessions can be set aside. Each card below the current session carries a **归档** action, and a **批量归档已完成** button archives every session whose work is already finished (no pending or in-progress task). A set-aside session leaves the list and joins a collapsed **🗄 已归档 N 个会话** row at the end — its mirror is not read and it is not drawn until you open that row, where each card offers **恢复** (and the fold offers **全部恢复**). Archiving is the board's own state, kept in the extension's storage, never in the todo files — so it never races the agent, and a session that runs `todowrite` again returns to the list on its own.
+
 ## Install
 
 In OpenChamber, open **Settings → Extensions**, paste this URL, select **Add**, and approve the requested permissions:
@@ -36,10 +38,10 @@ Send a message in an OpenCode session to start using the todo tools.
 
 ### Install a specific version
 
-Append a release tag to the URL, for example `#v0.8.0`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
+Append a release tag to the URL, for example `#v0.9.0`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
 
 ```text
-https://github.com/blackkcold/openchamber-todo-bridge#v0.8.0
+https://github.com/blackkcold/openchamber-todo-bridge#v0.9.0
 ```
 
 ### Manual plugin setup

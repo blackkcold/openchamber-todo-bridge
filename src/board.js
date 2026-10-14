@@ -25,6 +25,16 @@ import { buildTree, INDENT, phaseColor, pruneFinished } from "./graph.js"
 import { DAG_COL, dagLayout } from "./dag.js"
 import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { parseDoc, parseIndex } from "./doc.js"
+import {
+  ARCHIVE_KEY,
+  emptyArchive,
+  finishedSessionIDs,
+  isArchived,
+  parseArchive,
+  partition,
+  withArchived,
+  withoutArchived,
+} from "./archive.js"
 
 const POLL_MS = 4000
 const REQUEST_TIMEOUT_MS = 8000
@@ -50,7 +60,17 @@ let mounted = false
 let timer = null
 let lastKey = ""
 /** Every session, newest first, from the index alone — no mirror is opened for this. */
+let allMetas = []
+/** The sessions to show: `allMetas` minus the ones the reader has set aside. */
 let agenda = []
+/** The sessions set aside, newest first — not loaded, not rendered until the fold opens. */
+let archived = []
+/** The reader's archive, read from `host.storage` (never the mirrors or the index). */
+let archive = emptyArchive()
+/** Whether the set-aside fold is open; while closed, its mirrors are never read. */
+let showArchived = false
+/** How many set-aside sessions the open fold has drawn so far. */
+let archivedLoadedCount = BATCH
 let globalPhases = []
 /** sessionID -> { updatedAt, todos, phases }: the tree needs this; the index does not. */
 const docCache = new Map()
@@ -62,11 +82,18 @@ const filter = { query: "", status: "all", phase: "all", view: "tree", session: 
 let selected = null
 const controls = {}
 let detailHandles = []
-let observer = null
+/** IntersectionObservers for the load-more sentinels, one per open list. */
+let observers = []
+/** The last archive change, offered back as an undo for a few seconds. */
+let undo = null
+let undoTimer = null
+
+const ARCHIVE_UNDO_MS = 9000
 
 // ---- index metadata ----------------------------------------------------------
 
-const metaOf = (sessionID) => agenda.find((meta) => meta.sessionID === sessionID) || null
+/** A meta by session id, from the whole index (set-aside sessions included). */
+const metaOf = (sessionID) => allMetas.find((meta) => meta.sessionID === sessionID) || null
 
 /** The loaded mirror for a meta, or null when it is not loaded / is stale. */
 function docOf(meta) {
@@ -115,7 +142,10 @@ function windowMetas() {
   }
   const pinned = pinnedMeta()
   const shown = listMetas().slice(0, loadedCount)
-  return (pinned ? [pinned] : []).concat(shown)
+  const out = (pinned ? [pinned] : []).concat(shown)
+  // Set-aside sessions are read only when the fold is open — never by default.
+  if (showArchived) out.push(...archived.slice(0, archivedLoadedCount))
+  return out
 }
 
 // ---- mirrors (lazy) ----------------------------------------------------------
@@ -148,7 +178,7 @@ function materialize(meta) {
 }
 
 /** Header counts: from the index summary when present, else from the mirror. */
-function sessionHeader(meta) {
+function sessionHeader(meta, opts = {}) {
   const doc = docOf(meta)
   let done, total
   if (Number.isFinite(meta.total)) {
@@ -160,9 +190,14 @@ function sessionHeader(meta) {
     done = todos.filter((todo) => isDone(todo.status)).length
   }
   const pct = total ? Math.round((done / total) * 100) : 0
+  const action = opts.archive
+    ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="把这个会话收进已归档">归档</button>`
+    : opts.restore
+      ? `<button type="button" class="sess-act" data-restore="${esc(meta.sessionID)}" title="把这个会话移回最近会话">恢复</button>`
+      : ""
   return (
     `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` +
-    `<span class="cnt">${done}/${total}</span></div>` +
+    `<span class="cnt">${done}/${total}</span>${action}</div>` +
     `<div class="prog"><i style="width:${pct}%"></i></div>`
   )
 }
@@ -250,13 +285,15 @@ function swimlaneSvg(session) {
   return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleOf({ sessionID: session.sessionID }))}">${parts.join("")}</svg></div>`
 }
 
-function sessionCard(meta, current) {
+function sessionCard(meta, current, archivedCard = false) {
   const doc = docOf(meta)
   const body = doc
     ? (filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)))
     : `<div class="note">加载中…</div>`
   const tag = current ? `<div class="pin-tag">当前会话</div>` : ""
-  return `<section class="sess${current ? " pinned" : ""}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta)}${body}</section>`
+  const opts = archivedCard ? { restore: true } : (current ? {} : { archive: true })
+  const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`
+  return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`
 }
 
 /** Whether a loaded session holds a task matching the active filter. */
@@ -282,32 +319,63 @@ function paint() {
 
   if (filter.session !== "all") {
     const meta = metaOf(filter.session)
-    box.innerHTML = meta ? sessionCard(meta, false) : `<div class="note">该会话已不存在。</div>`
+    box.innerHTML = undoBarHtml() + (meta
+      ? sessionCard(meta, meta.sessionID === currentID, isArchived(archive, meta))
+      : `<div class="note">该会话已不存在。</div>`)
     paintDetails()
     observeSentinel()
     return
   }
 
   const pinned = pinnedMeta()
-  if (!pinned) {
-    box.innerHTML = `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`
-    paintDetails()
-    observeSentinel()
-    return
-  }
-
   const list = listMetas()
   const considered = list.slice(0, loadedCount)
   const shown = filtering() ? considered.filter(hasMatch) : considered
   const cards = shown.map((meta) => sessionCard(meta, false)).join("")
   const countNote = filtering() ? ` · 命中 ${shown.length}` : ""
-  box.innerHTML =
-    sessionCard(pinned, true) +
-    `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` +
-    (cards || `<div class="note">没有匹配的任务。</div>`) +
-    sentinelHtml(list, considered)
+  const main = pinned
+    ? sessionCard(pinned, true, isArchived(archive, pinned)) +
+      `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` +
+      (cards || `<div class="note">没有匹配的任务。</div>`) +
+      sentinelHtml(list, considered)
+    : (archived.length
+        ? `<div class="note">当前没有进行中的会话；下面是已归档的。</div>`
+        : `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`)
+  box.innerHTML = undoBarHtml() + main + archivedSectionHtml()
   paintDetails()
   observeSentinel()
+}
+
+/**
+ * The set-aside sessions: one collapsed row by default, cards only once opened.
+ * The count is derived from the index alone, so a closed fold costs no file read.
+ */
+function archivedSectionHtml() {
+  if (!archived.length) return ""
+  const items = archived.reduce((n, meta) => n + (Number.isFinite(meta.total) ? meta.total : 0), 0)
+  const head =
+    `<button type="button" class="arch-fold" id="archiveToggle" aria-expanded="${showArchived}">` +
+    `<span>🗄 已归档 ${archived.length} 个会话</span>` +
+    `<span class="n">${items} 项 · ${showArchived ? "收起" : "展开"}</span></button>`
+  if (!showArchived) return `<div class="archive">${head}</div>`
+  const shown = archivedLoadedCount >= archived.length ? archived : archived.slice(0, archivedLoadedCount)
+  const more = archivedLoadedCount < archived.length
+    ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已归档（还有 ${archived.length - archivedLoadedCount} 个）</div>`
+    : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已归档会话</div>`
+  const restoreAll = archived.length > 1
+    ? `<div class="endnote"><button type="button" class="link" id="restoreAll">全部恢复</button></div>`
+    : ""
+  return `<div class="archive">${head}${shown.map((meta) => sessionCard(meta, false, true)).join("")}${more}${restoreAll}</div>`
+}
+
+/** The undo for the last archive change, shown in place of the classic toast button. */
+function undoBarHtml() {
+  if (!undo) return ""
+  return (
+    `<div class="undo-bar"><span>${esc(undo.label)}</span>` +
+    `<button type="button" id="undoBtn">撤销</button>` +
+    `<button type="button" id="undoDismiss" aria-label="关闭">×</button></div>`
+  )
 }
 
 /** Load the next batch (or everything) when the sentinel scrolls into view. */
@@ -325,20 +393,44 @@ function loadAll() {
   void renderBoard().finally(() => { loadingMore = false })
 }
 
+/** Load the next batch of set-aside sessions when the fold's sentinel appears. */
+function loadMoreArchived() {
+  if (loadingMore || !el("archivedSentinel")) return
+  loadingMore = true
+  archivedLoadedCount += BATCH
+  void renderBoard().finally(() => { loadingMore = false })
+}
+
+/** Open or close the set-aside fold. Opening is what pulls its mirrors in. */
+function toggleArchived() {
+  showArchived = !showArchived
+  archivedLoadedCount = BATCH
+  void renderBoard()
+}
+
+function disconnectObservers() {
+  for (const io of observers) io.disconnect()
+  observers = []
+}
+
+/** Watch a load-more sentinel and fire `onHit` when it nears the viewport. */
+function attachObserver(node, onHit) {
+  if (typeof IntersectionObserver === "undefined") return
+  const io = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) onHit()
+  }, { root: el("sessions"), rootMargin: "600px" })
+  io.observe(node)
+  observers.push(io)
+}
+
 function observeSentinel() {
-  if (observer) {
-    observer.disconnect()
-    observer = null
-  }
+  disconnectObservers()
   const loadAllButton = el("loadAll")
   if (loadAllButton) loadAllButton.addEventListener("click", () => loadAll())
-  const node = el("sentinel")
-  if (!node) return
-  if (typeof IntersectionObserver === "undefined") return
-  observer = new IntersectionObserver((entries) => {
-    if (entries.some((entry) => entry.isIntersecting)) loadMore()
-  }, { root: el("sessions"), rootMargin: "600px" })
-  observer.observe(node)
+  const main = el("sentinel")
+  if (main) attachObserver(main, loadMore)
+  const folded = el("archivedSentinel")
+  if (folded) attachObserver(folded, loadMoreArchived)
 }
 
 /** Backup for a throttled IntersectionObserver: load when the list nears its end. */
@@ -474,6 +566,109 @@ async function copyTodo(todo) {
   }
 }
 
+// ---- archiving ---------------------------------------------------------------
+
+/**
+ * Setting a session aside is board state, not todo data: it is written to the
+ * extension's own `host.storage`, never to a mirror — writing a mirror would
+ * fight a live agent's whole-list rewrite. It survives a restart, and a session
+ * that runs `todowrite` again resurfaces on its own (see `src/archive.js`).
+ */
+
+/** Offer the last archive change back as an undo for a few seconds. */
+function armUndo(label, entry) {
+  undo = { label, entry }
+  if (undoTimer !== null) clearTimeout(undoTimer)
+  undoTimer = setTimeout(() => {
+    undo = null
+    undoTimer = null
+    paint()
+  }, ARCHIVE_UNDO_MS)
+}
+
+function clearUndo() {
+  undo = null
+  if (undoTimer !== null) {
+    clearTimeout(undoTimer)
+    undoTimer = null
+  }
+}
+
+/**
+ * Apply a new archive value: write it, then repaint from the source of truth. On
+ * a write failure the in-memory value and the undo roll back, so the board never
+ * shows a state the host did not accept.
+ */
+async function commitArchive(entry, previous, label, successMessage) {
+  archive = entry
+  armUndo(label, previous)
+  try {
+    await host.storage.set(ARCHIVE_KEY, archive)
+  } catch (error) {
+    archive = previous
+    clearUndo()
+    host.toast({ kind: "error", message: `归档未能保存：${(error && error.code) || error}` })
+    lastKey = ""
+    await refresh()
+    return
+  }
+  lastKey = ""
+  await refresh()
+  host.toast({ kind: "success", message: successMessage })
+}
+
+async function archiveSession(sessionID) {
+  const previous = archive
+  await commitArchive(
+    withArchived(archive, [sessionID], Date.now()),
+    previous,
+    "已归档 1 个会话",
+    "已归档 1 个会话，可在「已归档」里恢复。",
+  )
+}
+
+async function restoreSession(sessionID) {
+  const previous = archive
+  await commitArchive(withoutArchived(archive, [sessionID]), previous, "已恢复 1 个会话", "已恢复 1 个会话。")
+}
+
+/** Archive every session with no open work; skip the one in view and the archived. */
+async function archiveFinished() {
+  const ids = finishedSessionIDs(allMetas, archive, currentID)
+  if (!ids.length) {
+    host.toast({ kind: "info", message: "没有已完成的会话可归档。" })
+    return
+  }
+  const previous = archive
+  await commitArchive(
+    withArchived(archive, ids, Date.now()),
+    previous,
+    `已归档 ${ids.length} 个会话`,
+    `已归档 ${ids.length} 个已完成会话，可在「已归档」里恢复。`,
+  )
+}
+
+async function restoreAllArchived() {
+  const ids = archived.map((meta) => meta.sessionID)
+  if (!ids.length) return
+  const previous = archive
+  await commitArchive(withoutArchived(archive, ids), previous, `已恢复 ${ids.length} 个会话`, `已恢复 ${ids.length} 个会话。`)
+}
+
+async function performUndo() {
+  if (!undo) return
+  const target = undo.entry
+  clearUndo()
+  archive = target
+  try {
+    await host.storage.set(ARCHIVE_KEY, archive)
+  } catch (error) {
+    host.toast({ kind: "error", message: `撤销未能保存：${(error && error.code) || error}` })
+  }
+  lastKey = ""
+  await refresh()
+}
+
 // ---- controls ----------------------------------------------------------------
 
 function updateSessionOptions() {
@@ -528,10 +723,26 @@ function mountToolbar() {
       paint()
     },
   })
+  controls.archive = mountButton(el("archiveHost"), {
+    label: "批量归档已完成",
+    variant: "secondary",
+    size: "sm",
+    onClick: () => { void archiveFinished() },
+  })
 
   el("sessions").addEventListener("scroll", onSessionsScroll, { passive: true })
   el("sessions").addEventListener("click", (event) => {
-    const row = event.target instanceof Element ? event.target.closest(".row") : null
+    const target = event.target instanceof Element ? event.target : null
+    if (!target) return
+    if (target.closest("#archiveToggle")) { toggleArchived(); return }
+    if (target.closest("#restoreAll")) { void restoreAllArchived(); return }
+    if (target.closest("#undoBtn")) { void performUndo(); return }
+    if (target.closest("#undoDismiss")) { clearUndo(); paint(); return }
+    const archiveButton = target.closest("[data-archive]")
+    if (archiveButton) { void archiveSession(archiveButton.dataset.archive); return }
+    const restoreButton = target.closest("[data-restore]")
+    if (restoreButton) { void restoreSession(restoreButton.dataset.restore); return }
+    const row = target.closest(".row")
     if (!row || row.dataset.index === undefined) return
     selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) }
     paint()
@@ -566,20 +777,37 @@ async function refresh() {
     return
   }
 
+  // The archive lives in the extension's own storage. A host that refuses it, or
+  // does not answer, simply means "nothing is set aside" — the board still works.
+  let rawArchive
+  try {
+    rawArchive = await host.storage.get(ARCHIVE_KEY)
+  } catch {
+    rawArchive = undefined
+  }
+  const nextArchive = parseArchive(rawArchive)
+
   const phases = []
   const seen = new Set()
   for (const meta of metas) {
     for (const phase of (meta.phases || [])) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
     for (const phase of Object.keys(meta.byPhase || {})) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
   }
-  const key = JSON.stringify([metas, loadedCount, filter, currentID])
+  const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount])
   if (key === lastKey) return
   lastKey = key
 
   const phasesChanged = JSON.stringify(phases) !== JSON.stringify(globalPhases)
-  agenda = metas
+  allMetas = metas
+  archive = nextArchive
+  const split = partition(metas, archive, currentID)
+  agenda = split.active
+  archived = split.archived
   globalPhases = phases
-  if (filter.session !== "all" && !metaOf(filter.session)) filter.session = "all"
+  if (filter.session !== "all") {
+    const chosen = metaOf(filter.session)
+    if (!chosen || isArchived(archive, chosen)) filter.session = "all"
+  }
   updateSessionOptions()
   if (phasesChanged) updatePhaseOptions()
   el("legend").innerHTML = globalPhases
