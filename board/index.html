@@ -78,6 +78,26 @@
       #details .kv a { color: var(--oc-primary, #205ea6); cursor: pointer; text-decoration: underline; }
       #details .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
       .note { color: var(--b-muted); padding: 12px; }
+
+      /* the pinned current-session card, set apart from the recency list below */
+      .sess.pinned {
+        border: 1px solid var(--oc-primary, #205ea6);
+        border-color: color-mix(in srgb, var(--oc-primary, #205ea6) 34%, var(--b-border));
+        background: color-mix(in srgb, var(--oc-primary, #205ea6) 5%, transparent);
+        border-radius: 10px; padding: 10px 12px 12px;
+      }
+      .pin-tag {
+        display: inline-block; font-size: 10px; color: var(--oc-primary-foreground, #fff);
+        background: var(--oc-primary, #205ea6); border-radius: 999px; padding: 1px 8px; margin-bottom: 6px;
+      }
+      .divider { display: flex; align-items: baseline; gap: 8px; max-width: 900px; margin: 4px 0 14px; color: var(--b-muted); font-size: 11px; }
+      .divider::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--b-border); }
+      .sentinel {
+        max-width: 900px; margin: 2px 0 0; padding: 12px; border: 1px dashed var(--b-border);
+        border-radius: 10px; color: var(--b-muted); text-align: center; cursor: pointer;
+      }
+      .endnote { max-width: 900px; color: var(--b-muted); font-size: 11px; text-align: center; margin-top: 8px; }
+      .link { border: 0; background: none; color: var(--oc-primary, #205ea6); font: inherit; cursor: pointer; text-decoration: underline; padding: 0; }
     </style>
   </head>
   <body>

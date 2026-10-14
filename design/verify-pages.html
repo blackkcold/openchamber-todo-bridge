@@ -81,9 +81,45 @@
         ],
       }
 
+      // The session index the board reads (it may not listDir the folder). As the
+      // plugin now writes it: version 2, newest first, each entry carrying a
+      // summary so the board renders its bar and headers without opening a mirror.
+      const summaryOf = (doc) => {
+        const todos = doc.todos || []
+        const st = new Map()
+        for (const t of todos) if (t.id) st.set(t.id, t.status)
+        let done = 0, doing = 0, pending = 0, cancelled = 0, blocked = 0
+        const byPhase = {}
+        for (const t of todos) {
+          if (t.status === "completed") done += 1
+          else if (t.status === "in_progress") doing += 1
+          else if (t.status === "pending") pending += 1
+          else if (t.status === "cancelled") cancelled += 1
+          if (Array.isArray(t.dependsOn) && t.dependsOn.some((d) => st.has(d) && st.get(d) !== "completed")) blocked += 1
+          const key = t.phase || ""
+          byPhase[key] = (byPhase[key] || 0) + 1
+        }
+        const active = todos.find((t) => t.status === "in_progress")
+        const root = todos.find((t) => !t.parentId)
+        return { title: (active || root || {}).content || "", total: todos.length, done, doing, pending, cancelled, blocked, byPhase, phases: Array.isArray(doc.phases) ? doc.phases : [] }
+      }
+
       const FILES = { "ses_tree": TREE, "ses_flat": FLAT, "ses_done": DONE, "ses_phased": PHASED }
-      // The session index the board reads (it may not listDir the folder).
-      FILES._index = { version: 1, sessions: Object.keys(FILES).map((id, index) => ({ sessionID: id, updatedAt: Date.now() - index * 1000 })) }
+      const ORDERED = ["ses_tree", "ses_flat", "ses_done", "ses_phased"]
+      for (let i = 1; i <= 16; i += 1) {
+        const id = `ses_${i}`
+        ORDERED.push(id)
+        FILES[id] = {
+          version: 2, sessionID: id, updatedAt: Date.now() - (i + 1) * 1000,
+          phases: ["分析", "实现", "验证"],
+          todos: [
+            { content: `会话 ${i}：梳理现状`, status: "completed", id: "a", phase: "分析" },
+            { content: `会话 ${i}：推进实现`, status: i % 3 === 0 ? "pending" : "in_progress", id: "b", parentId: "a", phase: "实现" },
+            { content: `会话 ${i}：补回归测试`, status: "pending", id: "c", phase: "验证" },
+          ],
+        }
+      }
+      FILES._index = { version: 2, sessions: ORDERED.map((id, index) => ({ sessionID: id, updatedAt: Date.now() - index * 500, ...summaryOf(FILES[id]) })) }
 
       const LIGHT = {
         background: "#fffcf0", elevated: "#fffcf0", foreground: "#100f0f", muted: "#6f6e69",
@@ -141,7 +177,7 @@
         iframe.src = surface === "page" ? "/board/index.html" : "/panel/index.html"
       }
       mount("panel", "panel", "ses_tree")
-      mount("board", "page", null)
+      mount("board", "page", "ses_phased")
 
       // Prune check: finished work is hidden by default.
       setTimeout(() => {
@@ -209,6 +245,23 @@
           say("peek error: " + error)
         }
       }, 3200)
+
+      // Windowing: the board pins the current session and shows one batch at a
+      // time, loading the rest only as the list is scrolled to its end.
+      setTimeout(() => {
+        try {
+          const doc = document.getElementById("board").contentDocument
+          const board = doc.getElementById("sessions")
+          const count = () => doc.querySelectorAll("#sessions .sess").length
+          say(`paging: pinned=${doc.querySelectorAll("#sessions .sess.pinned").length} cards=${count()} sentinel=${doc.getElementById("sentinel") ? "yes" : "no"} divider="${((doc.querySelector(".divider") || {}).textContent || "").trim()}"`)
+          board.scrollTop = board.scrollHeight
+          setTimeout(() => {
+            say(`after scroll: cards=${count()} sentinel=${doc.getElementById("sentinel") ? "yes" : "no"} endnote=${doc.querySelector(".endnote") ? "yes" : "no"}`)
+          }, 1500)
+        } catch (error) {
+          say("paging probe error: " + error)
+        }
+      }, 3800)
     </script>
   </body>
 </html>

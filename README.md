@@ -14,7 +14,9 @@ The bridge brings back `todowrite` / `todoread` for OpenCode v2 and displays the
 | --- | --- |
 | Work Status section | The current session's task tree, animated. Sized to its content up to the host's 320px ceiling. |
 | Rail panel | The same tree in a panel, with a button to jump to the session it belongs to. |
-| Task board (`page`) | Every session's task view, with a view switch (task tree / phase-swimlane graph), a session selector, filters, a cross-session summary, a phase legend, and a node detail. Its actions compose an instruction into the chat box, copy the task, or open the session it belongs to; it never writes the list back. |
+| Task board (`page`) | The **current** session pinned in its own card at the top, then the most recent sessions — 15 at first, loading more (and their trees) only as you scroll. Each shows a view switch (task tree / phase-swimlane graph), a session selector, filters, a cross-session summary, a phase legend, and a node detail. Its actions compose an instruction into the chat box, copy the task, or open the session it belongs to; it never writes the list back. |
+
+The board reads the plugin's `_index.json` alone to draw its summary bar, its session labels and every card header — each index entry carries a per-session summary — so it opens instantly however many sessions exist, and opens a session's mirror only to draw that session's tree.
 
 The task-tree / graph view understands three optional fields beyond the checklist: `id` / `parentId` nest a subtask, `phase` names its stage (drawn as colour bands / swimlanes), and `dependsOn` records a cross-task dependency — a node whose dependency is not completed is marked **blocked** (a dashed ring in the tree, a dashed chip in the swimlane). A top-level `phases` array fixes the colour / lane order. All are optional and validated (a malformed one is refused so the model corrects itself); the plugin mirrors a `version: 2` file and still reads a v1 (flat) one, which just stays a checklist.
 
@@ -34,10 +36,10 @@ Send a message in an OpenCode session to start using the todo tools.
 
 ### Install a specific version
 
-Append a release tag to the URL, for example `#v0.7.1`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
+Append a release tag to the URL, for example `#v0.8.0`. The plain URL above follows the default branch (`main`) and updates when it moves; a pinned URL follows that tag and does not update on its own.
 
 ```text
-https://github.com/blackkcold/openchamber-todo-bridge#v0.7.1
+https://github.com/blackkcold/openchamber-todo-bridge#v0.8.0
 ```
 
 ### Manual plugin setup

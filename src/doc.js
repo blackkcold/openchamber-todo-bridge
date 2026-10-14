@@ -52,3 +52,45 @@ export function parseDoc(content) {
   }
   return normalizeDoc(data)
 }
+
+/**
+ * Parse the session index the plugin writes (`_index.json`).
+ *
+ * Returns `null` only when the JSON is malformed; a missing or partial entry is
+ * skipped rather than failing the whole index. The summary fields (`title`,
+ * `total`, counts, `byPhase`, `phases`) are optional: a v1 index — or one
+ * written before the plugin learned to summarise — yields entries with just
+ * `sessionID` / `updatedAt`, and the caller falls back to reading the mirror.
+ */
+export function parseIndex(content) {
+  let data
+  try {
+    data = JSON.parse(content)
+  } catch {
+    return null
+  }
+  const raw = data && Array.isArray(data.sessions) ? data.sessions : []
+  const out = []
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== "object") continue
+    const sessionID = typeof entry.sessionID === "string" ? entry.sessionID.trim() : ""
+    if (sessionID === "") continue
+    const num = (value) => (Number.isFinite(value) ? value : 0)
+    const item = { sessionID, updatedAt: num(entry.updatedAt) }
+    if (typeof entry.title === "string" && entry.title !== "") item.title = entry.title
+    if (Number.isFinite(entry.total)) {
+      item.total = entry.total
+      item.done = num(entry.done)
+      item.doing = num(entry.doing)
+      item.pending = num(entry.pending)
+      item.cancelled = num(entry.cancelled)
+      item.blocked = num(entry.blocked)
+      item.byPhase = entry.byPhase && typeof entry.byPhase === "object" ? entry.byPhase : {}
+      item.phases = Array.isArray(entry.phases)
+        ? entry.phases.filter((phase) => typeof phase === "string" && phase !== "")
+        : []
+    }
+    out.push(item)
+  }
+  return out
+}

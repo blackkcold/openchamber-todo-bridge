@@ -9,7 +9,7 @@
 // that is what made agents reach for the tool unprompted. An earlier revision of
 // this plugin condensed the description to a few lines and agents stopped using
 // the tool proactively. These assertions exist to stop that regression.
-import { buildReminder, TODOWRITE_DESCRIPTION, normalize } from "../opencode-plugin/index.js"
+import { buildReminder, TODOWRITE_DESCRIPTION, normalize, summarize, titleFor } from "../opencode-plugin/index.js"
 
 let failed = 0
 const check = (name, pass) => {
@@ -85,6 +85,29 @@ for (const [why, payload] of rejects) {
   try { normalize(payload) } catch { threw = true }
   check(`rejects bad ${why}`, threw)
 }
+
+console.log("\nsummarize — the index summary the board reads")
+const sum = summarize([
+  { content: "a", status: "completed", id: "t1", phase: "调研" },
+  { content: "b", status: "in_progress", id: "t2", phase: "实现" },
+  { content: "c", status: "pending" },
+  { content: "d", status: "cancelled" },
+  { content: "e", status: "pending", dependsOn: ["t2"] },
+], ["调研", "实现"])
+check("counts total", sum.total === 5)
+check("counts done", sum.done === 1)
+check("counts doing", sum.doing === 1)
+check("counts cancelled", sum.cancelled === 1)
+check("counts pending", sum.pending === 2)
+check("counts blocked (an open dependency)", sum.blocked === 1)
+check("buckets by phase", sum.byPhase["调研"] === 1 && sum.byPhase["实现"] === 1 && sum.byPhase[""] === 3)
+check("keeps the declared phases", Array.isArray(sum.phases) && sum.phases.length === 2)
+check(
+  "a completed dependency does not block",
+  summarize([{ content: "x", status: "pending", dependsOn: ["done"] }, { content: "y", status: "completed", id: "done" }]).blocked === 0,
+)
+check("title prefers the in_progress task", titleFor([{ content: "root" }, { content: "now", status: "in_progress" }]) === "now")
+check("title falls back to the root", titleFor([{ content: "root" }, { content: "leaf", parentId: "root" }]) === "root")
 
 console.log(`\ndescription length: ${TODOWRITE_DESCRIPTION.length} chars`)
 if (failed > 0) {
