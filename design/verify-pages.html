@@ -19,7 +19,7 @@
     <h1>面板与看板 — 协议桩</h1>
     <p class="tip">
       真实 <code>panel/index.html</code>（窄栏）与 <code>board/index.html</code>（全屏看板），
-      接同一套协议桩。桩回答 ready / file-read / file-list，并吞掉 compose / clipboard / toast。
+      接同一套协议桩。桩回答 ready / file-read / file-list / storage，并吞掉 compose / clipboard / toast。
     </p>
 
     <h2>rail 面板（当前会话 = ses_tree）</h2>
@@ -139,6 +139,9 @@
       })
 
       const registry = new Map()
+      // The board keeps its session archive in `host.storage`; the stub answers it
+      // from memory so a bulk-archive / restore round trip is checkable here.
+      const STORE = new Map()
 
       window.addEventListener("message", (event) => {
         const entry = registry.get(event.source)
@@ -168,6 +171,13 @@
         if (msg.type === "clipboard-write") { say("clipboard-write"); ok({}); return }
         if (msg.type === "toast") { say(`toast: ${(msg.payload || {}).message || ""}`); ok({}); return }
         if (msg.type === "resize") { ok({}); return }
+        if (msg.type === "storage") {
+          const { op, key, value } = msg.payload || {}
+          if (op === "get") { ok(STORE.has(key) ? { storage: true, op: "get", found: true, value: STORE.get(key) } : { storage: true, op: "get", found: false }); return }
+          if (op === "set") { STORE.set(key, value); say(`storage.set ${key}`); ok({ storage: true, op: "set" }); return }
+          if (op === "delete") { STORE.delete(key); ok({ storage: true, op: "delete" }); return }
+          if (op === "keys") { ok({ storage: true, op: "keys", keys: [...STORE.keys()] }); return }
+        }
         if (typeof msg.id === "string") ok({})
       })
 
@@ -262,6 +272,85 @@
           say("paging probe error: " + error)
         }
       }, 3800)
+
+      // Archive: reset the session filter to "all" (an earlier probe narrows it to
+      // one session, where there is no fold), then bulk-archive the finished
+      // sessions, open the fold, and restore one. The stub answers `storage`, so
+      // the whole round trip runs without OpenChamber.
+      setTimeout(() => {
+        const doc = document.getElementById("board").contentDocument
+        const note = (m) => say("archive: " + m)
+        const foldText = () => {
+          const el = doc.getElementById("archiveToggle")
+          return el ? el.textContent.replace(/\s+/g, " ").trim() : "(none)"
+        }
+        const selects = () => Array.from(doc.querySelectorAll(".oc-sdk-trigger")).map((t) => t.textContent.replace(/\s+/g, " ").trim()).join(" | ")
+        const archCards = () => doc.querySelectorAll("#sessions .sess.archived").length
+        const restoreBtn = () => doc.querySelector("#sessions .sess.archived [data-restore]")
+        try {
+          const sessionTrigger = doc.querySelectorAll(".oc-sdk-trigger")[0]
+          if (!sessionTrigger) { note("no session select"); return }
+          sessionTrigger.click()
+          setTimeout(() => {
+            try {
+              const all = Array.from(doc.querySelectorAll('[role="option"]')).find((o) => o.textContent.trim() === "全部会话")
+              if (!all) { note("no 全部会话 option"); return }
+              all.click()
+              setTimeout(() => {
+                try {
+                  note("selects: " + selects())
+                  const button = doc.querySelector("#archiveHost button")
+                  note("bulk button: " + (button ? button.textContent : "missing"))
+                  if (!button) return
+                  button.click()
+                  setTimeout(() => {
+                    try {
+                      note(`after bulk → fold="${foldText()}" archivedCards=${archCards()} undoBar=${doc.getElementById("undoBtn") ? "yes" : "no"}`)
+                      const toggle = doc.getElementById("archiveToggle")
+                      if (!toggle) { note("no fold to open"); return }
+                      toggle.click()
+                      setTimeout(() => {
+                        try {
+                          const t2 = doc.getElementById("archiveToggle")
+                          note(`after expand → aria=${t2 ? t2.getAttribute("aria-expanded") : "no-toggle"} archivedCards=${archCards()} restoreBtn=${restoreBtn() ? "yes" : "no"}`)
+                          const restore = restoreBtn()
+                          if (!restore) { note("no restore button to click"); return }
+                          restore.click()
+                          setTimeout(() => {
+                            try {
+                              note(`after restore → fold=${doc.getElementById("archiveToggle") ? "present" : "gone"} archivedCards=${archCards()}`)
+                              // Leave the fold open, so a person (or a screenshot) sees the
+                              // set-aside card and its restore button as the final state.
+                              const again = doc.querySelector("#archiveHost button")
+                              if (again) again.click()
+                              setTimeout(() => {
+                                try {
+                                  const toggle2 = doc.getElementById("archiveToggle")
+                                  if (toggle2 && toggle2.getAttribute("aria-expanded") !== "true") toggle2.click()
+                                  setTimeout(() => {
+                                    try {
+                                      const t3 = doc.getElementById("archiveToggle")
+                                      const boardList = doc.getElementById("sessions")
+                                      if (boardList) boardList.scrollTop = boardList.scrollHeight
+                                      note(`left open → aria=${t3 ? t3.getAttribute("aria-expanded") : "no-toggle"} archivedCards=${archCards()} restoreBtn=${restoreBtn() ? "yes" : "no"}`)
+                                    } catch (error) { say("archive leave-open error: " + error) }
+                                  }, 800)
+                                } catch (error) { say("archive re-archive error: " + error) }
+                              }, 800)
+                            } catch (error) { say("archive restore probe error: " + error) }
+                          }, 800)
+                        } catch (error) { say("archive expand probe error: " + error) }
+                      }, 800)
+                    } catch (error) { say("archive bulk probe error: " + error) }
+                  }, 800)
+                } catch (error) { say("archive click probe error: " + error) }
+              }, 500)
+            } catch (error) { say("archive all-pick error: " + error) }
+          }, 350)
+        } catch (error) {
+          say("archive probe error: " + error)
+        }
+      }, 9000)
     </script>
   </body>
 </html>

@@ -2287,6 +2287,80 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return `<svg class="gut-svg" aria-hidden="true">${body}</svg>`;
   }
 
+  // src/archive.js
+  var ARCHIVE_KEY = "archive";
+  var ARCHIVE_VERSION = 1;
+  function emptyArchive() {
+    return { version: ARCHIVE_VERSION, sessions: {} };
+  }
+  function parseArchive(raw) {
+    const out = emptyArchive();
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+      return out;
+    const src = raw.sessions;
+    if (src === null || typeof src !== "object" || Array.isArray(src))
+      return out;
+    for (const [sessionID, at] of Object.entries(src)) {
+      if (typeof sessionID !== "string" || sessionID === "")
+        continue;
+      if (!Number.isFinite(at))
+        continue;
+      out.sessions[sessionID] = at;
+    }
+    return out;
+  }
+  function isArchived(entry, meta) {
+    if (!entry || !meta || typeof meta.sessionID !== "string")
+      return false;
+    const at = entry.sessions ? entry.sessions[meta.sessionID] : undefined;
+    if (!Number.isFinite(at))
+      return false;
+    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
+    return at >= updated;
+  }
+  function partition(metas, entry, keepActiveID) {
+    const active2 = [];
+    const archived = [];
+    for (const meta of Array.isArray(metas) ? metas : []) {
+      if (meta.sessionID === keepActiveID || !isArchived(entry, meta))
+        active2.push(meta);
+      else
+        archived.push(meta);
+    }
+    return { active: active2, archived };
+  }
+  function isFullyFinished(meta) {
+    if (!meta || !Number.isFinite(meta.total) || meta.total <= 0)
+      return false;
+    return (meta.doing || 0) === 0 && (meta.pending || 0) === 0;
+  }
+  function finishedSessionIDs(metas, entry, keepActiveID) {
+    const ids = [];
+    for (const meta of Array.isArray(metas) ? metas : []) {
+      if (meta.sessionID === keepActiveID)
+        continue;
+      if (isArchived(entry, meta))
+        continue;
+      if (isFullyFinished(meta))
+        ids.push(meta.sessionID);
+    }
+    return ids;
+  }
+  function withArchived(entry, ids, now) {
+    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (typeof id === "string" && id !== "")
+        sessions[id] = now;
+    }
+    return { version: ARCHIVE_VERSION, sessions };
+  }
+  function withoutArchived(entry, ids) {
+    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
+    for (const id of Array.isArray(ids) ? ids : [])
+      delete sessions[id];
+    return { version: ARCHIVE_VERSION, sessions };
+  }
+
   // src/board.js
   var POLL_MS = 4000;
   var REQUEST_TIMEOUT_MS = 8000;
@@ -2305,7 +2379,12 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var mounted = false;
   var timer = null;
   var lastKey = "";
+  var allMetas = [];
   var agenda = [];
+  var archived = [];
+  var archive = emptyArchive();
+  var showArchived = false;
+  var archivedLoadedCount = BATCH;
   var globalPhases = [];
   var docCache = new Map;
   var loadedCount = BATCH;
@@ -2316,8 +2395,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var selected = null;
   var controls = {};
   var detailHandles = [];
-  var observer = null;
-  var metaOf = (sessionID) => agenda.find((meta) => meta.sessionID === sessionID) || null;
+  var observers = [];
+  var undo = null;
+  var undoTimer = null;
+  var ARCHIVE_UNDO_MS = 9000;
+  var metaOf = (sessionID) => allMetas.find((meta) => meta.sessionID === sessionID) || null;
   function docOf(meta) {
     const cached = meta ? docCache.get(meta.sessionID) : null;
     return cached && cached.updatedAt === meta.updatedAt ? cached : null;
@@ -2358,7 +2440,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     const pinned = pinnedMeta();
     const shown = listMetas().slice(0, loadedCount);
-    return (pinned ? [pinned] : []).concat(shown);
+    const out = (pinned ? [pinned] : []).concat(shown);
+    if (showArchived)
+      out.push(...archived.slice(0, archivedLoadedCount));
+    return out;
   }
   async function ensureDocs(metas) {
     const need = metas.filter((meta) => !docOf(meta));
@@ -2382,7 +2467,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       phases: doc ? doc.phases : []
     };
   }
-  function sessionHeader(meta) {
+  function sessionHeader(meta, opts = {}) {
     const doc = docOf(meta);
     let done, total;
     if (Number.isFinite(meta.total)) {
@@ -2394,7 +2479,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       done = todos.filter((todo) => isDone(todo.status)).length;
     }
     const pct = total ? Math.round(done / total * 100) : 0;
-    return `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` + `<span class="cnt">${done}/${total}</span></div>` + `<div class="prog"><i style="width:${pct}%"></i></div>`;
+    const action = opts.archive ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="把这个会话收进已归档">归档</button>` : opts.restore ? `<button type="button" class="sess-act" data-restore="${esc(meta.sessionID)}" title="把这个会话移回最近会话">恢复</button>` : "";
+    return `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` + `<span class="cnt">${done}/${total}</span>${action}</div>` + `<div class="prog"><i style="width:${pct}%"></i></div>`;
   }
   function hiddenNote(session) {
     const hidden = session.todos.length - pruneFinished(session.todos).length;
@@ -2460,11 +2546,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleOf({ sessionID: session.sessionID }))}">${parts.join("")}</svg></div>`;
   }
-  function sessionCard(meta, current) {
+  function sessionCard(meta, current, archivedCard = false) {
     const doc = docOf(meta);
     const body = doc ? filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)) : `<div class="note">加载中…</div>`;
     const tag = current ? `<div class="pin-tag">当前会话</div>` : "";
-    return `<section class="sess${current ? " pinned" : ""}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta)}${body}</section>`;
+    const opts = archivedCard ? { restore: true } : current ? {} : { archive: true };
+    const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`;
+    return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`;
   }
   function hasMatch(meta) {
     const doc = docOf(meta);
@@ -2482,26 +2570,38 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const box = el2("sessions");
     if (filter.session !== "all") {
       const meta = metaOf(filter.session);
-      box.innerHTML = meta ? sessionCard(meta, false) : `<div class="note">该会话已不存在。</div>`;
+      box.innerHTML = undoBarHtml() + (meta ? sessionCard(meta, meta.sessionID === currentID, isArchived(archive, meta)) : `<div class="note">该会话已不存在。</div>`);
       paintDetails();
       observeSentinel();
       return;
     }
     const pinned = pinnedMeta();
-    if (!pinned) {
-      box.innerHTML = `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`;
-      paintDetails();
-      observeSentinel();
-      return;
-    }
     const list = listMetas();
     const considered = list.slice(0, loadedCount);
     const shown = filtering() ? considered.filter(hasMatch) : considered;
     const cards = shown.map((meta) => sessionCard(meta, false)).join("");
     const countNote = filtering() ? ` · 命中 ${shown.length}` : "";
-    box.innerHTML = sessionCard(pinned, true) + `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` + (cards || `<div class="note">没有匹配的任务。</div>`) + sentinelHtml(list, considered);
+    const main = pinned ? sessionCard(pinned, true, isArchived(archive, pinned)) + `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` + (cards || `<div class="note">没有匹配的任务。</div>`) + sentinelHtml(list, considered) : archived.length ? `<div class="note">当前没有进行中的会话；下面是已归档的。</div>` : `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`;
+    box.innerHTML = undoBarHtml() + main + archivedSectionHtml();
     paintDetails();
     observeSentinel();
+  }
+  function archivedSectionHtml() {
+    if (!archived.length)
+      return "";
+    const items = archived.reduce((n, meta) => n + (Number.isFinite(meta.total) ? meta.total : 0), 0);
+    const head = `<button type="button" class="arch-fold" id="archiveToggle" aria-expanded="${showArchived}">` + `<span>\uD83D\uDDC4 已归档 ${archived.length} 个会话</span>` + `<span class="n">${items} 项 · ${showArchived ? "收起" : "展开"}</span></button>`;
+    if (!showArchived)
+      return `<div class="archive">${head}</div>`;
+    const shown = archivedLoadedCount >= archived.length ? archived : archived.slice(0, archivedLoadedCount);
+    const more = archivedLoadedCount < archived.length ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已归档（还有 ${archived.length - archivedLoadedCount} 个）</div>` : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已归档会话</div>`;
+    const restoreAll = archived.length > 1 ? `<div class="endnote"><button type="button" class="link" id="restoreAll">全部恢复</button></div>` : "";
+    return `<div class="archive">${head}${shown.map((meta) => sessionCard(meta, false, true)).join("")}${more}${restoreAll}</div>`;
+  }
+  function undoBarHtml() {
+    if (!undo)
+      return "";
+    return `<div class="undo-bar"><span>${esc(undo.label)}</span>` + `<button type="button" id="undoBtn">撤销</button>` + `<button type="button" id="undoDismiss" aria-label="关闭">×</button></div>`;
   }
   function loadMore() {
     if (loadingMore || !el2("sentinel"))
@@ -2521,24 +2621,46 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       loadingMore = false;
     });
   }
+  function loadMoreArchived() {
+    if (loadingMore || !el2("archivedSentinel"))
+      return;
+    loadingMore = true;
+    archivedLoadedCount += BATCH;
+    renderBoard().finally(() => {
+      loadingMore = false;
+    });
+  }
+  function toggleArchived() {
+    showArchived = !showArchived;
+    archivedLoadedCount = BATCH;
+    renderBoard();
+  }
+  function disconnectObservers() {
+    for (const io of observers)
+      io.disconnect();
+    observers = [];
+  }
+  function attachObserver(node, onHit) {
+    if (typeof IntersectionObserver === "undefined")
+      return;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting))
+        onHit();
+    }, { root: el2("sessions"), rootMargin: "600px" });
+    io.observe(node);
+    observers.push(io);
+  }
   function observeSentinel() {
-    if (observer) {
-      observer.disconnect();
-      observer = null;
-    }
+    disconnectObservers();
     const loadAllButton = el2("loadAll");
     if (loadAllButton)
       loadAllButton.addEventListener("click", () => loadAll());
-    const node = el2("sentinel");
-    if (!node)
-      return;
-    if (typeof IntersectionObserver === "undefined")
-      return;
-    observer = new IntersectionObserver((entries) => {
-      if (entries.some((entry) => entry.isIntersecting))
-        loadMore();
-    }, { root: el2("sessions"), rootMargin: "600px" });
-    observer.observe(node);
+    const main = el2("sentinel");
+    if (main)
+      attachObserver(main, loadMore);
+    const folded = el2("archivedSentinel");
+    if (folded)
+      attachObserver(folded, loadMoreArchived);
   }
   function onSessionsScroll() {
     const box = el2("sessions");
@@ -2649,6 +2771,78 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       host.toast({ kind: "success", message: "已复制任务内容。" });
     } catch {}
   }
+  function armUndo(label, entry) {
+    undo = { label, entry };
+    if (undoTimer !== null)
+      clearTimeout(undoTimer);
+    undoTimer = setTimeout(() => {
+      undo = null;
+      undoTimer = null;
+      paint();
+    }, ARCHIVE_UNDO_MS);
+  }
+  function clearUndo() {
+    undo = null;
+    if (undoTimer !== null) {
+      clearTimeout(undoTimer);
+      undoTimer = null;
+    }
+  }
+  async function commitArchive(entry, previous, label, successMessage) {
+    archive = entry;
+    armUndo(label, previous);
+    try {
+      await host.storage.set(ARCHIVE_KEY, archive);
+    } catch (error) {
+      archive = previous;
+      clearUndo();
+      host.toast({ kind: "error", message: `归档未能保存：${error && error.code || error}` });
+      lastKey = "";
+      await refresh();
+      return;
+    }
+    lastKey = "";
+    await refresh();
+    host.toast({ kind: "success", message: successMessage });
+  }
+  async function archiveSession(sessionID) {
+    const previous = archive;
+    await commitArchive(withArchived(archive, [sessionID], Date.now()), previous, "已归档 1 个会话", "已归档 1 个会话，可在「已归档」里恢复。");
+  }
+  async function restoreSession(sessionID) {
+    const previous = archive;
+    await commitArchive(withoutArchived(archive, [sessionID]), previous, "已恢复 1 个会话", "已恢复 1 个会话。");
+  }
+  async function archiveFinished() {
+    const ids = finishedSessionIDs(allMetas, archive, currentID);
+    if (!ids.length) {
+      host.toast({ kind: "info", message: "没有已完成的会话可归档。" });
+      return;
+    }
+    const previous = archive;
+    await commitArchive(withArchived(archive, ids, Date.now()), previous, `已归档 ${ids.length} 个会话`, `已归档 ${ids.length} 个已完成会话，可在「已归档」里恢复。`);
+  }
+  async function restoreAllArchived() {
+    const ids = archived.map((meta) => meta.sessionID);
+    if (!ids.length)
+      return;
+    const previous = archive;
+    await commitArchive(withoutArchived(archive, ids), previous, `已恢复 ${ids.length} 个会话`, `已恢复 ${ids.length} 个会话。`);
+  }
+  async function performUndo() {
+    if (!undo)
+      return;
+    const target = undo.entry;
+    clearUndo();
+    archive = target;
+    try {
+      await host.storage.set(ARCHIVE_KEY, archive);
+    } catch (error) {
+      host.toast({ kind: "error", message: `撤销未能保存：${error && error.code || error}` });
+    }
+    lastKey = "";
+    await refresh();
+  }
   function updateSessionOptions() {
     if (!controls.session)
       return;
@@ -2729,9 +2923,47 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         paint();
       }
     });
+    controls.archive = mountButton(el2("archiveHost"), {
+      label: "批量归档已完成",
+      variant: "secondary",
+      size: "sm",
+      onClick: () => {
+        archiveFinished();
+      }
+    });
     el2("sessions").addEventListener("scroll", onSessionsScroll, { passive: true });
     el2("sessions").addEventListener("click", (event) => {
-      const row = event.target instanceof Element ? event.target.closest(".row") : null;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target)
+        return;
+      if (target.closest("#archiveToggle")) {
+        toggleArchived();
+        return;
+      }
+      if (target.closest("#restoreAll")) {
+        restoreAllArchived();
+        return;
+      }
+      if (target.closest("#undoBtn")) {
+        performUndo();
+        return;
+      }
+      if (target.closest("#undoDismiss")) {
+        clearUndo();
+        paint();
+        return;
+      }
+      const archiveButton = target.closest("[data-archive]");
+      if (archiveButton) {
+        archiveSession(archiveButton.dataset.archive);
+        return;
+      }
+      const restoreButton = target.closest("[data-restore]");
+      if (restoreButton) {
+        restoreSession(restoreButton.dataset.restore);
+        return;
+      }
+      const row = target.closest(".row");
       if (!row || row.dataset.index === undefined)
         return;
       selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) };
@@ -2760,6 +2992,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       el2("sessions").innerHTML = `<div class="note">${message === "BAD_INDEX" ? "任务索引损坏。" : code === "NOT_FOUND" ? "任务索引尚未生成：在任一会话里触发一次任务更新（todowrite）即可。" : `读取失败：${esc(code || message || String(error))}`}</div>`;
       return;
     }
+    let rawArchive;
+    try {
+      rawArchive = await host.storage.get(ARCHIVE_KEY);
+    } catch {
+      rawArchive = undefined;
+    }
+    const nextArchive = parseArchive(rawArchive);
     const phases = [];
     const seen = new Set;
     for (const meta of metas) {
@@ -2774,15 +3013,22 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
           phases.push(phase);
         }
     }
-    const key = JSON.stringify([metas, loadedCount, filter, currentID]);
+    const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount]);
     if (key === lastKey)
       return;
     lastKey = key;
     const phasesChanged = JSON.stringify(phases) !== JSON.stringify(globalPhases);
-    agenda = metas;
+    allMetas = metas;
+    archive = nextArchive;
+    const split = partition(metas, archive, currentID);
+    agenda = split.active;
+    archived = split.archived;
     globalPhases = phases;
-    if (filter.session !== "all" && !metaOf(filter.session))
-      filter.session = "all";
+    if (filter.session !== "all") {
+      const chosen = metaOf(filter.session);
+      if (!chosen || isArchived(archive, chosen))
+        filter.session = "all";
+    }
     updateSessionOptions();
     if (phasesChanged)
       updatePhaseOptions();

@@ -30,6 +30,7 @@
       #viewHost { min-width: 120px; }
       #statusHost, #phaseHost { min-width: 130px; }
       #finishedHost { flex: 0 0 auto; }
+      #archiveHost { flex: 0 0 auto; }
       #legend { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--b-muted); font-size: 11px; margin-left: auto; }
       .lg { display: inline-flex; align-items: center; gap: 4px; }
       .lg > i { width: 8px; height: 8px; border-radius: 999px; }
@@ -79,6 +80,37 @@
       #details .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
       .note { color: var(--b-muted); padding: 12px; }
 
+      /* per-card archive / restore, in the card header */
+      .sess-act {
+        flex: 0 0 auto; font: inherit; font-size: 10px; line-height: 1.4;
+        color: var(--b-muted); background: none; border: 1px solid var(--b-border);
+        border-radius: 999px; padding: 1px 8px; cursor: pointer;
+      }
+      .sess-act:hover { color: var(--b-fg); border-color: var(--b-fg); }
+      .sess.archived { opacity: .72; }
+
+      /* the set-aside sessions, collapsed by default */
+      .archive { max-width: 900px; margin: 10px 0 0; }
+      .arch-fold {
+        display: flex; align-items: center; gap: 8px; width: 100%; max-width: 900px;
+        padding: 10px 12px; border: 1px dashed var(--b-border); border-radius: 10px;
+        background: none; color: var(--b-muted); font: inherit; cursor: pointer; text-align: left;
+      }
+      .arch-fold .n { margin-left: auto; }
+      .arch-fold[aria-expanded="true"] { margin-bottom: 14px; }
+
+      /* a short-lived undo for the last archive action */
+      .undo-bar {
+        display: flex; align-items: center; gap: 10px; max-width: 900px; margin: 0 0 12px;
+        padding: 8px 12px; border-radius: 8px; background: var(--oc-subtle, rgba(0, 0, 0, .04));
+        color: var(--b-muted); font-size: 11px;
+      }
+      .undo-bar #undoBtn, .undo-bar #undoDismiss {
+        border: 0; background: none; font: inherit; cursor: pointer; padding: 0;
+      }
+      .undo-bar #undoBtn { color: var(--oc-primary, #205ea6); text-decoration: underline; }
+      .undo-bar #undoDismiss { color: var(--b-muted); margin-left: auto; }
+
       /* the pinned current-session card, set apart from the recency list below */
       .sess.pinned {
         border: 1px solid var(--oc-primary, #205ea6);
@@ -109,6 +141,7 @@
         <div id="statusHost"></div>
         <div id="phaseHost"></div>
         <div id="finishedHost"></div>
+        <div id="archiveHost"></div>
         <div id="legend"></div>
       </div>
       <div id="summary"></div>
