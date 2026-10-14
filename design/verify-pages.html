@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>渲染验证 — 面板与看板</title>
+    <style>
+      body { font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 16px; background: #f7f6f0; color: #100f0f; }
+      h1 { font-size: 16px; }
+      h2 { font-size: 13px; margin: 20px 0 8px; }
+      .tip { color: #6f6e69; max-width: 820px; }
+      .pane { border: 1px solid #dad8ce; border-radius: 8px; overflow: hidden; background: #fffcf0; }
+      #panelPane { width: 320px; height: 200px; }
+      #boardPane { width: 100%; height: 620px; }
+      iframe { display: block; width: 100%; height: 100%; border: 0; }
+      #log { color: #6f6e69; white-space: pre-wrap; font-size: 12px; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1>面板与看板 — 协议桩</h1>
+    <p class="tip">
+      真实 <code>panel/index.html</code>（窄栏）与 <code>board/index.html</code>（全屏看板），
+      接同一套协议桩。桩回答 ready / file-read / file-list，并吞掉 compose / clipboard / toast。
+    </p>
+
+    <h2>rail 面板（当前会话 = ses_tree）</h2>
+    <div class="pane" id="panelPane"><iframe id="panel"></iframe></div>
+
+    <h2>全屏看板（全部会话）</h2>
+    <div class="pane" id="boardPane"><iframe id="board"></iframe></div>
+
+    <pre id="log">— 等待 —</pre>
+
+    <script>
+      const CHANNEL = "openchamber.sdk"
+      const V = 1
+      const log = document.getElementById("log")
+      const say = (line) => { log.textContent = log.textContent === "— 等待 —" ? line : `${log.textContent}\n${line}` }
+
+      const TREE = {
+        version: 2, sessionID: "ses_tree", updatedAt: Date.now() - 1000,
+        phases: ["调研", "设计", "实现", "验证"],
+        todos: [
+          { content: "调研：现有渲染管线与高度模型", status: "completed", id: "t1", phase: "调研" },
+          { content: "设计：树的布局与 gutter 方案", status: "completed", id: "t2", parentId: "t1", phase: "设计" },
+          { content: "实现：graph.js 建树与布局", status: "completed", id: "t3", parentId: "t2", phase: "实现" },
+          { content: "实现：区块行级 SVG gutter", status: "in_progress", id: "t4", parentId: "t2", phase: "实现" },
+          { content: "实现：肘形连接线与祖先主干", status: "pending", id: "t5", parentId: "t4", phase: "实现" },
+          { content: "实现：阶段配色与图例", status: "pending", id: "t6", parentId: "t2", phase: "实现" },
+          { content: "验证：verify.html 树窗格", status: "pending", id: "t7", phase: "验证" },
+          { content: "验证：暗色主题下的对比度", status: "pending", id: "t8", parentId: "t7", phase: "验证", dependsOn: ["t4"] },
+          { content: "调研：废弃的旧方案（已完成）", status: "completed", id: "t9", phase: "调研" },
+        ],
+      }
+      const FLAT = {
+        version: 2, sessionID: "ses_flat", updatedAt: Date.now(),
+        todos: [
+          { content: "普通：更新 changelog 与版本号", status: "pending", priority: "low" },
+          { content: "次优先：补 check_out 的回归测试", status: "pending", priority: "medium" },
+          { content: "已完成：把 CSS 里的颜色收敛到 --oc-*", status: "completed" },
+        ],
+      }
+      const DONE = {
+        version: 2, sessionID: "ses_done", updatedAt: Date.now() - 5000,
+        phases: ["发布"],
+        todos: [
+          { content: "发布 v0.6.0", status: "completed", id: "d1", phase: "发布" },
+          { content: "写 release notes", status: "completed", id: "d2", parentId: "d1", phase: "发布" },
+        ],
+      }
+
+      // A flat, phased list (no `parentId`) — like most real mirrors. The tree
+      // synthesises one group per phase, so it still indents and draws lines.
+      const PHASED = {
+        version: 2, sessionID: "ses_phased", updatedAt: Date.now() - 2000,
+        phases: ["核查", "实现", "验证"],
+        todos: [
+          { content: "核查：复核未提交差异", status: "completed", id: "k1", phase: "核查" },
+          { content: "实现：补开关样式", status: "completed", id: "k2", phase: "实现" },
+          { content: "实现：分批迁移三处开关行", status: "in_progress", id: "k3", phase: "实现" },
+          { content: "验证：跑全量测试", status: "pending", id: "k4", phase: "验证" },
+        ],
+      }
+
+      const FILES = { "ses_tree": TREE, "ses_flat": FLAT, "ses_done": DONE, "ses_phased": PHASED }
+      // The session index the board reads (it may not listDir the folder).
+      FILES._index = { version: 1, sessions: Object.keys(FILES).map((id, index) => ({ sessionID: id, updatedAt: Date.now() - index * 1000 })) }
+
+      const LIGHT = {
+        background: "#fffcf0", elevated: "#fffcf0", foreground: "#100f0f", muted: "#6f6e69",
+        subtle: "#e6e4d9", border: "#dad8ce", hover: "rgba(0,0,0,.04)", selection: "rgba(32,94,166,.14)",
+        focus: "#205ea6", primary: "#205ea6", mutedSurface: "#f2f0e5", elevatedForeground: "#100f0f",
+        active: "rgba(0,0,0,.06)", selectionForeground: "inherit", primaryForeground: "#ffffff",
+        primaryText: "#205ea6", successText: "#66800b", warningText: "#bc5215", errorText: "#af3029",
+        infoText: "#3a7bbf", success: "#66800b", warning: "#bc5215", error: "#af3029", info: "#3a7bbf",
+        font: "ui-sans-serif, -apple-system, system-ui, sans-serif", mono: "ui-monospace, monospace",
+        radius: "9px",
+      }
+      const ready = (surface, sessionID) => ({
+        theme: { mode: "light", tokens: LIGHT },
+        locale: "zh", directory: null,
+        session: sessionID ? { id: sessionID, title: "demo", busy: false } : null,
+        surface, item: null, connection: { connected: false }, settings: {},
+      })
+
+      const registry = new Map()
+
+      window.addEventListener("message", (event) => {
+        const entry = registry.get(event.source)
+        if (!entry) return
+        const msg = event.data
+        if (!msg || msg.channel !== CHANNEL || msg.v !== V) return
+        const answer = (payload) => entry.iframe.contentWindow.postMessage(payload, "*")
+        const ok = (payload) => answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true, payload })
+
+        if (msg.type === "hello") { answer({ channel: CHANNEL, v: V, type: "ready", payload: ready(entry.surface, entry.sessionID) }); return }
+        if (msg.type === "file-read") {
+          const path = (msg.payload && msg.payload.path) || ""
+          const id = path.split("/").pop().replace(/\.json$/, "")
+          const data = FILES[id]
+          if (!data) { answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false, code: "NOT_FOUND", error: "stub: no such file" }); return }
+          say(`file-read ${id}`)
+          ok({ content: JSON.stringify(data) })
+          return
+        }
+        if (msg.type === "file-list") {
+          say("file-list")
+          ok({ entries: Object.keys(FILES).map((name) => ({ name: `${name}.json`, kind: "file" })) })
+          return
+        }
+        if (msg.type === "compose") { say(`compose: ${((msg.payload || {}).text || "").slice(0, 40)}…`); ok({}); return }
+        if (msg.type === "open-session") { say(`open-session: ${(msg.payload || {}).sessionId || ""}`); ok({}); return }
+        if (msg.type === "clipboard-write") { say("clipboard-write"); ok({}); return }
+        if (msg.type === "toast") { say(`toast: ${(msg.payload || {}).message || ""}`); ok({}); return }
+        if (msg.type === "resize") { ok({}); return }
+        if (typeof msg.id === "string") ok({})
+      })
+
+      function mount(id, surface, sessionID) {
+        const iframe = document.getElementById(id)
+        registry.set(iframe.contentWindow, { iframe, surface, sessionID })
+        iframe.src = surface === "page" ? "/board/index.html" : "/panel/index.html"
+      }
+      mount("panel", "panel", "ses_tree")
+      mount("board", "page", null)
+
+      // Prune check: finished work is hidden by default.
+      setTimeout(() => {
+        try {
+          const pdoc = document.getElementById("panel").contentDocument
+          const bdoc = document.getElementById("board").contentDocument
+          say("panel list: " + pdoc.getElementById("list").textContent.replace(/\s+/g, " ").trim().slice(0, 90))
+          say("ses_flat rows: " + bdoc.querySelectorAll('[data-session="ses_flat"] .row').length)
+          say("ses_done: " + (bdoc.querySelector('[data-session="ses_done"] .note') ? "hidden-note" : "rows shown"))
+          say("ses_phased rows: " + bdoc.querySelectorAll('[data-session="ses_phased"] .row').length + " | group rows: " + bdoc.querySelectorAll('[data-session="ses_phased"] .row.group').length)
+        } catch (error) {
+          say("prune probe error: " + error)
+        }
+      }, 2600)
+
+      // The panel's "jump to session" button: present and wired when a session is open.
+      setTimeout(() => {
+        try {
+          const pdoc = document.getElementById("panel").contentDocument
+          const host = pdoc.getElementById("jumpHost")
+          const button = host && host.querySelector("button")
+          say(`panel jump: ${host ? (host.hidden ? "hidden" : "shown") : "missing"} / ${button ? "button ok" : "no button"}`)
+          if (button) button.click()
+        } catch (error) {
+          say("panel probe error: " + error)
+        }
+      }, 2800)
+
+      // From inside the harness (the iframes are same-origin) drive the real
+      // pages: dump the summary, click a row for the detail, then switch the
+      // board to the swimlane view and focus one session via its own SDK selects.
+      setTimeout(() => {
+        try {
+          const doc = document.getElementById("board").contentDocument
+          const text = (id) => (doc.getElementById(id) || { textContent: "(none)" }).textContent.replace(/\s+/g, " ").trim()
+          say("summary: " + text("summary").slice(0, 170))
+          const rows = Array.from(doc.querySelectorAll('[data-session="ses_tree"] .row'))
+          const row = rows.find((r) => r.textContent.includes("暗色")) || rows[0]
+          if (!row) {
+            say(`peek: no rows for ses_tree (${rows.length})`)
+            return
+          }
+          row.dispatchEvent(new MouseEvent("click", { bubbles: true }))
+          setTimeout(() => {
+            say("details: " + text("details").slice(0, 200))
+            say("detail actions: " + Array.from(doc.querySelectorAll("#detailActions button")).map((b) => b.textContent).join(" / "))
+            const selects = doc.querySelectorAll(".oc-sdk-select")
+            const pick = (index, match, then) => {
+              const trigger = selects[index] && selects[index].querySelector(".oc-sdk-trigger")
+              if (!trigger) { say("select missing: " + index); return }
+              trigger.click()
+              setTimeout(() => {
+                const option = Array.from(doc.querySelectorAll('[role="option"]')).find((o) => o.textContent.includes(match))
+                if (!option) { say("option not found: " + match); return }
+                option.click()
+                setTimeout(then, 300)
+              }, 250)
+            }
+            pick(1, "泳道图", () => pick(0, "分批迁移", () => {
+              say("sessions shown: " + doc.querySelectorAll(".sess").length + " | swimlane svg: " + doc.querySelectorAll(".swim svg").length)
+              pick(1, "任务树", () => say("tree view ready for ses_phased"))
+            }))
+          }, 400)
+        } catch (error) {
+          say("peek error: " + error)
+        }
+      }, 3200)
+    </script>
+  </body>
+</html>

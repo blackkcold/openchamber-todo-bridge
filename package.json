@@ -1,6 +1,6 @@
 {
   "name": "openchamber-todo-bridge",
-  "version": "0.5.1",
+  "version": "0.7.1",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -14,8 +14,14 @@
       "panel": {
         "id": "todo-bridge",
         "name": "Todos",
-        "icon": "checkbox-circle"
+        "icon": "checkbox-circle",
+        "entry": "panel/index.html"
       },
+      "page": {
+        "entry": "board/index.html",
+        "title": "任务图"
+      },
+      "capabilities": ["sessions"],
       "statusSection": {
         "entry": "status/index.html",
         "title": "Todos",
@@ -31,7 +37,7 @@
     "build": "bun run scripts/build.ts",
     "test-extension": "bun run scripts/build-test-extension.ts",
     "validate": "bun run scripts/validate.ts",
-    "test": "node scripts/test-plugin.mjs && node scripts/test-viewport.mjs"
+    "test": "node scripts/test-plugin.mjs && node scripts/test-viewport.mjs && node scripts/test-graph.mjs && node scripts/test-dag.mjs && node scripts/test-install.mjs"
   },
   "devDependencies": {
     "@openchamber/sdk": "^2.0.4"

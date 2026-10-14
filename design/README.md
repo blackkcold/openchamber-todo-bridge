@@ -142,11 +142,15 @@ paint is readable before the theme lands.
   chosen one is **A · Checklist**.
 - `verify.html` — renders the real shipped page against a protocol stub, so a
   change to `status/` or `src/` can be checked without installing it. Four
-  panes: a 15-item list (over the 320px cap, scrolls), a 3-item list (fits, with
-  the fold), an empty list (collapsed), and a 2× pane for judging the priority
-  marks. Two buttons drive it: 跑滚动自检 asserts the nine scroll-model checks,
-  and 回位自检（约 32 秒） asserts that the idle return fires exactly once and
-  never re-arms.
+  panes: a 15-item list (over the 320px cap, scrolls), a **task tree** (nested
+  `parentId` + phases), a 3-item list (fits, with the fold), an empty list
+  (collapsed), and a 2× pane for judging the priority marks. Two buttons drive
+  it: 跑滚动自检 asserts the nine scroll-model checks, and 回位自检（约 32 秒）
+  asserts that the idle return fires exactly once and never re-arms.
+- `verify-pages.html` — the same stub for the **rail panel** (`panel/index.html`)
+  and the **task board** (`board/index.html`). It answers `file-read` and
+  `file-list`, swallows compose/clipboard/toast, and clicks a board row to show
+  the detail panel, so both pages can be checked without OpenChamber.
 - `preview.jpg` — the screenshot above.
 
 ## Checking a change

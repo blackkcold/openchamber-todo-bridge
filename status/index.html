@@ -277,10 +277,35 @@
       .fold[aria-expanded="true"]::before { transform: rotate(90deg); }
 
       .empty { color: var(--t-muted); padding: 2px 0; }
+
+      /* ---- legend: colour = stage ---- */
+      #legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px 8px;
+        margin-top: 3px;
+        font-size: 10px;
+        color: var(--t-muted);
+      }
+      #legend[hidden] { display: none; }
+      .lg { display: inline-flex; align-items: center; gap: 4px; }
+      .lg > i { width: 7px; height: 7px; border-radius: 999px; flex: 0 0 auto; }
+
+      /* ---- tree rows ----
+        A structured row carries a gutter: the elbow connectors, the ancestor
+        trunks, and this node's status symbol, all in one inline SVG. The shared
+        `.gut*` CSS is injected by `src/gutter.js`; this page owns only the row's
+        own alignment and the completion tick, which are specific to the
+        section's animation. The symbol's colour is the phase and its shape is
+        the status. */
+      .item.tree { align-items: flex-start; }
+      .item.tree.group .txt { font-weight: 600; }
+      .item.tree.just-completed .gut-tick { animation: todo-tick-in 260ms var(--t-motion-spring-snappy, linear) both; }
+
       @media (prefers-reduced-motion: reduce) {
         #bar > i, .item, .item .box, .item .txt, .fold, .fold::before { transition: none; }
         #bar::after, .item.in_progress .dot { animation: none; }
-        .item.just-completed .tick { animation: none; }
+        .item.just-completed .tick, .item.tree.just-completed .gut-tick { animation: none; }
         .type-char { animation: none !important; opacity: 1; }
         .strike-sweep { display: none; }
       }
@@ -291,6 +316,7 @@
       <div id="top" data-empty="true">
         <span id="count"></span>
         <div id="bar"><i></i></div>
+        <div id="legend" hidden></div>
       </div>
       <div id="body" tabindex="0"><div class="empty">Loading…</div></div>
     </div>

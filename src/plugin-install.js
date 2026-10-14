@@ -46,19 +46,49 @@ export const PLUGIN_VERSION = (() => {
 const VERSION_MARKER = `\n// ${PLUGIN_ID}@${PLUGIN_VERSION}\n`
 const ENTRY_CONTENT = SOURCE + VERSION_MARKER
 
+const markerFor = (version) => `\n// ${PLUGIN_ID}@${version}\n`
+
+/** The version named by the marker at the end of a file, or null. */
+function versionFromMarker(entry) {
+  const match = new RegExp(`\\n// ${PLUGIN_ID}@([^\\n]+)\\n$`).exec(entry)
+  return match ? match[1].trim() : null
+}
+
+/** Compare two `x.y.z` versions: -1, 0, 1 — or null when either will not parse. */
+function compareVersions(a, b) {
+  const parse = (value) => {
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(value))
+    return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
+  }
+  const left = parse(a)
+  const right = parse(b)
+  if (!left || !right) return null
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1
+  }
+  return 0
+}
+
 /**
  * What the profile needs, given what is already on disk.
  *
  * `entry` is the current file content, or null when it is missing or unreadable.
+ * `current` is the version this build ships; it defaults to the inlined one and
+ * is a parameter only so `scripts/test-install.mjs` can exercise the comparison.
  * Returns a plan the caller applies; keeping this pure is what lets the harness
  * test every state — fresh, current, stale, partial — with no filesystem.
+ *
+ * Two extensions can share this plugin path (a stable build and a test build),
+ * so the decision must never downgrade: if the copy on disk is a newer version,
+ * leave it alone rather than overwrite it with an older one.
  */
-export function planInstall(entry) {
+export function planInstall(entry, current = PLUGIN_VERSION) {
   if (typeof entry !== "string") return { action: "write", reason: "missing" }
   if (!entry.includes(PLUGIN_ID)) return { action: "write", reason: "foreign" }
-  if (entry.endsWith(VERSION_MARKER)) return { action: "none", reason: "current" }
-  // A marker that names a different version, or an older copy from before this
-  // mechanism existed: both are ours to replace.
+  if (entry.endsWith(markerFor(current))) return { action: "none", reason: "current" }
+  // A different marker, or an older copy from before this mechanism existed.
+  const onDisk = versionFromMarker(entry)
+  if (onDisk && compareVersions(onDisk, current) > 0) return { action: "none", reason: "newer-on-disk" }
   return { action: "write", reason: "outdated" }
 }
 
