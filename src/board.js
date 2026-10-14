@@ -5,6 +5,12 @@
  * summary, filters, a view switch (task tree / phase-swimlane graph), a session
  * selector, and a node detail. Opened from OpenChamber's Extension pages menu.
  *
+ * Windowed. The board used to read every mirror each poll and render every one
+ * of them, which stalls once a machine accumulates a few hundred sessions. Now
+ * it reads only `_index.json` (which carries a summary per session), renders the
+ * current session pinned plus the most recent `BATCH` sessions, and loads more —
+ * and the mirrors for the trees — only as the reader scrolls or filters.
+ *
  * Read-only in v1 — the one action is "hand it to the AI", which composes an
  * instruction into the chat box (no capability needed) rather than writing the
  * mirror back and fighting the agent's whole-list rewrite.
@@ -18,7 +24,7 @@ import { applyHostReady, mountButton, mountCheckbox, mountSearchField, mountSele
 import { buildTree, INDENT, phaseColor, pruneFinished } from "./graph.js"
 import { DAG_COL, dagLayout } from "./dag.js"
 import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
-import { normalizeDoc } from "./doc.js"
+import { parseDoc, parseIndex } from "./doc.js"
 
 const POLL_MS = 4000
 const REQUEST_TIMEOUT_MS = 8000
@@ -26,6 +32,8 @@ const TODOS_DIR = "~/.config/openchamber/todos"
 const UNGROUPED = "未分组"
 const CHIP_W = DAG_COL - 34
 const CHIP_H = 26
+/** Sessions drawn before the first scroll; the sentinel loads the next batch. */
+const BATCH = 15
 
 ensureGutStyle(document)
 
@@ -41,18 +49,38 @@ let host = null
 let mounted = false
 let timer = null
 let lastKey = ""
-let sessions = []
+/** Every session, newest first, from the index alone — no mirror is opened for this. */
+let agenda = []
 let globalPhases = []
+/** sessionID -> { updatedAt, todos, phases }: the tree needs this; the index does not. */
+const docCache = new Map()
+let loadedCount = BATCH
+let currentID = null
+let renderSeq = 0
+let loadingMore = false
 const filter = { query: "", status: "all", phase: "all", view: "tree", session: "all", showFinished: false }
 let selected = null
 const controls = {}
 let detailHandles = []
+let observer = null
 
-function titleFor(session) {
-  const active = session.todos.find((todo) => todo.status === "in_progress")
-  if (active) return active.content
-  const root = session.todos.find((todo) => !todo.parentId)
-  return (root || {}).content || session.sessionID
+// ---- index metadata ----------------------------------------------------------
+
+const metaOf = (sessionID) => agenda.find((meta) => meta.sessionID === sessionID) || null
+
+/** The loaded mirror for a meta, or null when it is not loaded / is stale. */
+function docOf(meta) {
+  const cached = meta ? docCache.get(meta.sessionID) : null
+  return cached && cached.updatedAt === meta.updatedAt ? cached : null
+}
+
+/** A task-derived label, from the index summary or, failing that, the mirror. */
+function titleOf(meta, doc) {
+  if (meta && meta.title) return meta.title
+  const todos = doc ? doc.todos : []
+  const active = todos.find((todo) => todo.status === "in_progress")
+  const root = todos.find((todo) => !todo.parentId)
+  return (active || root || {}).content || (meta ? meta.sessionID : "")
 }
 
 function filtering() {
@@ -66,47 +94,75 @@ function matches(todo) {
   return true
 }
 
-async function load() {
-  // The board's grant covers `todos/*.json`, not the directory, so it reads the
-  // session index the plugin writes instead of listing the folder.
-  let ids
-  try {
-    const { content } = await host.readFile(`${TODOS_DIR}/_index.json`)
-    const index = JSON.parse(content)
-    ids = Array.isArray(index.sessions) ? index.sessions.map((session) => session.sessionID).filter(Boolean) : []
-  } catch (error) {
-    if (error && error.code === "NOT_FOUND") throw new Error("NO_INDEX")
-    throw error
+/** The session pinned to the top: the open session if indexable, else the newest. */
+function pinnedMeta() {
+  const byCurrent = currentID ? metaOf(currentID) : null
+  return byCurrent || agenda[0] || null
+}
+
+/** Every session below the pinned card, newest first. */
+function listMetas() {
+  const pinned = pinnedMeta()
+  const pinnedID = pinned ? pinned.sessionID : null
+  return agenda.filter((meta) => meta.sessionID !== pinnedID)
+}
+
+/** The metas whose mirrors the current view actually needs. */
+function windowMetas() {
+  if (filter.session !== "all") {
+    const meta = metaOf(filter.session)
+    return meta ? [meta] : []
   }
-  const out = []
-  for (const id of ids) {
+  const pinned = pinnedMeta()
+  const shown = listMetas().slice(0, loadedCount)
+  return (pinned ? [pinned] : []).concat(shown)
+}
+
+// ---- mirrors (lazy) ----------------------------------------------------------
+
+/** Read the mirrors the window needs that are not cached at their current mtime. */
+async function ensureDocs(metas) {
+  const need = metas.filter((meta) => !docOf(meta))
+  if (!need.length) return
+  await Promise.all(need.map(async (meta) => {
     try {
-      const { content } = await host.readFile(`${TODOS_DIR}/${id}.json`)
-      const data = JSON.parse(content)
-      const doc = normalizeDoc(data)
-      if (!doc.todos.length) continue
-      out.push({
-        sessionID: data.sessionID || id,
-        updatedAt: Number(data.updatedAt) || 0,
-        todos: doc.todos,
-        phases: doc.phases,
-      })
+      const { content } = await host.readFile(`${TODOS_DIR}/${meta.sessionID}.json`)
+      const doc = parseDoc(content)
+      if (doc) docCache.set(meta.sessionID, { updatedAt: meta.updatedAt, todos: doc.todos, phases: doc.phases })
     } catch {
       /* a partial or unreadable file is skipped, not fatal */
     }
-  }
-  out.sort((a, b) => b.updatedAt - a.updatedAt)
-  return out
+  }))
 }
 
 // ---- rendering ---------------------------------------------------------------
 
-function sessionHeader(session) {
-  const done = session.todos.filter((todo) => isDone(todo.status)).length
-  const pct = Math.round((done / session.todos.length) * 100)
+function materialize(meta) {
+  const doc = docOf(meta)
+  return {
+    sessionID: meta.sessionID,
+    updatedAt: meta.updatedAt,
+    todos: doc ? doc.todos : [],
+    phases: doc ? doc.phases : [],
+  }
+}
+
+/** Header counts: from the index summary when present, else from the mirror. */
+function sessionHeader(meta) {
+  const doc = docOf(meta)
+  let done, total
+  if (Number.isFinite(meta.total)) {
+    total = meta.total
+    done = (meta.done || 0) + (meta.cancelled || 0)
+  } else {
+    const todos = doc ? doc.todos : []
+    total = todos.length
+    done = todos.filter((todo) => isDone(todo.status)).length
+  }
+  const pct = total ? Math.round((done / total) * 100) : 0
   return (
-    `<div class="sess-head"><h3>${esc(titleFor(session))}</h3>` +
-    `<span class="cnt">${done}/${session.todos.length}</span></div>` +
+    `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` +
+    `<span class="cnt">${done}/${total}</span></div>` +
     `<div class="prog"><i style="width:${pct}%"></i></div>`
   )
 }
@@ -191,52 +247,155 @@ function swimlaneSvg(session) {
       parts.push(`<text x="${node.x}" y="${node.y + 4}" font-size="10" fill="var(--oc-fg, #100f0f)" text-anchor="middle">${text}${node.blocked ? " ⛓" : " ○"}</text>`)
     }
   }
-  return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleFor(session))}">${parts.join("")}</svg></div>`
+  return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleOf({ sessionID: session.sessionID }))}">${parts.join("")}</svg></div>`
 }
 
-function visibleSessions() {
-  return sessions.filter((session) => (
-    (filter.session === "all" || session.sessionID === filter.session) &&
-    (!filtering() || session.todos.some(matches))
-  ))
+function sessionCard(meta, current) {
+  const doc = docOf(meta)
+  const body = doc
+    ? (filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)))
+    : `<div class="note">加载中…</div>`
+  const tag = current ? `<div class="pin-tag">当前会话</div>` : ""
+  return `<section class="sess${current ? " pinned" : ""}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta)}${body}</section>`
+}
+
+/** Whether a loaded session holds a task matching the active filter. */
+function hasMatch(meta) {
+  const doc = docOf(meta)
+  return Boolean(doc && doc.todos.some(matches))
+}
+
+function sentinelHtml(list, considered) {
+  const more = considered.length < list.length
+  let html = more
+    ? `<div id="sentinel" class="sentinel">↓ 滚动到底加载下一批（还有 ${list.length - considered.length} 个会话）</div>`
+    : `<div class="endnote">已到末尾 · 共 ${list.length} 个会话</div>`
+  if (filtering() && more) {
+    html += `<div class="endnote">筛选只作用于已加载的 ${considered.length} 个会话 · ` +
+      `<button type="button" id="loadAll" class="link">加载全部以筛选</button></div>`
+  }
+  return html
 }
 
 function paint() {
-  const visible = visibleSessions()
-  el("sessions").innerHTML = visible.length
-    ? visible.map((session) => (
-        `<section class="sess" data-session="${esc(session.sessionID)}">` +
-        sessionHeader(session) +
-        (filter.view === "swimlane" ? swimlaneSvg(session) : treeRowsHtml(session)) +
-        `</section>`
-      )).join("")
-    : `<div class="note">没有匹配的任务。</div>`
+  const box = el("sessions")
+
+  if (filter.session !== "all") {
+    const meta = metaOf(filter.session)
+    box.innerHTML = meta ? sessionCard(meta, false) : `<div class="note">该会话已不存在。</div>`
+    paintDetails()
+    observeSentinel()
+    return
+  }
+
+  const pinned = pinnedMeta()
+  if (!pinned) {
+    box.innerHTML = `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`
+    paintDetails()
+    observeSentinel()
+    return
+  }
+
+  const list = listMetas()
+  const considered = list.slice(0, loadedCount)
+  const shown = filtering() ? considered.filter(hasMatch) : considered
+  const cards = shown.map((meta) => sessionCard(meta, false)).join("")
+  const countNote = filtering() ? ` · 命中 ${shown.length}` : ""
+  box.innerHTML =
+    sessionCard(pinned, true) +
+    `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` +
+    (cards || `<div class="note">没有匹配的任务。</div>`) +
+    sentinelHtml(list, considered)
   paintDetails()
+  observeSentinel()
+}
+
+/** Load the next batch (or everything) when the sentinel scrolls into view. */
+function loadMore() {
+  if (loadingMore || !el("sentinel")) return
+  loadingMore = true
+  loadedCount += BATCH
+  void renderBoard().finally(() => { loadingMore = false })
+}
+
+function loadAll() {
+  if (loadingMore) return
+  loadingMore = true
+  loadedCount = Number.MAX_SAFE_INTEGER
+  void renderBoard().finally(() => { loadingMore = false })
+}
+
+function observeSentinel() {
+  if (observer) {
+    observer.disconnect()
+    observer = null
+  }
+  const loadAllButton = el("loadAll")
+  if (loadAllButton) loadAllButton.addEventListener("click", () => loadAll())
+  const node = el("sentinel")
+  if (!node) return
+  if (typeof IntersectionObserver === "undefined") return
+  observer = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) loadMore()
+  }, { root: el("sessions"), rootMargin: "600px" })
+  observer.observe(node)
+}
+
+/** Backup for a throttled IntersectionObserver: load when the list nears its end. */
+function onSessionsScroll() {
+  const box = el("sessions")
+  if (box.scrollHeight - box.scrollTop - box.clientHeight < 400) loadMore()
+}
+
+/** Ensure the window's mirrors, then paint — guarded against overlapping runs. */
+async function renderBoard() {
+  const seq = (renderSeq += 1)
+  await ensureDocs(windowMetas())
+  if (seq !== renderSeq) return
+  paint()
 }
 
 function paintSummary() {
   let doing = 0, pending = 0, done = 0, blocked = 0, total = 0
   const byPhase = new Map()
-  for (const session of sessions) {
+  for (const meta of agenda) {
+    if (Number.isFinite(meta.total)) {
+      total += meta.total
+      done += meta.done || 0
+      doing += meta.doing || 0
+      pending += meta.pending || 0
+      blocked += meta.blocked || 0
+      for (const [phase, count] of Object.entries(meta.byPhase || {})) {
+        byPhase.set(phase, (byPhase.get(phase) || 0) + count)
+      }
+      continue
+    }
+    // An index written before the plugin learned to summarise: count from the
+    // mirror when it is loaded, so the bar fills in as the reader scrolls.
+    const doc = docOf(meta)
+    if (!doc) continue
     const statusById = new Map()
-    for (const todo of session.todos) if (todo.id) statusById.set(todo.id, todo.status)
-    for (const todo of session.todos) {
+    for (const todo of doc.todos) if (todo.id) statusById.set(todo.id, todo.status)
+    for (const todo of doc.todos) {
       total += 1
-      if (todo.status === "in_progress") doing += 1
+      if (todo.status === "completed") done += 1
+      else if (todo.status === "in_progress") doing += 1
       else if (todo.status === "pending") pending += 1
-      else if (todo.status === "completed") done += 1
       if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
-      const phase = todo.phase || UNGROUPED
+      const phase = todo.phase || ""
       byPhase.set(phase, (byPhase.get(phase) || 0) + 1)
     }
   }
-  const phaseChips = globalPhases.concat(byPhase.has(UNGROUPED) ? [UNGROUPED] : [])
+  const ungrouped = byPhase.get("") || 0
+  const phaseChips = globalPhases
     .map((phase) => {
       const index = globalPhases.indexOf(phase)
       return `<span class="pg"><i style="background:${colorAt(index)}"></i>${esc(phase)} <b>${byPhase.get(phase) || 0}</b></span>`
-    }).join("")
+    })
+    .join("") +
+    (ungrouped ? `<span class="pg"><i style="background:${colorAt(-1)}"></i>${esc(UNGROUPED)} <b>${ungrouped}</b></span>` : "")
   el("summary").innerHTML =
-    `<div class="stats"><b>${sessions.length} 会话</b> <span>◐ ${doing} 进行中</span>` +
+    `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${doing} 进行中</span>` +
     `<span>○ ${pending} 待办</span><span class="blocked">⛓ ${blocked} 受阻</span><span>✓ ${done} 完成</span>` +
     `<span>共 ${total} 项</span></div>` +
     `<div class="phases"><span style="color:var(--b-muted)">阶段分布</span>${phaseChips}</div>`
@@ -246,18 +405,20 @@ function paintDetails() {
   for (const handle of detailHandles) handle.dispose()
   detailHandles = []
   const box = el("details")
-  const session = selected && sessions.find((s) => s.sessionID === selected.sessionID)
-  const todo = session && session.todos[selected.index]
+  const meta = selected ? metaOf(selected.sessionID) : null
+  const doc = meta ? docOf(meta) : null
+  const todo = doc && selected ? doc.todos[selected.index] : null
   if (!todo) {
     box.innerHTML = `<h3>任务详情</h3><div class="kv">点击左侧任务查看详情。</div>`
     return
   }
+  const todos = doc.todos
   const deps = Array.isArray(todo.dependsOn) ? todo.dependsOn : []
   const depHtml = deps.length
     ? deps.map((id) => {
-        const index = session.todos.findIndex((t) => t.id === id)
+        const index = todos.findIndex((t) => t.id === id)
         if (index < 0) return `${esc(id)}（未找到）`
-        const dep = session.todos[index]
+        const dep = todos[index]
         return `<a data-goto="${index}">${esc(dep.content)}</a>${dep.status === "completed" ? " ✓" : "（未完成 → 受阻）"}`
       }).join("<br>")
     : "—"
@@ -268,7 +429,7 @@ function paintDetails() {
     `<div class="kv">阶段：${esc(todo.phase || "—")}</div>` +
     `<div class="kv">优先级：${esc(todo.priority || "—")}</div>` +
     `<div class="kv">依赖：<br>${depHtml}</div>` +
-    `<div class="kv">会话：${esc(session.sessionID)}</div>` +
+    `<div class="kv">会话：${esc(meta.sessionID)}</div>` +
     `<div class="actions" id="detailActions"></div>`
   const actions = el("detailActions")
   const hand = document.createElement("div")
@@ -278,7 +439,7 @@ function paintDetails() {
   detailHandles.push(
     mountButton(hand, { label: "交给 AI 处理", size: "sm", onClick: () => handOff(todo) }),
     mountButton(copy, { label: "复制", variant: "secondary", size: "sm", onClick: () => copyTodo(todo) }),
-    mountButton(open, { label: "打开会话", variant: "ghost", size: "sm", onClick: () => openSession(session.sessionID) }),
+    mountButton(open, { label: "打开会话", variant: "ghost", size: "sm", onClick: () => openSession(meta.sessionID) }),
   )
 }
 
@@ -317,7 +478,7 @@ async function copyTodo(todo) {
 
 function updateSessionOptions() {
   if (!controls.session) return
-  const options = [{ id: "all", label: "全部会话" }, ...sessions.map((s) => ({ id: s.sessionID, label: truncate(titleFor(s), 28) }))]
+  const options = [{ id: "all", label: "全部会话" }, ...agenda.map((meta) => ({ id: meta.sessionID, label: truncate(meta.title || meta.sessionID, 28) }))]
   controls.session.update({ options })
 }
 
@@ -334,7 +495,12 @@ function mountToolbar() {
   })
   controls.session = mountSelect(el("sessionHost"), {
     label: "会话", value: "all", options: [{ id: "all", label: "全部会话" }], searchable: true,
-    onChange: (value) => { filter.session = value; controls.session.update({ value }); paint() },
+    onChange: (value) => {
+      filter.session = value
+      loadedCount = BATCH
+      controls.session.update({ value })
+      void renderBoard()
+    },
   })
   controls.view = mountSelect(el("viewHost"), {
     label: "视图", value: "tree",
@@ -363,6 +529,7 @@ function mountToolbar() {
     },
   })
 
+  el("sessions").addEventListener("scroll", onSessionsScroll, { passive: true })
   el("sessions").addEventListener("click", (event) => {
     const row = event.target instanceof Element ? event.target.closest(".row") : null
     if (!row || row.dataset.index === undefined) return
@@ -381,40 +548,45 @@ function mountToolbar() {
 
 async function refresh() {
   if (!host) return
-  let next
+  let metas
   try {
-    next = await load()
+    const { content } = await host.readFile(`${TODOS_DIR}/_index.json`)
+    metas = parseIndex(content)
+    if (metas === null) throw new Error("BAD_INDEX")
   } catch (error) {
     const code = error && error.code
     const message = String((error && error.message) || "")
     el("sessions").innerHTML = `<div class="note">${
-      message === "NO_INDEX"
-        ? "任务索引尚未生成：在任一会话里触发一次任务更新（todowrite）即可。"
-        : `读取失败：${esc(code || message || String(error))}`
+      message === "BAD_INDEX"
+        ? "任务索引损坏。"
+        : code === "NOT_FOUND"
+          ? "任务索引尚未生成：在任一会话里触发一次任务更新（todowrite）即可。"
+          : `读取失败：${esc(code || message || String(error))}`
     }</div>`
     return
   }
+
   const phases = []
   const seen = new Set()
-  for (const session of next) {
-    for (const phase of session.phases) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
-    for (const todo of session.todos) if (todo.phase && !seen.has(todo.phase)) { seen.add(todo.phase); phases.push(todo.phase) }
+  for (const meta of metas) {
+    for (const phase of (meta.phases || [])) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
+    for (const phase of Object.keys(meta.byPhase || {})) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
   }
-  const key = JSON.stringify([next.map((s) => [s.sessionID, s.updatedAt, s.todos]), phases])
+  const key = JSON.stringify([metas, loadedCount, filter, currentID])
   if (key === lastKey) return
   lastKey = key
 
   const phasesChanged = JSON.stringify(phases) !== JSON.stringify(globalPhases)
-  sessions = next
+  agenda = metas
   globalPhases = phases
-  if (filter.session !== "all" && !sessions.some((s) => s.sessionID === filter.session)) filter.session = "all"
+  if (filter.session !== "all" && !metaOf(filter.session)) filter.session = "all"
   updateSessionOptions()
   if (phasesChanged) updatePhaseOptions()
   el("legend").innerHTML = globalPhases
     .map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`)
     .join("")
   paintSummary()
-  paint()
+  await renderBoard()
 }
 
 function insideHostFrame() {
@@ -423,6 +595,14 @@ function insideHostFrame() {
   } catch {
     return true
   }
+}
+
+function setCurrent(session) {
+  const next = session && typeof session.id === "string" ? session.id : null
+  if (next === currentID) return
+  currentID = next
+  lastKey = ""
+  if (host) void renderBoard()
 }
 
 function boot() {
@@ -440,10 +620,12 @@ function boot() {
     applyHostReady(ctx, document.documentElement)
     if (mounted) return
     mounted = true
+    currentID = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     mountToolbar()
     void refresh()
     if (timer === null) timer = setInterval(() => { void refresh() }, POLL_MS)
   })
+  host.onSession((session) => setCurrent(session))
 }
 
 boot()

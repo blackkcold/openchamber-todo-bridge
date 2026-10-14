@@ -370,3 +370,25 @@ test-install）全绿；浏览器核对区块受阻环、看板汇总/会话选�
 （而非状态圆点），渲染层把它画成一行**加粗的阶段标题**（用阶段色）。
 
 测试：`test-graph.mjs` 新增分组用例（每阶段一个合成节点、任务缩进一级、显式嵌套时不合成、无阶段时不合成）。
+
+## 18. 看板窗口化（默认最近 15 个 + 当前会话置顶 + 懒加载）
+
+看板曾每 4s 读**全部**会话镜像、并渲染**全部**会话——会话一多就卡死。改为：
+
+- **数据**：只读插件写的 `_index.json`。索引升级到 `version: 2`：每个会话条目附带**摘要**
+  （`title` / `total` / `done` / `doing` / `pending` / `cancelled` / `blocked` / `byPhase` / `phases`），
+  由插件写索引时算出（按 mtime 缓存，未变的文件不重读）。于是顶部统计、会话下拉、每张卡的头都
+  **零文件读**；只有画某会话的树 / 泳道才 `readFile` 它的镜像。
+- **渲染**：`BATCH = 15`。当前会话（`ctx.session`，缺省取最新一个）**置顶成独立卡片**并从列表排除；
+  其下按 `_index.json` 倒序渲染最近 15 个会话；底部哨兵用 `IntersectionObserver`（`rootMargin: 600px`）
+  加 `#sessions` 滚动兜底，滚到底载入下一批（`loadingMore` 闸门防重复）。
+- **筛选**：关键字 / 状态 / 阶段只作用于**已加载**窗口（懒加载下只有这些有数据），并给一个
+  「加载全部以筛选」按钮，由用户显式承担全量成本。
+- **兼容**：`parseIndex` 容忍旧 v1 索引（无摘要）——那种条目回退为「读该会话文件取计数」。
+
+文件：`opencode-plugin/index.js`（`summarize` / `titleFor` + 索引 v2）、`src/doc.js`（`parseIndex`）、
+`src/board.js`（窗口化 / 置顶 / 懒读）、`board/index.html`（置顶卡 / 哨兵样式）、`scripts/test-index.mjs`（新）、
+`scripts/test-plugin.mjs`（`summarize` 用例）。版本 `0.7.1 → 0.8.0`。
+
+验证：`bun run test` 全绿；`design/verify-pages.html`（20 会话、带摘要索引、当前会话 = `ses_phased`）：
+首屏 `pinned=1 cards=16 sentinel=yes divider="已显示 15 / 19"`，滚到底后 `cards=20 sentinel=no endnote=yes`。

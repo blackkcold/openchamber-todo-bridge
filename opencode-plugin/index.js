@@ -27,9 +27,13 @@
  *     parentId?, phase?, dependsOn? }], updatedAt }
  *   A v1 file (no `version`, flat items) is still read; the extra fields are
  *   optional and only drive the visual task tree.
+ *
+ *   <TODO_BRIDGE_DIR>/_index.json          the sessions the board reads, newest
+ *   first, each with a summary (title, counts, phases) so the board can render
+ *   its summary bar and headers without opening every mirror.
  */
 
-import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises"
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
@@ -172,12 +176,77 @@ async function mirror(sessionID, todos, phases) {
 }
 
 /**
+ * The per-session summary the board reads from the index.
+ *
+ * The board used to `readFile` every session mirror just to draw its summary
+ * bar, its session labels and each card header. That is O(sessions) reads a
+ * poll, which stalls once a machine accumulates a few hundred sessions. The
+ * counts below are everything the board needs for those, so it can render them
+ * from `_index.json` alone and read a mirror only to draw the task tree itself.
+ *
+ * Pure, so the harness can check the arithmetic without a filesystem.
+ */
+export function summarize(todos, phases = []) {
+  const list = Array.isArray(todos) ? todos : []
+  const statusById = new Map()
+  for (const todo of list) if (todo && typeof todo.id === "string" && todo.id !== "") statusById.set(todo.id, todo.status)
+  let done = 0, doing = 0, pending = 0, cancelled = 0, blocked = 0
+  const byPhase = {}
+  for (const todo of list) {
+    if (todo === null || typeof todo !== "object") continue
+    if (todo.status === "completed") done += 1
+    else if (todo.status === "in_progress") doing += 1
+    else if (todo.status === "pending") pending += 1
+    else if (todo.status === "cancelled") cancelled += 1
+    if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
+    const key = typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : ""
+    byPhase[key] = (byPhase[key] || 0) + 1
+  }
+  const declared = Array.isArray(phases) ? phases.filter((phase) => typeof phase === "string" && phase !== "") : []
+  return { total: list.length, done, doing, pending, cancelled, blocked, byPhase, phases: declared }
+}
+
+/** The session label the board shows, derived from the list since a mirror has no title. */
+export function titleFor(todos) {
+  const list = Array.isArray(todos) ? todos : []
+  const active = list.find((todo) => todo && todo.status === "in_progress")
+  const root = list.find((todo) => todo && !todo.parentId)
+  return (active || root || {}).content || ""
+}
+
+/**
  * Writes `_index.json`, the list of sessions the board reads.
  *
  * The board's `filesystem` grant covers the files (`todos/*.json`), not the
  * directory, so the board cannot `listDir`. The plugin runs with full access, so
  * it writes the index instead — which keeps the grant file-level.
+ *
+ * Each entry carries a summary (title, counts, phases) so the board can render
+ * its summary bar, its session labels and every card header without opening a
+ * single mirror. The summary is recomputed only when a file's mtime moves, so a
+ * write stays cheap on a machine with many sessions.
  */
+const summaryCache = new Map()
+
+async function summarizeFile(dir, name, mtimeMs) {
+  const path = join(dir, name)
+  const cached = summaryCache.get(path)
+  if (cached && cached.mtimeMs === mtimeMs) return cached.entry
+  let entry = null
+  try {
+    const data = JSON.parse(await readFile(path, "utf8"))
+    const todos = parseRecord(data)
+    const sessionID = data && typeof data.sessionID === "string" && data.sessionID !== ""
+      ? data.sessionID
+      : name.slice(0, -".json".length)
+    entry = { sessionID, updatedAt: Math.round(mtimeMs), title: titleFor(todos), ...summarize(todos, data && data.phases) }
+  } catch {
+    /* an unreadable or partial file is skipped this round */
+  }
+  summaryCache.set(path, { mtimeMs, entry })
+  return entry
+}
+
 async function writeIndex(dir) {
   let names = []
   try {
@@ -186,17 +255,25 @@ async function writeIndex(dir) {
     return
   }
   const sessions = []
+  const seen = new Set()
   for (const name of names) {
     if (!name.endsWith(".json") || name === INDEX_NAME) continue
     try {
       const info = await stat(join(dir, name))
-      sessions.push({ sessionID: name.slice(0, -".json".length), updatedAt: Math.round(info.mtimeMs) })
+      const entry = await summarizeFile(dir, name, info.mtimeMs)
+      if (entry) {
+        sessions.push(entry)
+        seen.add(name)
+      }
     } catch {
       /* a file that vanished mid-scan is skipped */
     }
   }
+  for (const path of summaryCache.keys()) {
+    if (!seen.has(path.slice(path.lastIndexOf("/") + 1))) summaryCache.delete(path)
+  }
   sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-  const payload = JSON.stringify({ version: 1, sessions, updatedAt: Date.now() }, null, 2)
+  const payload = JSON.stringify({ version: 2, sessions, updatedAt: Date.now() }, null, 2)
   const tmp = join(dir, `.${INDEX_NAME}.${process.pid}.tmp`)
   await writeFile(tmp, payload, "utf8")
   await rename(tmp, join(dir, INDEX_NAME))
@@ -333,6 +410,15 @@ export default {
   id: "openchamber-todo-bridge",
 
   async setup(ctx) {
+    // Refresh/upgrade `_index.json` once at load, so the board gets its per-session
+    // summaries even before the first todowrite of a session — and an index left
+    // over from an older plugin (no summaries) is rewritten on the next start.
+    try {
+      await writeIndex(mirrorDir())
+    } catch {
+      /* best-effort: the board falls back to reading mirrors */
+    }
+
     const tools = await ctx.tool.transform((editor) => {
       editor.add({
         name: "todowrite",
