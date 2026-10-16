@@ -24,7 +24,7 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.1` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.2` to the URL.
 
 ## Compatibility & permissions
 
