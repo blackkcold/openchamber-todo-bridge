@@ -2290,6 +2290,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   // src/archive.js
   var ARCHIVE_KEY = "archive";
   var ARCHIVE_VERSION = 1;
+  var PREFS_KEY = "archive:prefs";
+  var PREFS_VERSION = 1;
   function emptyArchive() {
     return { version: ARCHIVE_VERSION, sessions: {} };
   }
@@ -2307,6 +2309,17 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         continue;
       out.sessions[sessionID] = at;
     }
+    return out;
+  }
+  function emptyPrefs() {
+    return { version: PREFS_VERSION, auto: true };
+  }
+  function parsePrefs(raw) {
+    const out = emptyPrefs();
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+      return out;
+    if (typeof raw.auto === "boolean")
+      out.auto = raw.auto;
     return out;
   }
   function isArchived(entry, meta) {
@@ -2343,6 +2356,32 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         continue;
       if (isFullyFinished(meta))
         ids.push(meta.sessionID);
+    }
+    return ids;
+  }
+  function autoArchiveIDs(metas, entry, opts = {}) {
+    if (!opts.readOk)
+      return [];
+    const keep = new Set(Array.isArray(opts.keep) ? opts.keep : []);
+    const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {};
+    const now = Number.isFinite(opts.now) ? opts.now : Infinity;
+    const ids = [];
+    for (const meta of Array.isArray(metas) ? metas : []) {
+      if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "")
+        continue;
+      if (keep.has(meta.sessionID))
+        continue;
+      if (isArchived(entry, meta))
+        continue;
+      if (!isFullyFinished(meta))
+        continue;
+      const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
+      if (updated > now)
+        continue;
+      const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity;
+      if (updated <= restored)
+        continue;
+      ids.push(meta.sessionID);
     }
     return ids;
   }
@@ -2398,6 +2437,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var observers = [];
   var undo = null;
   var undoTimer = null;
+  var prefs = emptyPrefs();
+  var hold = {};
+  var readOk = false;
+  var sweepPaused = false;
   var ARCHIVE_UNDO_MS = 9000;
   var metaOf = (sessionID) => allMetas.find((meta) => meta.sessionID === sessionID) || null;
   function docOf(meta) {
@@ -2550,7 +2593,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const doc = docOf(meta);
     const body = doc ? filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)) : `<div class="note">加载中…</div>`;
     const tag = current ? `<div class="pin-tag">当前会话</div>` : "";
-    const opts = archivedCard ? { restore: true } : current ? {} : { archive: true };
+    const opts = archivedCard ? { restore: true } : { archive: true };
     const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`;
     return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`;
   }
@@ -2771,6 +2814,48 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       host.toast({ kind: "success", message: "已复制任务内容。" });
     } catch {}
   }
+  function keepIDs() {
+    const ids = [];
+    if (currentID)
+      ids.push(currentID);
+    if (filter.session !== "all")
+      ids.push(filter.session);
+    return ids;
+  }
+  function holdIDs(ids, at = Date.now()) {
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (typeof id === "string" && id !== "")
+        hold[id] = at;
+    }
+  }
+  function removedIDs(previous, next) {
+    const before = previous && previous.sessions || {};
+    const after = next && next.sessions || {};
+    return Object.keys(before).filter((id) => !(id in after));
+  }
+  async function sweepArchive(ids, now) {
+    let base = archive;
+    try {
+      base = parseArchive(await host.storage.get(ARCHIVE_KEY));
+    } catch {
+      return null;
+    }
+    const next = withArchived(base, ids, now);
+    try {
+      await host.storage.set(ARCHIVE_KEY, next);
+    } catch {
+      sweepPaused = true;
+      return null;
+    }
+    return next;
+  }
+  async function savePrefs() {
+    try {
+      await host.storage.set(PREFS_KEY, prefs);
+    } catch (error) {
+      host.toast({ kind: "error", message: `偏好未能保存：${error && error.code || error}` });
+    }
+  }
   function armUndo(label, entry) {
     undo = { label, entry };
     if (undoTimer !== null)
@@ -2790,6 +2875,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   }
   async function commitArchive(entry, previous, label, successMessage) {
     archive = entry;
+    holdIDs(removedIDs(previous, entry));
     armUndo(label, previous);
     try {
       await host.storage.set(ARCHIVE_KEY, archive);
@@ -2834,6 +2920,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return;
     const target = undo.entry;
     clearUndo();
+    holdIDs(removedIDs(archive, target));
     archive = target;
     try {
       await host.storage.set(ARCHIVE_KEY, archive);
@@ -2931,6 +3018,17 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         archiveFinished();
       }
     });
+    controls.auto = mountCheckbox(el2("autoArchiveHost"), {
+      label: "自动归档已完成",
+      checked: prefs.auto,
+      onChange: (checked) => {
+        prefs.auto = checked;
+        controls.auto.update({ checked });
+        savePrefs();
+        lastKey = "";
+        refresh();
+      }
+    });
     el2("sessions").addEventListener("scroll", onSessionsScroll, { passive: true });
     el2("sessions").addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
@@ -2995,10 +3093,29 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     let rawArchive;
     try {
       rawArchive = await host.storage.get(ARCHIVE_KEY);
+      readOk = true;
     } catch {
       rawArchive = undefined;
+      readOk = false;
     }
-    const nextArchive = parseArchive(rawArchive);
+    let nextArchive = parseArchive(rawArchive);
+    try {
+      const stored = parsePrefs(await host.storage.get(PREFS_KEY));
+      if (stored.auto !== prefs.auto) {
+        prefs = stored;
+        if (controls.auto)
+          controls.auto.update({ checked: prefs.auto });
+      }
+    } catch {}
+    if (prefs.auto && readOk && !sweepPaused) {
+      const now = Date.now();
+      const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk });
+      if (ids.length) {
+        const merged = await sweepArchive(ids, now);
+        if (merged)
+          nextArchive = merged;
+      }
+    }
     const phases = [];
     const seen = new Set;
     for (const meta of metas) {
@@ -3013,7 +3130,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
           phases.push(phase);
         }
     }
-    const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount]);
+    const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount, prefs.auto, hold]);
     if (key === lastKey)
       return;
     lastKey = key;
@@ -3026,7 +3143,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     globalPhases = phases;
     if (filter.session !== "all") {
       const chosen = metaOf(filter.session);
-      if (!chosen || isArchived(archive, chosen))
+      if (!chosen || isArchived(archive, chosen) && chosen.sessionID !== currentID)
         filter.session = "all";
     }
     updateSessionOptions();

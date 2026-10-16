@@ -6,11 +6,14 @@
 // missing, partial, or written by an older version.
 import {
   emptyArchive,
+  emptyPrefs,
   parseArchive,
+  parsePrefs,
   isArchived,
   partition,
   isFullyFinished,
   finishedSessionIDs,
+  autoArchiveIDs,
   withArchived,
   withoutArchived,
 } from "../src/archive.js"
@@ -72,6 +75,34 @@ console.log("\nfinishedSessionIDs — the bulk run")
   check("an already-archived finished session is skipped", finishedSessionIDs(metas, entry).join(",") === "")
   check("a finished, unarchived session is picked up", finishedSessionIDs(metas, emptyArchive()).join(",") === "done")
   check("the session in view is skipped", finishedSessionIDs(metas, emptyArchive(), "done").join(",") === "")
+}
+
+console.log("\nparsePrefs — the auto-archive preference")
+check("the default is auto on", emptyPrefs().auto === true)
+check("a missing value defaults to auto on", parsePrefs(undefined).auto === true)
+check("garbage defaults to auto on", parsePrefs("nope").auto === true)
+check("an array defaults to auto on", parsePrefs([]).auto === true)
+check("an explicit false is kept", parsePrefs({ version: 1, auto: false }).auto === false)
+check("an explicit true is kept", parsePrefs({ auto: true }).auto === true)
+check("a non-boolean auto defaults to on", parsePrefs({ auto: "no" }).auto === true)
+
+console.log("\nautoArchiveIDs — the silent sweep")
+{
+  const finished = (id, updatedAt = 10) => meta(id, updatedAt, { total: 2, done: 2, doing: 0, pending: 0 })
+  const open = (id, updatedAt = 10) => meta(id, updatedAt, { total: 2, done: 1, doing: 1, pending: 0 })
+  const metas = [open("a"), finished("b"), finished("c"), finished("d")]
+  const sweep = (entry, opts) => autoArchiveIDs(metas, entry, { now: 100, readOk: true, ...opts }).join(",")
+  check("only finished, unarchived sessions are picked, in order", sweep(emptyArchive()) === "b,c,d")
+  check("an already-archived session is skipped", sweep({ version: 1, sessions: { c: 999 } }) === "b,d")
+  check("a kept session is skipped", sweep(emptyArchive(), { keep: ["b", "current"] }) === "c,d")
+  check("readOk false skips the whole sweep", autoArchiveIDs(metas, emptyArchive(), { now: 100, readOk: false }).length === 0)
+  check("a held session is skipped until it moves", sweep(emptyArchive(), { hold: { b: 50 } }) === "c,d")
+  check("a hold older than the update no longer holds", sweep(emptyArchive(), { hold: { b: 5 } }) === "b,c,d")
+  check("a session updated after now is skipped (clock)", autoArchiveIDs([finished("e", 200)], emptyArchive(), { now: 100, readOk: true }).length === 0)
+  check("a summary-less session is skipped", autoArchiveIDs([meta("f", 10)], emptyArchive(), { now: 100, readOk: true }).length === 0)
+  const before = emptyArchive()
+  autoArchiveIDs(metas, before, { now: 100, readOk: true })
+  check("the sweep does not mutate its inputs", Object.keys(before.sessions).length === 0)
 }
 
 console.log("\nwithArchived / withoutArchived — pure edits")

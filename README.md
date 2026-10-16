@@ -14,7 +14,7 @@ Visualize OpenCode todos in OpenChamber: a live task tree for the current sessio
 
 - Restores `todowrite` / `todoread` for OpenCode v2 and displays session todos in OpenChamber.
 - Groups nested tasks into a tree; `phase` adds colour-coded stages, and unfinished dependencies are marked blocked.
-- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving.
+- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — manual, and optionally automatic for finished sessions.
 
 ## Install
 
@@ -24,7 +24,7 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.0` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.1` to the URL.
 
 ## Compatibility & permissions
 
