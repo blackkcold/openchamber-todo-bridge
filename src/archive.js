@@ -23,6 +23,11 @@
 export const ARCHIVE_KEY = "archive"
 /** The stored document's shape version, for a future migration. */
 export const ARCHIVE_VERSION = 1
+/** A second key for the reader's archive preferences (`{ auto }`). Kept apart from
+ *  the archive document so a preference never has to be taught to `parseArchive`. */
+export const PREFS_KEY = "archive:prefs"
+/** The preferences document's shape version. */
+export const PREFS_VERSION = 1
 
 /** An empty archive: what a missing, unreadable, or unknown value becomes. */
 export function emptyArchive() {
@@ -46,6 +51,23 @@ export function parseArchive(raw) {
     if (!Number.isFinite(at)) continue
     out.sessions[sessionID] = at
   }
+  return out
+}
+
+/** The default preferences: automatic archiving is on. */
+export function emptyPrefs() {
+  return { version: PREFS_VERSION, auto: true }
+}
+
+/**
+ * Normalise a stored preferences value. Defensive like `parseArchive`: anything
+ * that is not a boolean `auto` (a missing value, a string, an array) leaves the
+ * default in place, so an unknown value never turns the sweep on or off by surprise.
+ */
+export function parsePrefs(raw) {
+  const out = emptyPrefs()
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return out
+  if (typeof raw.auto === "boolean") out.auto = raw.auto
   return out
 }
 
@@ -98,6 +120,39 @@ export function finishedSessionIDs(metas, entry, keepActiveID) {
     if (meta.sessionID === keepActiveID) continue
     if (isArchived(entry, meta)) continue
     if (isFullyFinished(meta)) ids.push(meta.sessionID)
+  }
+  return ids
+}
+
+/**
+ * The sessions an automatic sweep should set aside: fully finished, not already
+ * archived, kept in view, or held, and not stamped with a future time. Pure, so
+ * the board's trigger stays a thin wrapper and every guard runs under Node.
+ *
+ * - `opts.keep` — ids to leave alone: the open session and the one being filtered.
+ * - `opts.hold` — id -> the time it was restored or undone; a session stays out of
+ *   the sweep until it runs `todowrite` again (its `updatedAt` passes that time).
+ * - `opts.now` — the sweep time. A session updated after it (a clock that went
+ *   backwards) is skipped: a stamp could never hide it, so trying would only write.
+ * - `opts.readOk` — false when the stored archive could not be read. Skip entirely,
+ *   so an unreadable archive is never replaced with a blind set.
+ */
+export function autoArchiveIDs(metas, entry, opts = {}) {
+  if (!opts.readOk) return []
+  const keep = new Set(Array.isArray(opts.keep) ? opts.keep : [])
+  const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {}
+  const now = Number.isFinite(opts.now) ? opts.now : Infinity
+  const ids = []
+  for (const meta of Array.isArray(metas) ? metas : []) {
+    if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "") continue
+    if (keep.has(meta.sessionID)) continue
+    if (isArchived(entry, meta)) continue
+    if (!isFullyFinished(meta)) continue
+    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0
+    if (updated > now) continue
+    const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity
+    if (updated <= restored) continue
+    ids.push(meta.sessionID)
   }
   return ids
 }

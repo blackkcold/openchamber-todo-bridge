@@ -142,6 +142,10 @@
       // The board keeps its session archive in `host.storage`; the stub answers it
       // from memory so a bulk-archive / restore round trip is checkable here.
       const STORE = new Map()
+      // Pre-seed the auto sweep OFF so the manual bulk/undo probe below is
+      // deterministic. The dedicated auto-sweep probe later clears the store and
+      // reloads the board, exercising the real default (on) on a clean slate.
+      STORE.set("archive:prefs", { version: 1, auto: false })
 
       window.addEventListener("message", (event) => {
         const entry = registry.get(event.source)
@@ -263,7 +267,8 @@
           const doc = document.getElementById("board").contentDocument
           const board = doc.getElementById("sessions")
           const count = () => doc.querySelectorAll("#sessions .sess").length
-          say(`paging: pinned=${doc.querySelectorAll("#sessions .sess.pinned").length} cards=${count()} sentinel=${doc.getElementById("sentinel") ? "yes" : "no"} divider="${((doc.querySelector(".divider") || {}).textContent || "").trim()}"`)
+          const pinAct = doc.querySelector("#sessions .sess.pinned .sess-act")
+          say(`paging: pinned=${doc.querySelectorAll("#sessions .sess.pinned").length} cards=${count()} sentinel=${doc.getElementById("sentinel") ? "yes" : "no"} pinnedAction="${pinAct ? pinAct.textContent : "none"}" divider="${((doc.querySelector(".divider") || {}).textContent || "").trim()}"`)
           board.scrollTop = board.scrollHeight
           setTimeout(() => {
             say(`after scroll: cards=${count()} sentinel=${doc.getElementById("sentinel") ? "yes" : "no"} endnote=${doc.querySelector(".endnote") ? "yes" : "no"}`)
@@ -351,6 +356,43 @@
           say("archive probe error: " + error)
         }
       }, 9000)
+
+      // Auto-archive (default on): wipe the stub's storage and reload the board, so
+      // the sweep runs on a clean slate — nothing is set aside beforehand. A finished
+      // session must be filed away on its own, with no bulk click, and the toggle
+      // must persist its opt-out to `archive:prefs`.
+      setTimeout(() => {
+        const note = (m) => say("auto-sweep: " + m)
+        try {
+          STORE.clear()
+          const frame = document.getElementById("board")
+          frame.src = "/board/index.html"
+          registry.set(frame.contentWindow, { iframe: frame, surface: "page", sessionID: "ses_phased" })
+          setTimeout(() => {
+            try {
+              const doc = frame.contentDocument
+              const toggle = doc.getElementById("archiveToggle")
+              if (toggle) toggle.click()
+              setTimeout(() => {
+                try {
+                  const ids = Array.from(doc.querySelectorAll("#sessions .sess.archived")).map((s) => s.dataset.session)
+                  const stored = STORE.get("archive")
+                  note(`on load → fold="${toggle ? toggle.textContent.replace(/\s+/g, " ").trim() : "(none)"}"` +
+                    ` archived=[${ids.join(",")}] stored=[${stored ? Object.keys(stored.sessions || {}).join(",") : ""}]`)
+                  const box = doc.getElementById("autoArchiveHost")
+                  const cb = box && box.querySelector('button[role="checkbox"]')
+                  if (!cb) { note("no auto checkbox: " + (box ? box.innerHTML : "no host")); return }
+                  cb.click()
+                  setTimeout(() => {
+                    const pref = STORE.get("archive:prefs")
+                    note(`after toggle off → pref.auto=${pref ? pref.auto : "(unset)"}`)
+                  }, 700)
+                } catch (error) { say("auto-sweep expand error: " + error) }
+              }, 900)
+            } catch (error) { say("auto-sweep reload error: " + error) }
+          }, 5200)
+        } catch (error) { say("auto-sweep probe error: " + error) }
+      }, 15000)
     </script>
   </body>
 </html>

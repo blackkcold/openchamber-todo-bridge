@@ -27,10 +27,14 @@ import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { parseDoc, parseIndex } from "./doc.js"
 import {
   ARCHIVE_KEY,
+  PREFS_KEY,
+  autoArchiveIDs,
   emptyArchive,
+  emptyPrefs,
   finishedSessionIDs,
   isArchived,
   parseArchive,
+  parsePrefs,
   partition,
   withArchived,
   withoutArchived,
@@ -87,6 +91,15 @@ let observers = []
 /** The last archive change, offered back as an undo for a few seconds. */
 let undo = null
 let undoTimer = null
+/** The reader's archive preferences (currently just the auto sweep), from storage. */
+let prefs = emptyPrefs()
+/** id -> the time it was restored or undone: held out of the sweep until it moves. */
+const hold = {}
+/** Whether the stored archive could be read on the last refresh — the sweep gate. */
+let readOk = false
+/** Set after a failed auto write (e.g. the document is over the size cap): stop the
+ *  silent retry every poll, so a full archive is not written against every 4s. */
+let sweepPaused = false
 
 const ARCHIVE_UNDO_MS = 9000
 
@@ -291,7 +304,7 @@ function sessionCard(meta, current, archivedCard = false) {
     ? (filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)))
     : `<div class="note">加载中…</div>`
   const tag = current ? `<div class="pin-tag">当前会话</div>` : ""
-  const opts = archivedCard ? { restore: true } : (current ? {} : { archive: true })
+  const opts = archivedCard ? { restore: true } : { archive: true }
   const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`
   return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`
 }
@@ -575,6 +588,60 @@ async function copyTodo(todo) {
  * that runs `todowrite` again resurfaces on its own (see `src/archive.js`).
  */
 
+/** Ids the auto sweep must leave in view: the open session and the filtered one. */
+function keepIDs() {
+  const ids = []
+  if (currentID) ids.push(currentID)
+  if (filter.session !== "all") ids.push(filter.session)
+  return ids
+}
+
+/** Hold `ids` out of the auto sweep until each of them runs `todowrite` again. */
+function holdIDs(ids, at = Date.now()) {
+  for (const id of Array.isArray(ids) ? ids : []) {
+    if (typeof id === "string" && id !== "") hold[id] = at
+  }
+}
+
+/** The ids an archive edit removed: the ones a restore or an undo brought back. */
+function removedIDs(previous, next) {
+  const before = (previous && previous.sessions) || {}
+  const after = (next && next.sessions) || {}
+  return Object.keys(before).filter((id) => !(id in after))
+}
+
+/**
+ * One auto sweep: re-read the archive first, so a manual change made while this
+ * poll's own read was in flight is merged rather than silently overwritten, then
+ * set. Returns the stored value, or null when it was not written (a read that
+ * cannot be confirmed is retried next poll; a failed write pauses the sweep).
+ */
+async function sweepArchive(ids, now) {
+  let base = archive
+  try {
+    base = parseArchive(await host.storage.get(ARCHIVE_KEY))
+  } catch {
+    return null
+  }
+  const next = withArchived(base, ids, now)
+  try {
+    await host.storage.set(ARCHIVE_KEY, next)
+  } catch {
+    sweepPaused = true
+    return null
+  }
+  return next
+}
+
+/** Persist the archive preferences; a refusal keeps them in memory for this page. */
+async function savePrefs() {
+  try {
+    await host.storage.set(PREFS_KEY, prefs)
+  } catch (error) {
+    host.toast({ kind: "error", message: `偏好未能保存：${(error && error.code) || error}` })
+  }
+}
+
 /** Offer the last archive change back as an undo for a few seconds. */
 function armUndo(label, entry) {
   undo = { label, entry }
@@ -601,6 +668,9 @@ function clearUndo() {
  */
 async function commitArchive(entry, previous, label, successMessage) {
   archive = entry
+  // Anything this write un-archives (a restore, or a later undo of an archive)
+  // stays out of the sweep until the session runs todowrite again.
+  holdIDs(removedIDs(previous, entry))
   armUndo(label, previous)
   try {
     await host.storage.set(ARCHIVE_KEY, archive)
@@ -659,6 +729,7 @@ async function performUndo() {
   if (!undo) return
   const target = undo.entry
   clearUndo()
+  holdIDs(removedIDs(archive, target))
   archive = target
   try {
     await host.storage.set(ARCHIVE_KEY, archive)
@@ -729,6 +800,17 @@ function mountToolbar() {
     size: "sm",
     onClick: () => { void archiveFinished() },
   })
+  controls.auto = mountCheckbox(el("autoArchiveHost"), {
+    label: "自动归档已完成",
+    checked: prefs.auto,
+    onChange: (checked) => {
+      prefs.auto = checked
+      controls.auto.update({ checked })
+      void savePrefs()
+      lastKey = ""
+      void refresh()
+    },
+  })
 
   el("sessions").addEventListener("scroll", onSessionsScroll, { passive: true })
   el("sessions").addEventListener("click", (event) => {
@@ -779,13 +861,40 @@ async function refresh() {
 
   // The archive lives in the extension's own storage. A host that refuses it, or
   // does not answer, simply means "nothing is set aside" — the board still works.
+  // `readOk` remembers that this read succeeded: the auto sweep is skipped when it
+  // did not, so an unreadable archive is never replaced with a blind empty set.
   let rawArchive
   try {
     rawArchive = await host.storage.get(ARCHIVE_KEY)
+    readOk = true
   } catch {
     rawArchive = undefined
+    readOk = false
   }
-  const nextArchive = parseArchive(rawArchive)
+  let nextArchive = parseArchive(rawArchive)
+
+  // Preferences: a host that refuses or lacks them keeps the in-memory default.
+  try {
+    const stored = parsePrefs(await host.storage.get(PREFS_KEY))
+    if (stored.auto !== prefs.auto) {
+      prefs = stored
+      if (controls.auto) controls.auto.update({ checked: prefs.auto })
+    }
+  } catch {
+    /* keep the current preference */
+  }
+
+  // Silent auto sweep: set finished sessions aside on their own, with no toast and
+  // no undo. Skipped when storage could not be read, when the preference is off, or
+  // after a failed write. The open session and the filtered one are left in view.
+  if (prefs.auto && readOk && !sweepPaused) {
+    const now = Date.now()
+    const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk })
+    if (ids.length) {
+      const merged = await sweepArchive(ids, now)
+      if (merged) nextArchive = merged
+    }
+  }
 
   const phases = []
   const seen = new Set()
@@ -793,7 +902,7 @@ async function refresh() {
     for (const phase of (meta.phases || [])) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
     for (const phase of Object.keys(meta.byPhase || {})) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
   }
-  const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount])
+  const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount, prefs.auto, hold])
   if (key === lastKey) return
   lastKey = key
 
@@ -806,7 +915,9 @@ async function refresh() {
   globalPhases = phases
   if (filter.session !== "all") {
     const chosen = metaOf(filter.session)
-    if (!chosen || isArchived(archive, chosen)) filter.session = "all"
+    // Bounce to "all" when the filtered session is gone or filed away — but not the
+    // open one: single-viewing the current session and archiving it keeps it in view.
+    if (!chosen || (isArchived(archive, chosen) && chosen.sessionID !== currentID)) filter.session = "all"
   }
   updateSessionOptions()
   if (phasesChanged) updatePhaseOptions()
