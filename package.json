@@ -1,6 +1,6 @@
 {
   "name": "openchamber-todo-bridge",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,8 @@
     "build": "bun run scripts/build.ts",
     "test-extension": "bun run scripts/build-test-extension.ts",
     "validate": "bun run scripts/validate.ts",
-    "test": "node scripts/test-plugin.mjs && node scripts/test-context.mjs && node scripts/test-viewport.mjs && node scripts/test-graph.mjs && node scripts/test-dag.mjs && node scripts/test-index.mjs && node scripts/test-archive.mjs && node scripts/test-install.mjs"
+    "test": "node scripts/test-plugin.mjs && node scripts/test-context.mjs && node scripts/test-state.mjs && node scripts/test-cache.mjs && node scripts/test-index-state.mjs && node scripts/test-viewport.mjs && node scripts/test-graph.mjs && node scripts/test-dag.mjs && node scripts/test-index.mjs && node scripts/test-archive.mjs && node scripts/test-install.mjs && node scripts/test-build.mjs",
+    "cache-audit": "node --no-warnings scripts/cache-audit.mjs"
   },
   "devDependencies": {
     "@openchamber/sdk": "^2.0.4"
