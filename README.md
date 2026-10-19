@@ -24,7 +24,19 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.2` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.3` to the URL.
+
+### v0.9.3 — cache-friendly task context
+
+Task reminders now live at the tail of the outgoing request instead of changing
+the system prefix. Unchanged lists produce identical wording, without a growing
+round counter. Reminders remain transient: no extra user turns are saved, and
+finished lists add no reminder. Todo storage, mirrors, and the UI are unchanged.
+
+This removes a source of prefix instability; provider cache hits and actual cost
+savings still depend on the model, routing, and workload. No savings percentage
+is claimed. Regression coverage checks stable system/history prefixes and
+changed, finished, and empty lists.
 
 ## Compatibility & permissions
 

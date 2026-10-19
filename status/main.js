@@ -1679,7 +1679,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
  *
  *   1. Registers \`todowrite\` / \`todoread\` again, with V1-compatible fields, and
  *      keeps the list in OpenCode's plugin storage. The current list is injected
- *      as system context on every model request while tasks are open, so the
+ *      as transient tail context on each model request while tasks are open, so the
  *      model keeps track of it across long conversations and compaction.
  *
  *   2. Mirrors the list to a plain per-session JSON file, which the companion
@@ -2003,40 +2003,24 @@ export const TODOWRITE_DESCRIPTION = [
   "When in doubt, use it.",
 ].join("\\n")
 
-/** How many unchanged injections before the reminder says so outright. */
-const STALE_AFTER = 3
-
 /**
- * Builds the per-round reminder.
- *
- * Pure so the harness can check the wording and the escalation without a model
- * or a filesystem. \`repeats\` counts consecutive injections of the same list:
- * once the agent has seen the same list several rounds running, saying so is
- * more useful than repeating the same suggestion.
+ * Stable wording: elapsed rounds are runtime bookkeeping, not model context.
  */
-export function buildReminder(todos, repeats = 1) {
+export function buildReminder(todos) {
   const lines = [
+    "[Session task state — reference only; continue the user's current task.]",
     "Current todo list for this session:",
     render(todos),
     "",
   ]
 
-  if (repeats >= STALE_AFTER) {
-    lines.push(
-      \`This list has not changed in \${repeats} rounds. If any of it is finished, update it now with todowrite:\`,
-      "- mark finished and verified work \`completed\`",
-      "- move the task you are working on to \`in_progress\` (one at a time)",
-      "- nest subtasks with \`parentId\` and set each \`phase\`, so the tree stays readable",
-    )
-  } else {
-    lines.push(
+  lines.push(
       "Keep this list current with todowrite:",
       "- mark a task \`completed\` as soon as it is done and verified",
       "- move the next task to \`in_progress\` before starting it (one at a time)",
       "- capture follow-ups discovered during the work",
       "- keep the tree meaningful: nest subtasks with \`parentId\` and name each task's \`phase\`",
-    )
-  }
+  )
 
   return lines.join("\\n")
 }
@@ -2122,27 +2106,13 @@ export default {
       })
     })
 
-    // Re-inject the current list each round. Two reasons: compaction can drop
-    // the older tool results, and without a reminder a long task tends to run to
-    // the end with the list still showing everything as pending.
-    //
-    // The list is compared by content, so an unchanged list is detected without
-    // asking the model anything. After a few unchanged rounds the reminder says
-    // so outright rather than repeating the same suggestion.
-    const seen = new Map()
+    // The hook edits only the outgoing request. Keep dynamic task state after
+    // the conversation, not in system: changing a system prefix can invalidate
+    // caching for the entire history. Never persist a reminder as a user turn.
     const context = await ctx.session.hook("context", async (event) => {
       const todos = parseRecord(await ctx.storage.get(storageKey(event.sessionID)))
-      if (!hasOpen(todos)) {
-        seen.delete(event.sessionID)
-        return
-      }
-
-      const key = JSON.stringify(todos)
-      const previous = seen.get(event.sessionID)
-      const repeats = previous && previous.key === key ? previous.repeats + 1 : 1
-      seen.set(event.sessionID, { key, repeats })
-
-      event.system.push({ type: "text", text: buildReminder(todos, repeats) })
+      if (!hasOpen(todos)) return
+      event.messages.push({ role: "user", content: [{ type: "text", text: buildReminder(todos) }] })
     })
 
     return async () => {
@@ -2154,7 +2124,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
