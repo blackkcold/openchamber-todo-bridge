@@ -8,7 +8,8 @@
 // config edit. Reading them from one canonical file at build time keeps a single
 // source of truth instead of a copy that can drift. Only the section references
 // them, so the panel and board do not carry that weight.
-import { readFile, rm } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { appendFile, readFile, rm } from "node:fs/promises"
 
 const PAGES = [
   { source: "src/main.js", outdir: "status", plugin: true },
@@ -20,6 +21,8 @@ await Promise.all(PAGES.map((page) => rm(`${page.outdir}/main.js`, { force: true
 
 const pluginSource = await readFile("opencode-plugin/index.js", "utf8")
 const pluginPackage = await readFile("opencode-plugin/package.json", "utf8")
+/** A build-drift marker: a source change without a rebuild fails test-build. */
+const pluginSourceHash = createHash("sha256").update(pluginSource).digest("hex")
 
 for (const page of PAGES) {
   const define = page.plugin
@@ -48,4 +51,9 @@ for (const page of PAGES) {
   console.log("built:", result.outputs.map((o) => o.path).join(", "))
 }
 
+// The extension installs the built section without running this script. Keep a
+// source hash beside the bundle so test-build can reject a stale generated file.
+await appendFile("status/main.js", `\n// plugin-source-sha256: ${pluginSourceHash}\n`)
+
 console.log(`inlined plugin: ${pluginSource.length} bytes source, ${pluginPackage.length} bytes manifest`)
+console.log(`plugin source sha256: ${pluginSourceHash}`)

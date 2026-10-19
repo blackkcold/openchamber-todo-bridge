@@ -18,7 +18,7 @@ const dispose = await plugin.setup({
   } },
 })
 const history = [{ role: "user", content: [{ type: "text", text: "Finish the task" }] }]
-const make = () => ({ sessionID: "ses_fixture", system: [{ type: "text", text: "Stable policy" }], messages: structuredClone(history) })
+const make = (sessionID = "ses_fixture") => ({ sessionID, system: [{ type: "text", text: "Stable policy" }], messages: structuredClone(history) })
 const first = make()
 await hook(first)
 assert.deepEqual(first.system, [{ type: "text", text: "Stable policy" }], "todo must not mutate the system prefix")
@@ -29,17 +29,17 @@ const second = make()
 await hook(second)
 assert.deepEqual(second, first, "unchanged state produces identical outgoing context")
 todos = [{ content: "Publish after approval", status: "pending" }]
-const changed = make()
+const changed = make("ses_fixture_changed")
 await hook(changed)
 assert.deepEqual(changed.system, first.system)
 assert.deepEqual(changed.messages.slice(0, history.length), history)
 assert.match(changed.messages.at(-1).content[0].text, /Publish after approval/)
 assert.equal(buildReminder(todos, 1), buildReminder(todos, 999), "round counters cannot change request text")
 todos = [{ content: "Done", status: "completed" }]
-const finished = make()
+const finished = make("ses_fixture_finished")
 await hook(finished)
 assert.deepEqual(finished.messages, history, "finished lists add no reminder")
-const empty = make()
+const empty = make("ses_fixture_empty")
 todos = []
 await hook(empty)
 assert.deepEqual(empty.messages, history)

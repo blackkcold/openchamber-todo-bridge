@@ -1702,9 +1702,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
  *   its summary bar and headers without opening every mirror.
  */
 
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 
 const TODO_STATUSES = ["pending", "in_progress", "completed", "cancelled"]
 const TODO_PRIORITIES = ["high", "medium", "low"]
@@ -1811,36 +1812,171 @@ function parseRecord(value) {
   return todos
 }
 
-function render(todos) {
+function parsePhases(value) {
+  return value && Array.isArray(value.phases)
+    ? value.phases.filter((phase) => typeof phase === "string" && phase !== "")
+    : []
+}
+
+/** Session cache: a request must not read the durable record every round. */
+const SESSION_CACHE_TTL_MS = 30_000
+const SESSION_CACHE_MAX = 200
+const sessionCache = new Map()
+
+function cacheRecord(sessionID, record, readAt = Date.now()) {
+  sessionCache.delete(sessionID)
+  sessionCache.set(sessionID, { record, readAt })
+  while (sessionCache.size > SESSION_CACHE_MAX) {
+    const oldest = sessionCache.keys().next().value
+    sessionCache.delete(oldest)
+  }
+}
+
+/**
+ * Reads the durable record. \`phases\` is optional metadata; a v1 record without
+ * it degrades to an empty order rather than failing.
+ *
+ * A cached record is served for 30 seconds. The TTL is deliberately not sliding:
+ * a session that keeps reading must still notice another process's write. The
+ * \`fresh\` path is used by \`todowrite\`, where the previous phases and updatedAt
+ * are authoritative input to the write, not display state.
+ */
+async function readRecord(ctx, sessionID, { fresh = false } = {}) {
+  const now = Date.now()
+  if (!fresh) {
+    const cached = sessionCache.get(sessionID)
+    if (cached && now - cached.readAt < SESSION_CACHE_TTL_MS) {
+      // Keep the map's LRU order without extending the TTL.
+      sessionCache.delete(sessionID)
+      sessionCache.set(sessionID, cached)
+      return cached.record
+    }
+  }
+  try {
+    const value = await ctx.storage.get(storageKey(sessionID))
+    const record = {
+      todos: parseRecord(value),
+      phases: parsePhases(value),
+      updatedAt: value && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
+    }
+    cacheRecord(sessionID, record, now)
+    return record
+  } catch (error) {
+    sessionCache.delete(sessionID)
+    throw error
+  }
+}
+
+/**
+ * Renders the list for the model. When the list has stable ids, they are shown
+ * so the model can keep them across compaction; parent links and dependencies
+ * are shown only when present. A flat list without ids keeps the old shape.
+ */
+function render(todos, phases = []) {
   if (todos.length === 0) return "(the todo list is empty)"
-  return todos
-    .map((todo, index) => {
-      const phase = todo.phase ? \` [\${todo.phase}]\` : ""
-      const priority = todo.priority ? \` — \${todo.priority} priority\` : ""
-      return \`\${index + 1}. \${MARK[todo.status]} \${todo.content}\${phase}\${priority}\`
-    })
-    .join("\\n")
+  const showIds = todos.some((todo) => typeof todo.id === "string" && todo.id !== "")
+  const declared = Array.isArray(phases)
+    ? phases.filter((phase) => typeof phase === "string" && phase !== "")
+    : []
+  const lines = todos.map((todo, index) => {
+    const phase = todo.phase ? \` [\${todo.phase}]\` : ""
+    const priority = todo.priority ? \` — \${todo.priority} priority\` : ""
+    const id = showIds && todo.id ? \` #\${todo.id}\` : ""
+    const parent = todo.parentId ? \` <- \${todo.parentId}\` : ""
+    const deps = Array.isArray(todo.dependsOn) && todo.dependsOn.length
+      ? \` deps:\${todo.dependsOn.join(",")}\`
+      : ""
+    return \`\${index + 1}. \${MARK[todo.status]} \${todo.content}\${phase}\${priority}\${id}\${parent}\${deps}\`
+  })
+  if (declared.length) lines.push(\`Phases: \${declared.join(", ")}\`)
+  return lines.join("\\n")
 }
 
 const hasOpen = (todos) => todos.some((t) => t.status === "pending" || t.status === "in_progress")
 
+/**
+ * A tiny coalescing queue. Calls made while one run is pending share a single
+ * follow-up run, so a burst of todowrites touches \`_index.json\` once.
+ */
+export function createCoalescingQueue(task) {
+  let tail = Promise.resolve()
+  let dirty = false
+  return () => {
+    dirty = true
+    const run = tail.catch(() => {}).then(async () => {
+      if (!dirty) return
+      dirty = false
+      await task()
+    })
+    tail = run.catch(() => {})
+    return run
+  }
+}
+
+/** sessionID -> the tail of that session's write chain. */
+const sessionWrites = new Map()
+
+async function pendingWrite(sessionID) {
+  const pending = sessionWrites.get(sessionID)
+  if (!pending) return
+  try {
+    await pending
+  } catch {
+    /* the original tool call reports its own failure */
+  }
+}
+
+/** Serializes writes for one session; different sessions still run in parallel. */
+function runSerial(sessionID, task) {
+  const previous = sessionWrites.get(sessionID) || Promise.resolve()
+  const run = previous.catch(() => {}).then(task)
+  sessionWrites.set(sessionID, run)
+  return run.finally(() => {
+    if (sessionWrites.get(sessionID) === run) sessionWrites.delete(sessionID)
+  })
+}
+
 /** Writes atomically so the extension never reads a half-written file. */
-async function mirror(sessionID, todos, phases) {
+async function mirror(sessionID, todos, phases, updatedAt = Date.now()) {
   const dir = mirrorDir()
   await mkdir(dir, { recursive: true })
-  const body = { version: 2, sessionID, todos, updatedAt: Date.now() }
+  const body = { version: 2, sessionID, todos, updatedAt }
   if (Array.isArray(phases) && phases.length) body.phases = phases
   const payload = JSON.stringify(body, null, 2)
   const target = join(dir, \`\${sessionID}.json\`)
-  const tmp = join(dir, \`.\${sessionID}.\${process.pid}.tmp\`)
-  await writeFile(tmp, payload, "utf8")
-  await rename(tmp, target)
+  const tmp = join(dir, \`.\${sessionID}.\${process.pid}.\${randomUUID()}.tmp\`)
+  try {
+    await writeFile(tmp, payload, "utf8")
+    await rename(tmp, target)
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
+  }
+
+  // Prime the summary cache with the exact record just written. The index scan
+  // can then use this entry even when the filesystem's mtime is coarse or the
+  // content changed without moving mtime.
+  try {
+    const info = await stat(target)
+    // If a foreign rename landed between our rename and this stat, the size is
+    // a cheap signal that the entry no longer describes our payload.
+    if (info.size === Buffer.byteLength(payload)) {
+      summaryCache.set(target, {
+        mtimeMs: info.mtimeMs,
+        size: info.size,
+        entry: summaryEntry(sessionID, todos, phases, updatedAt),
+      })
+    }
+  } catch {
+    /* the index scan will read the file if this stat fails */
+  }
+
   // Keep the board's session index current. Best-effort: the mirror is already
   // durable, so a failed index write must not fail the todo write.
+  indexDir = dir
   try {
-    await writeIndex(dir)
-  } catch {
-    /* the board falls back to whatever the index last held */
+    await scheduleIndexWrite()
+  } catch (error) {
+    logIndexError(error)
   }
 }
 
@@ -1896,23 +2032,66 @@ export function titleFor(todos) {
  * write stays cheap on a machine with many sessions.
  */
 const summaryCache = new Map()
+const MAX_SUMMARY_CACHE = 1024
+/** Force a full re-read occasionally so a preserved mtime cannot hide a change forever. */
+const FULL_REFRESH_MS = 60_000
+let lastFullRefresh = 0
+let lastIndexErrorAt = 0
+let lastMirrorErrorAt = 0
+let indexDir = ""
 
-async function summarizeFile(dir, name, mtimeMs) {
+function summaryEntry(sessionID, todos, phases, updatedAt) {
+  return { sessionID, updatedAt, title: titleFor(todos), ...summarize(todos, phases) }
+}
+
+const scheduleIndexWrite = createCoalescingQueue(async () => {
+  if (indexDir) await writeIndex(indexDir)
+})
+
+function logIndexError(error) {
+  const now = Date.now()
+  if (now - lastIndexErrorAt < 60_000) return
+  lastIndexErrorAt = now
+  console.error("[openchamber-todo-bridge] index write failed:", error)
+}
+
+function logMirrorError(error) {
+  const now = Date.now()
+  if (now - lastMirrorErrorAt < 60_000) return
+  lastMirrorErrorAt = now
+  console.error("[openchamber-todo-bridge] mirror write failed:", error)
+}
+
+async function summarizeFile(dir, name, mtimeMs, size, force = false) {
   const path = join(dir, name)
   const cached = summaryCache.get(path)
-  if (cached && cached.mtimeMs === mtimeMs) return cached.entry
+  if (!force && cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    // Refresh the map position on a hit; the cap is LRU, not FIFO.
+    summaryCache.delete(path)
+    summaryCache.set(path, cached)
+    return cached.entry
+  }
   let entry = null
   try {
     const data = JSON.parse(await readFile(path, "utf8"))
     const todos = parseRecord(data)
-    const sessionID = data && typeof data.sessionID === "string" && data.sessionID !== ""
-      ? data.sessionID
-      : name.slice(0, -".json".length)
-    entry = { sessionID, updatedAt: Math.round(mtimeMs), title: titleFor(todos), ...summarize(todos, data && data.phases) }
+    const phases = parsePhases(data)
+    const sessionID = name.slice(0, -".json".length)
+    const updatedAt = data && Number.isFinite(data.updatedAt) ? data.updatedAt : Math.round(mtimeMs)
+    entry = summaryEntry(sessionID, todos, phases, updatedAt)
   } catch {
     /* an unreadable or partial file is skipped this round */
   }
-  summaryCache.set(path, { mtimeMs, entry })
+  if (entry) {
+    summaryCache.set(path, { mtimeMs, size, entry })
+    if (summaryCache.size > MAX_SUMMARY_CACHE) {
+      const oldest = summaryCache.keys().next().value
+      summaryCache.delete(oldest)
+    }
+  } else {
+    // Do not cache a negative result: the next write should retry the read.
+    summaryCache.delete(path)
+  }
   return entry
 }
 
@@ -1923,13 +2102,15 @@ async function writeIndex(dir) {
   } catch {
     return
   }
+  const force = Date.now() - lastFullRefresh > FULL_REFRESH_MS
+  if (force) lastFullRefresh = Date.now()
   const sessions = []
   const seen = new Set()
   for (const name of names) {
     if (!name.endsWith(".json") || name === INDEX_NAME) continue
     try {
       const info = await stat(join(dir, name))
-      const entry = await summarizeFile(dir, name, info.mtimeMs)
+      const entry = await summarizeFile(dir, name, info.mtimeMs, info.size, force)
       if (entry) {
         sessions.push(entry)
         seen.add(name)
@@ -1939,13 +2120,17 @@ async function writeIndex(dir) {
     }
   }
   for (const path of summaryCache.keys()) {
-    if (!seen.has(path.slice(path.lastIndexOf("/") + 1))) summaryCache.delete(path)
+    if (!seen.has(basename(path))) summaryCache.delete(path)
   }
   sessions.sort((a, b) => b.updatedAt - a.updatedAt)
   const payload = JSON.stringify({ version: 2, sessions, updatedAt: Date.now() }, null, 2)
-  const tmp = join(dir, \`.\${INDEX_NAME}.\${process.pid}.tmp\`)
-  await writeFile(tmp, payload, "utf8")
-  await rename(tmp, join(dir, INDEX_NAME))
+  const tmp = join(dir, \`.\${INDEX_NAME}.\${process.pid}.\${randomUUID()}.tmp\`)
+  try {
+    await writeFile(tmp, payload, "utf8")
+    await rename(tmp, join(dir, INDEX_NAME))
+  } finally {
+    await rm(tmp, { force: true }).catch(() => {})
+  }
 }
 
 /**
@@ -2006,11 +2191,29 @@ export const TODOWRITE_DESCRIPTION = [
 /**
  * Stable wording: elapsed rounds are runtime bookkeeping, not model context.
  */
-export function buildReminder(todos) {
+/**
+ * The tool result is history. Keep it compact while work is open: the call
+ * arguments already hold the full list and the next reminder carries it again.
+ * A finished list has no reminder, so it keeps the full render as the recovery
+ * copy.
+ */
+function resultContent(todos, phases = []) {
+  if (!hasOpen(todos)) {
+    return \`Todo list updated (\${todos.length} \${todos.length === 1 ? "item" : "items"}):\\n\${render(todos, phases)}\`
+  }
+  const open = todos.filter((todo) => todo.status === "pending" || todo.status === "in_progress").length
+  const doing = todos.filter((todo) => todo.status === "in_progress").length
+  const done = todos.filter((todo) => todo.status === "completed").length
+  const cancelled = todos.filter((todo) => todo.status === "cancelled").length
+  const progress = doing ? \` (\${doing} in progress)\` : ""
+  return \`Updated: \${open} open\${progress}, \${done} done, \${cancelled} cancelled. Full list: todoread.\`
+}
+
+export function buildReminder(todos, phases = []) {
   const lines = [
     "[Session task state — reference only; continue the user's current task.]",
     "Current todo list for this session:",
-    render(todos),
+    render(todos, phases),
     "",
   ]
 
@@ -2019,13 +2222,13 @@ export function buildReminder(todos) {
       "- mark a task \`completed\` as soon as it is done and verified",
       "- move the next task to \`in_progress\` before starting it (one at a time)",
       "- capture follow-ups discovered during the work",
-      "- keep the tree meaningful: nest subtasks with \`parentId\` and name each task's \`phase\`",
+      "- keep the tree meaningful: stable \`id\`s, \`parentId\`, \`phase\`, \`dependsOn\`",
   )
 
   return lines.join("\\n")
 }
 
-const TODOS_INPUT = {
+export const TODOS_INPUT = {
   type: "object",
   properties: {
     phases: {
@@ -2063,13 +2266,22 @@ export default {
   id: "openchamber-todo-bridge",
 
   async setup(ctx) {
+    // A reload is a new process generation: never reuse a prior generation's
+    // cached records across setup calls (this also isolates tests).
+    sessionCache.clear()
+    sessionWrites.clear()
+    summaryCache.clear()
+    indexDir = ""
+    lastFullRefresh = 0
+    lastIndexErrorAt = 0
+    lastMirrorErrorAt = 0
     // Refresh/upgrade \`_index.json\` once at load, so the board gets its per-session
     // summaries even before the first todowrite of a session — and an index left
     // over from an older plugin (no summaries) is rewritten on the next start.
     try {
       await writeIndex(mirrorDir())
-    } catch {
-      /* best-effort: the board falls back to reading mirrors */
+    } catch (error) {
+      logIndexError(error)
     }
 
     const tools = await ctx.tool.transform((editor) => {
@@ -2079,17 +2291,32 @@ export default {
         input: TODOS_INPUT,
         options: { codemode: false },
         async execute(input, context) {
-          const { todos, phases } = normalize(input)
-          await ctx.storage.set(storageKey(context.sessionID), { todos, phases: phases || [], updatedAt: Date.now() })
-          // Mirror after the durable write: a mirror failure must not lose the list.
-          try {
-            await mirror(context.sessionID, todos, phases)
-          } catch {
-            /* the list is already stored; the panel is best-effort */
-          }
-          return {
-            content: \`Todo list updated (\${todos.length} \${todos.length === 1 ? "item" : "items"}):\\n\${render(todos)}\`,
-          }
+          const normalized = normalize(input)
+          // Two calls in one assistant turn must not interleave storage, mirror
+          // and index writes for the same session.
+          const hasPhases = Object.hasOwn(normalized, "phases")
+          return runSerial(context.sessionID, async () => {
+            const { todos } = normalized
+            // \`phases\` is optional input. Omitting it must not erase the stored
+            // order, so that path needs a fresh read. When the caller supplies
+            // phases, no read is needed; a storage read fault must not fail a
+            // write that already carries all the metadata it needs.
+            const previous = hasPhases
+              ? sessionCache.get(context.sessionID)?.record || null
+              : await readRecord(ctx, context.sessionID, { fresh: true })
+            const phases = hasPhases ? normalized.phases : previous.phases
+            const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
+            const record = { todos, phases: phases || [], updatedAt }
+            await ctx.storage.set(storageKey(context.sessionID), record)
+            cacheRecord(context.sessionID, record)
+            // Mirror after the durable write: a mirror failure must not lose the list.
+            try {
+              await mirror(context.sessionID, todos, phases, updatedAt)
+            } catch (error) {
+              logMirrorError(error)
+            }
+            return { content: resultContent(todos, phases) }
+          })
         },
       })
 
@@ -2100,8 +2327,11 @@ export default {
         input: EMPTY_INPUT,
         options: { codemode: false },
         async execute(_input, context) {
-          const todos = parseRecord(await ctx.storage.get(storageKey(context.sessionID)))
-          return { content: \`Current todo list:\\n\${render(todos)}\` }
+          await pendingWrite(context.sessionID)
+          // This is the explicit recovery path. Read it fresh: a cached list
+          // from another process must never become the basis for a rewrite.
+          const record = await readRecord(ctx, context.sessionID, { fresh: true })
+          return { content: \`Current todo list:\\n\${render(record.todos, record.phases)}\` }
         },
       })
     })
@@ -2110,9 +2340,28 @@ export default {
     // the conversation, not in system: changing a system prefix can invalidate
     // caching for the entire history. Never persist a reminder as a user turn.
     const context = await ctx.session.hook("context", async (event) => {
-      const todos = parseRecord(await ctx.storage.get(storageKey(event.sessionID)))
-      if (!hasOpen(todos)) return
-      event.messages.push({ role: "user", content: [{ type: "text", text: buildReminder(todos) }] })
+      try {
+        if (!event || typeof event.sessionID !== "string" || event.sessionID === "") return
+        if (!Array.isArray(event.messages)) return
+        // If a todowrite is in flight, read after it settles so the reminder and
+        // the cache reflect the list the model just wrote.
+        await pendingWrite(event.sessionID)
+        const record = await readRecord(ctx, event.sessionID)
+        if (!hasOpen(record.todos)) return
+        // Replace the array instead of pushing into it: the host may hand us the
+        // live history array, and a transient reminder must never become a
+        // persisted user turn. Assigning a new array keeps the prefix untouched.
+        // Verified against OpenCode 2.0.16: the caller reads event.messages
+        // after the hook, so replacing the property updates the request.
+        event.messages = [
+          ...event.messages,
+          { role: "user", content: [{ type: "text", text: buildReminder(record.todos, record.phases) }] },
+        ]
+      } catch (error) {
+        // A storage or host fault must not fail the model request. The list is
+        // still durable; the next round can inject it again.
+        console.error("[openchamber-todo-bridge] context reminder skipped:", error)
+      }
     })
 
     return async () => {
@@ -2124,7 +2373,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -3094,3 +3343,5 @@ export default {
   }
   boot();
 })();
+
+// plugin-source-sha256: 5aef360cc5d638abb380866a66ac05b1c47abbdd66aa957c588c7b76fe6d3cf5
