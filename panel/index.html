@@ -95,13 +95,19 @@
         /* Only while rows remain below. `data-more` is set by syncEdge(). */
         opacity: 0; transition: opacity 160ms ease;
         /* The tint keeps blurred text from turning grey; it comes from the host
-           palette, and stays clear when the host has not sent one yet. */
-        background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 70%, transparent));
+           palette, and stays clear when the host has not sent one yet. Past
+           ~60% it swallows the only genuinely blurred rows and the edge reads
+           as a plain fade. */
+        background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 55%, transparent));
         -webkit-backdrop-filter: blur(6px) saturate(1.1);
         backdrop-filter: blur(6px) saturate(1.1);
-        /* Taper the blur upward so the edge has no seam. */
-        -webkit-mask-image: linear-gradient(to bottom, transparent, #000 82%);
-        mask-image: linear-gradient(to bottom, transparent, #000 82%);
+        /* A mask composites the blurred layer at partial alpha instead of
+           weakening the blur: from `transparent` upward, most of the strip is
+           sharp rows under a thin veil, which is why the edge first read as a
+           fade with no blur at all. Starting at .45 and going opaque by 45%
+           keeps a soft entry and leaves ~15px of full-strength blur. */
+        -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .45), #000 45%);
+        mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .45), #000 45%);
       }
       #root[data-more="true"] #frost { opacity: 1; }
       /* Without backdrop-filter the blur is gone, so lean on the tint alone —

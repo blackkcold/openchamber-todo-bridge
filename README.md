@@ -24,7 +24,23 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.6` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.7` to the URL.
+
+### v0.9.7 — a frost you can actually see
+
+0.9.6 drew the bottom edge with a mask that started fully transparent and only became
+opaque at 82% of the 28px strip. A mask does not weaken a backdrop blur: it composites the
+blurred layer at partial alpha over sharp rows. So for most of the strip the text stayed
+sharp under a thin veil, and the edge read as a fade with no blur in it. Measured on the
+rendered panel, horizontal gradient energy across the edge band was 47, against 124 for the
+same rows with no frost at all.
+
+The mask now starts at 45% alpha and reaches opaque by 45% of the strip, which leaves about
+15px at full blur strength while the entry stays soft. The tint drops from 70% to 55% of the
+host background, so the blurred rows remain visible instead of being swallowed by it. The
+band now measures 3 in both themes — the same as an unmasked blur — and the strip no longer
+opens on a hard line. Height, the 40px of bottom padding and the `data-more` clearing are
+unchanged, as is everything else from 0.9.6.
 
 ### v0.9.6 — a frosted bottom edge on the list
 
