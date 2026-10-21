@@ -17,6 +17,7 @@
         --t-muted: var(--oc-muted, #6f6e69);
         --t-border: var(--oc-border, #dad8ce);
         --t-hover: var(--oc-hover, rgba(0, 0, 0, .035));
+        --t-success: var(--oc-success, #66800b);
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; height: 100%; }
@@ -25,12 +26,51 @@
         background: transparent; color: var(--t-fg); overflow: hidden;
       }
       #root { height: 100%; display: flex; flex-direction: column; }
-      #top { flex: 0 0 auto; padding: 10px 12px 6px; }
+      #top { flex: 0 0 auto; padding: 10px 12px 2px; }
       #head { display: flex; align-items: center; gap: 8px; }
       #title { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #jumpHost { flex: 0 0 auto; }
       #jumpHost[hidden] { display: none; }
-      #meta { color: var(--t-muted); font-size: 11px; margin-top: 2px; }
+      #meta {
+        display: flex; align-items: center;
+        gap: 12px; min-height: 26px; margin-top: 2px;
+        color: var(--t-muted); font-size: 11px;
+      }
+      /* The count keeps the right edge; the toggle takes the left. */
+      #count { margin-left: auto; font-variant-numeric: tabular-nums; }
+      /* Soft pill instead of an outline: the header already has a rule (the
+         progress bar) under it, and a second hairline read as clutter. The count
+         gets its own badge so the number reads first; the chevron is an SVG so
+         its stroke stays crisp. The surface mixes `currentColor` — the one
+         colour the host guarantees in both themes. */
+      #finished {
+        display: inline-flex; align-items: center; gap: 6px;
+        flex: 0 0 auto; height: 26px; margin: 0; padding: 0 13px 0 11px;
+        border: 0; border-radius: 999px;
+        background: color-mix(in srgb, currentColor 10%, transparent);
+        color: var(--t-muted); font: inherit; font-size: 11px; line-height: 1;
+        letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap;
+        cursor: pointer; transition: background-color 140ms ease, color 140ms ease;
+      }
+      #finished[hidden] { display: none; }
+      #finished:hover, #finished[aria-expanded="true"] {
+        background: color-mix(in srgb, currentColor 16%, transparent);
+        color: var(--t-fg);
+      }
+      #finished:focus-visible { outline: 2px solid var(--oc-primary, #205ea6); outline-offset: 2px; }
+      #finished .lbl { display: inline-flex; align-items: center; }
+      #finished .n {
+        display: inline-flex; align-items: center; justify-content: center;
+        min-width: 18px; height: 18px; margin: 0 5px; padding: 0 4px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--t-success) 18%, transparent);
+        color: var(--t-success); font-size: 10px; line-height: 1; letter-spacing: 0;
+      }
+      #finished .cv {
+        width: 10px; height: 10px; flex: 0 0 auto;
+        transition: transform 160ms ease;
+      }
+      #finished[aria-expanded="true"] .cv { transform: rotate(90deg); }
       #bar { height: 2px; margin-top: 6px; border-radius: 999px; background: var(--t-border); overflow: hidden; }
       #bar > i {
         display: block; height: 100%; background: var(--oc-success, #66800b);
@@ -48,14 +88,6 @@
       .row.group .txt { font-weight: 600; }
       .row.cancelled { opacity: .65; }
       .empty { color: var(--t-muted); padding: 8px 0; }
-      .fold {
-        display: block; width: 100%; margin: 5px 0 0; padding: 3px 2px;
-        border: 0; border-radius: 5px; background: none; color: var(--t-muted);
-        font: inherit; font-size: 11px; text-align: left; cursor: pointer;
-      }
-      .fold:hover { background: var(--t-hover); }
-      .fold::before { display: inline-block; width: 8px; content: "▸"; }
-      .fold[aria-expanded="true"]::before { transform: rotate(90deg); }
     </style>
   </head>
   <body>
@@ -65,7 +97,10 @@
           <div id="title">Todos</div>
           <div id="jumpHost" hidden></div>
         </div>
-        <div id="meta">…</div>
+        <div id="meta">
+          <button id="finished" type="button" aria-expanded="false" aria-controls="list" hidden><svg class="cv" viewBox="0 0 10 10" aria-hidden="true"><path d="M3.4 1.6 6.9 5l-3.5 3.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="lbl">已完成 <span id="finishedN" class="n">0</span> 项</span></button>
+          <span id="count">0/0</span>
+        </div>
         <div id="bar"><i></i></div>
         <div id="legend"></div>
       </div>

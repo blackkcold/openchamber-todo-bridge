@@ -1777,29 +1777,35 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const { rows, phases } = buildTree(shown, doc.phases);
     const done = finishedCount(doc.todos);
     const total = doc.todos.length;
+    const hidden = total - kept.length;
     el2("title").textContent = titleFor(doc);
-    el2("meta").textContent = `${done}/${total}`;
+    el2("count").textContent = `${done}/${total}`;
     el2("bar").firstElementChild.style.width = `${total ? Math.round(done / total * 100) : 0}%`;
+    const toggle = el2("finished");
+    toggle.hidden = hidden === 0;
+    toggle.setAttribute("aria-expanded", String(openFinished));
+    el2("finishedN").textContent = String(hidden);
     el2("legend").innerHTML = phases.map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`).join("");
     const body = rows.map((row) => rowHtml(row, row.synthetic ? { content: row.content } : shown[row.index])).join("");
-    const hidden = total - kept.length;
-    const fold = hidden ? `<button class="fold" type="button" data-fold aria-expanded="${openFinished}">已完成 ${hidden} 项</button>` : "";
-    el2("list").innerHTML = body + fold;
+    const list = el2("list");
+    const scroll = list.scrollTop;
+    list.innerHTML = body || (total ? `<div class="empty">全部任务已完成</div>` : "");
+    list.scrollTop = scroll;
     syncJump();
   }
-  el2("list").addEventListener("click", (event) => {
-    const fold = event.target instanceof Element ? event.target.closest("[data-fold]") : null;
-    if (!fold)
-      return;
+  el2("finished").addEventListener("click", () => {
     openFinished = !openFinished;
     if (lastDoc)
       render(lastDoc);
   });
   function paintMessage(text) {
     el2("title").textContent = "Todos";
-    el2("meta").textContent = "";
+    el2("count").textContent = "";
     el2("bar").firstElementChild.style.width = "0";
     el2("legend").innerHTML = "";
+    const toggle = el2("finished");
+    toggle.hidden = true;
+    toggle.setAttribute("aria-expanded", "false");
     el2("list").innerHTML = `<div class="empty">${esc(text)}</div>`;
     syncJump();
   }

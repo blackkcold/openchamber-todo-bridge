@@ -2373,7 +2373,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -2470,6 +2470,7 @@ export default {
   var MOVE_STAGGER_CAP_MS = 90;
   var ENTER_STAGGER_MS = 40;
   var ENTER_STAGGER_CAP_MS = 160;
+  var REVEAL_MS = 140;
   var MOTION_EASING = "linear(0, 0.03 3.1%, 0.106 6.3%, 0.211 9.4%, 0.333 12.5%, 0.459 15.6%, 0.582 18.8%, 0.695 21.9%, 0.795 25%, 0.88 28.1%, 0.949 31.3%, 1.002 34.4%, 1.041 37.5%, 1.067 40.6%, 1.082 43.8%, 1.089 46.9%, 1.088 50%, 1.083 53.1%, 1.075 56.3%, 1.065 59.4%, 1.053 62.5%, 1.042 65.6%, 1.032 68.8%, 1.022 71.9%, 1.014 75%, 1.007 78.1%, 1.002 81.3%, 0.998 84.4%, 0.995 87.5%, 0.993 90.6%, 0.992 93.8%, 0.992 96.9%, 0.992 100%)";
   var MOTION_EASING_PULSE = "linear(0, 0.038 3.1%, 0.137 6.3%, 0.275 9.4%, 0.434 12.5%, 0.597 15.6%, 0.752 18.8%, 0.889 21.9%, 1.002 25%, 1.089 28.1%, 1.15 31.3%, 1.185 34.4%, 1.199 37.5%, 1.196 40.6%, 1.179 43.8%, 1.153 46.9%, 1.122 50%, 1.089 53.1%, 1.057 56.3%, 1.029 59.4%, 1.005 62.5%, 0.986 65.6%, 0.973 68.8%, 0.964 71.9%, 0.96 75%, 0.96 78.1%, 0.963 81.3%, 0.968 84.4%, 0.974 87.5%, 0.98 90.6%, 0.987 93.8%, 0.993 96.9%, 0.998 100%)";
   var MANIFEST_H = 56;
@@ -2505,6 +2506,8 @@ export default {
   var exitingRows = new Set;
   var completionGhosts = new Set;
   var suppressAnimationsForNextPaint = true;
+  var revealNextPaint = false;
+  var finishedShown = null;
   var painted = [];
   var paintedPhases = [];
   var lastHeight = MANIFEST_H;
@@ -2605,13 +2608,9 @@ export default {
       return aOrder - bOrder;
     });
     const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyOf.get(todo), todo }));
-    if (finished.length) {
-      const expanded = openFinished && finishedFor === sessionID;
-      rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded });
-      if (expanded) {
-        for (const todo of finished) {
-          rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo });
-        }
+    if (openFinished && finishedFor === sessionID) {
+      for (const todo of finished) {
+        rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo });
       }
     }
     return rows;
@@ -2628,10 +2627,6 @@ export default {
       const key = tree.synthetic ? tree.key : keyOf.get(todo);
       return { kind: "item", status: tree.status, key, todo, tree };
     });
-    const hidden = list.length - kept.length;
-    if (hidden) {
-      out.push({ kind: "fold", status: "fold", key: "fold", count: hidden, expanded });
-    }
     return out;
   }
   function currentRows() {
@@ -2640,9 +2635,6 @@ export default {
     return hasStructure(painted) ? treeRows(painted, paintedPhases) : buildRows(painted);
   }
   function rowHtml(row, typing = false) {
-    if (row.kind === "fold") {
-      return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`;
-    }
     return itemHtml(row.todo, row.key, typing, row.tree || null);
   }
   function createRowNode(row, typing = false) {
@@ -2651,25 +2643,6 @@ export default {
     return template.content.firstElementChild;
   }
   function updateRowNode(node, row, animateStatus = true) {
-    if (row.kind === "fold") {
-      const expanded = String(row.expanded);
-      if (node.getAttribute("aria-expanded") !== expanded)
-        node.setAttribute("aria-expanded", expanded);
-      const count = String(row.count);
-      if (node.dataset.count !== count) {
-        const grew = node.dataset.count !== "" && Number(count) > Number(node.dataset.count);
-        node.dataset.count = count;
-        const n = node.querySelector(".n");
-        if (n) {
-          n.textContent = count;
-          if (grew && !reducedMotion())
-            animateCountFlip(n);
-        } else {
-          node.textContent = `已完成 ${row.count} 项`;
-        }
-      }
-      return;
-    }
     const todo = row.todo;
     const previousStatus = node.dataset.status;
     if (node.dataset.rowKey !== row.key)
@@ -2832,9 +2805,9 @@ export default {
         applyListHeight(true);
     }, () => {});
   }
-  function completionGhost(body, source, row) {
+  function completionGhost(source, row) {
     const sourceRect = source.getBoundingClientRect();
-    const bodyRect = body.getBoundingClientRect();
+    const rootRect = el2("root").getBoundingClientRect();
     const ghost = source.cloneNode(true);
     updateRowNode(ghost, row, false);
     const ghostText = ghost.querySelector(".txt.typewriter");
@@ -2846,27 +2819,28 @@ export default {
     ghost.setAttribute("aria-hidden", "true");
     ghost.inert = true;
     ghost.style.position = "absolute";
-    ghost.style.left = `${sourceRect.left - bodyRect.left + body.scrollLeft}px`;
-    ghost.style.top = `${sourceRect.top - bodyRect.top + body.scrollTop}px`;
+    ghost.style.left = `${sourceRect.left - rootRect.left}px`;
+    ghost.style.top = `${sourceRect.top - rootRect.top}px`;
     ghost.style.width = `${sourceRect.width}px`;
     ghost.style.height = `${sourceRect.height}px`;
     ghost.style.margin = "0";
     ghost.style.zIndex = "2";
     ghost.style.pointerEvents = "none";
-    body.append(ghost);
+    const layer = el2("ghosts") || el2("root");
+    layer.append(ghost);
     completionGhosts.add(ghost);
     return { ghost, sourceRect };
   }
-  function animateCompletionGhosts(body, ghosts) {
-    const fold = Array.from(body.children).find((node) => node.dataset.rowKey === "fold");
-    if (!fold) {
+  function animateCompletionGhosts(ghosts) {
+    const toggle = el2("finished");
+    if (!toggle || toggle.hidden) {
       for (const { ghost } of ghosts) {
         completionGhosts.delete(ghost);
         ghost.remove();
       }
       return;
     }
-    const target = fold.getBoundingClientRect();
+    const target = toggle.getBoundingClientRect();
     let landed = false;
     for (const { ghost, sourceRect } of ghosts) {
       const deltaX = target.left - sourceRect.left;
@@ -2876,7 +2850,7 @@ export default {
         ghost.remove();
         if (!landed) {
           landed = true;
-          pulseFold(fold);
+          pulseFold(toggle);
         }
       });
     }
@@ -2969,7 +2943,7 @@ export default {
         continue;
       const ghostRow = options.ghostRows?.get(node.dataset.rowKey);
       if (ghostRow) {
-        ghosts.push(completionGhost(body, node, ghostRow));
+        ghosts.push(completionGhost(node, ghostRow));
         node.remove();
       } else if (animate) {
         animateRowExit(node, epoch);
@@ -2978,9 +2952,21 @@ export default {
       }
     }
     if (ghosts.length)
-      animateCompletionGhosts(body, ghosts);
+      animateCompletionGhosts(ghosts);
+    if (options.reveal && entering.length)
+      revealRows(entering);
     animateRows(body, firstTops, entering, previous.some((node) => node.dataset.rowKey), used, animate);
     return { staged: false, entering };
+  }
+  function revealRows(nodes) {
+    if (reducedMotion())
+      return;
+    requestAnimationFrame(() => {
+      for (const node of nodes) {
+        if (node.isConnected)
+          animateRow(node, { opacity: 0 }, { opacity: 1 }, REVEAL_MS);
+      }
+    });
   }
   function animateRows(body, firstTops, entering, hadRows, used, animate) {
     if (!animate || reducedMotion())
@@ -3015,10 +3001,8 @@ export default {
   var smooth = () => reducedMotion() ? "auto" : "smooth";
   function frameHeight(headerH) {
     const rows = rowNodes();
-    if (rows.length === 0)
-      return MIN_H;
     const last = rows[rows.length - 1];
-    const content = last.offsetTop + last.offsetHeight;
+    const content = last ? last.offsetTop + last.offsetHeight : 0;
     return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H);
   }
   function applyHeight(height, immediate = false) {
@@ -3083,16 +3067,9 @@ export default {
   function wireInput() {
     const body = el2("body");
     let pointerDown = false;
-    body.addEventListener("click", (event) => {
-      const fold = event.target instanceof Element ? event.target.closest(".fold") : null;
-      if (!fold)
-        return;
-      openFinished = !(openFinished && finishedFor === sessionID);
-      finishedFor = sessionID;
-      lastKey = "";
-      if (painted.length)
-        paint(painted, paintedPhases);
-    });
+    const toggle = el2("finished");
+    if (toggle)
+      toggle.addEventListener("click", toggleFinished);
     body.addEventListener("scroll", () => {
       if (pointerDown)
         armIdle();
@@ -3122,6 +3099,56 @@ export default {
   function legendHtml(phases) {
     return phases.map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`).join("");
   }
+  function syncFinishedToggle(todos) {
+    const toggle = el2("finished");
+    if (!toggle)
+      return;
+    const hidden = todos.length - pruneFinished(todos).length;
+    const expanded = openFinished && finishedFor === sessionID;
+    toggle.hidden = hidden === 0;
+    toggle.setAttribute("aria-expanded", String(expanded));
+    const label = el2("finishedN");
+    if (!label)
+      return;
+    const next = String(hidden);
+    if (label.textContent === next)
+      return;
+    const grew = finishedShown !== null && hidden > finishedShown;
+    label.textContent = next;
+    finishedShown = hidden;
+    if (grew && !reducedMotion())
+      animateCountFlip(label);
+  }
+  function captureScrollAnchor() {
+    const body = el2("body");
+    if (!body || body.scrollTop <= 0)
+      return null;
+    const top = body.scrollTop;
+    const node = rowNodes().find((row) => row.offsetTop + row.offsetHeight > top);
+    if (!node || !node.dataset.rowKey)
+      return null;
+    return { key: node.dataset.rowKey, delta: node.offsetTop - top };
+  }
+  function restoreScrollAnchor(anchor) {
+    if (!anchor)
+      return;
+    const body = el2("body");
+    const node = rowNodes().find((row) => row.dataset.rowKey === anchor.key);
+    if (!node)
+      return;
+    body.scrollTop = clampScroll(node.offsetTop - anchor.delta, body.scrollHeight - body.clientHeight);
+  }
+  function toggleFinished() {
+    const anchor = captureScrollAnchor();
+    openFinished = !(openFinished && finishedFor === sessionID);
+    finishedFor = sessionID;
+    lastKey = "";
+    revealNextPaint = true;
+    suppressAnimationsForNextPaint = true;
+    if (painted.length)
+      paint(painted, paintedPhases);
+    restoreScrollAnchor(anchor);
+  }
   function paint(todos, phases = []) {
     cancelRowAnimations();
     if (!todos.length) {
@@ -3135,6 +3162,8 @@ export default {
     const newTaskKeys = rememberTaskKeys(todos);
     const animate = !suppressAnimationsForNextPaint;
     suppressAnimationsForNextPaint = false;
+    const reveal = revealNextPaint;
+    revealNextPaint = false;
     el2("root").dataset.mode = "work";
     const view = structured ? "tree" : "flat";
     if (el2("root").dataset.view && el2("root").dataset.view !== view) {
@@ -3147,6 +3176,7 @@ export default {
     el2("count").textContent = `${done}/${todos.length}`;
     top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false";
     top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`;
+    syncFinishedToggle(todos);
     const legend = el2("legend");
     if (structured && phases.length) {
       legend.innerHTML = legendHtml(phases);
@@ -3155,9 +3185,9 @@ export default {
       legend.innerHTML = "";
       legend.hidden = true;
     }
-    const result = reconcileRows(currentRows(), { animate, newTaskKeys });
+    const result = reconcileRows(currentRows(), { animate, newTaskKeys, reveal });
     if (!result.staged)
-      applyListHeight(result.entering.length > 0);
+      applyListHeight(result.entering.length > 0 || !animate);
   }
   function paintPlain(html) {
     cancelRowAnimations();

@@ -48,18 +48,94 @@
         color: var(--t-fg);
         overflow: hidden;
       }
-      #root { height: 100%; display: flex; flex-direction: column; }
+      #root { height: 100%; display: flex; flex-direction: column; position: relative; }
 
-      /* ---- header: count + progress ---- */
-      #top { flex: 0 0 auto; padding: 0 8px 6px; }
+      /* Ghosts from the completion flight live above both the header and the
+         scrolling list, so a row can fly to the toggle in the header without
+         the list clipping it on the way out. */
+      #ghosts {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 3;
+      }
+
+      /* ---- header: toggle, count, progress ---- */
+      #top { flex: 0 0 auto; padding: 6px 10px 6px; }
+      #head {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 24px;
+      }
       #count {
         display: block;
-        text-align: right;
+        /* The count keeps the right edge it has always had; the toggle takes the
+           left, where a control cannot run into the frame's rounded corner. */
+        margin-left: auto;
         font-size: 10px;
         font-variant-numeric: tabular-nums;
         color: var(--t-muted);
         line-height: 1.2;
       }
+      /* ---- finished toggle ----
+        A soft pill rather than an outline: the header already carries a rule
+        (the progress bar), and a hairline border on top of it read as clutter.
+        The count sits in its own badge so the number reads first, and the
+        chevron is an SVG so its stroke stays crisp at 9px. The surface mixes
+        `currentColor`, which is the one thing the host guarantees in both
+        themes; a hard-coded tint would vanish on dark. */
+      #finished {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        height: 24px;
+        margin: 0;
+        padding: 0 12px 0 10px;
+        border: 0;
+        border-radius: 999px;
+        background: color-mix(in srgb, currentColor 10%, transparent);
+        color: var(--t-muted);
+        font: inherit;
+        font-size: 10px;
+        line-height: 1;
+        letter-spacing: .02em;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        cursor: pointer;
+        transition: background-color 140ms ease, color 140ms ease;
+      }
+      #finished[hidden] { display: none; }
+      #finished:hover, #finished[aria-expanded="true"] {
+        background: color-mix(in srgb, currentColor 16%, transparent);
+        color: var(--t-fg);
+      }
+      #finished:focus-visible { outline: 2px solid var(--t-primary); outline-offset: 2px; }
+      #finished .lbl { display: inline-flex; align-items: center; }
+      #finished .n {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 17px;
+        height: 17px;
+        margin: 0 5px;
+        padding: 0 4px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--t-success) 18%, transparent);
+        color: var(--t-success);
+        font-size: 9px;
+        line-height: 1;
+        letter-spacing: 0;
+      }
+      #finished .cv {
+        width: 9px;
+        height: 9px;
+        flex: 0 0 auto;
+        transition: transform 160ms var(--t-motion-spring, linear);
+      }
+      #finished[aria-expanded="true"] .cv { transform: rotate(90deg); }
       #bar {
         height: 2px;
         margin-top: 2px;
@@ -246,35 +322,10 @@
       .pri.high { letter-spacing: -1px; }
 
       /* ---- finished group toggle ----
-        Rendered as the last row of the open list: one line box with the same
-        padding as a task row, plus a 4px gap above it. That 4px, and the fold
-        being a control rather than a line of text, is exactly why the frame is
-        measured from the rendered rows instead of trusting `rows x rowH`.
+        Its styling moved to the header (`#finished`), next to the count. The
+        list no longer carries a control row of its own, which is why the frame
+        height is now the last task row's bottom edge.
       */
-      .fold {
-        display: block;
-        width: 100%;
-        margin: 4px 0 0;
-        padding: 3px 2px;
-        border: 0;
-        border-radius: 5px;
-        background: none;
-        color: var(--t-muted);
-        font: inherit;
-        font-size: 11px;
-        text-align: left;
-        cursor: pointer;
-        transition: transform var(--t-motion-row) var(--t-motion-ease);
-      }
-      .fold:hover { background: var(--t-hover); }
-      .fold::before {
-        display: inline-block;
-        width: 8px;
-        content: "▸";
-        transform-origin: center;
-        transition: transform 240ms var(--t-motion-spring, linear);
-      }
-      .fold[aria-expanded="true"]::before { transform: rotate(90deg); }
 
       .empty { color: var(--t-muted); padding: 2px 0; }
 
@@ -303,7 +354,7 @@
       .item.tree.just-completed .gut-tick { animation: todo-tick-in 260ms var(--t-motion-spring-snappy, linear) both; }
 
       @media (prefers-reduced-motion: reduce) {
-        #bar > i, .item, .item .box, .item .txt, .fold, .fold::before { transition: none; }
+        #bar > i, .item, .item .box, .item .txt, #finished .cv { transition: none; }
         #bar::after, .item.in_progress .dot { animation: none; }
         .item.just-completed .tick, .item.tree.just-completed .gut-tick { animation: none; }
         .type-char { animation: none !important; opacity: 1; }
@@ -314,11 +365,15 @@
   <body>
     <div id="root" data-mode="empty">
       <div id="top" data-empty="true">
-        <span id="count"></span>
+        <div id="head">
+          <button id="finished" type="button" aria-expanded="false" aria-controls="body" hidden><svg class="cv" viewBox="0 0 10 10" aria-hidden="true"><path d="M3.4 1.6 6.9 5l-3.5 3.4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="lbl">已完成 <span id="finishedN" class="n">0</span> 项</span></button>
+          <span id="count"></span>
+        </div>
         <div id="bar"><i></i></div>
         <div id="legend" hidden></div>
       </div>
       <div id="body" tabindex="0"><div class="empty">Loading…</div></div>
+      <div id="ghosts" aria-hidden="true"></div>
     </div>
     <script src="main.js"></script>
   </body>

@@ -24,7 +24,26 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.4` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.5` to the URL.
+
+### v0.9.5 — a finished toggle you can always reach
+
+The finished toggle moved from the end of the list to the header of the Work Status
+section and the rail panel, so it is reachable without scrolling however long the
+list is. Turning it on reveals completed rows in place inside the tree; turning it
+off removes them in one step, so the list height never animates twice.
+
+While the toggle animates, the list holds the reader's place: a row that was
+scrolled into view stays where it was. Finished rows still strike through before
+they leave, and the flight to the toggle is drawn on its own overlay, so the scroll
+container cannot clip it.
+
+The control itself is a soft pill with the count in a badge, and its chevron is an
+inline SVG, so the stroke stays crisp at 9px. The surface mixes `currentColor`,
+which keeps it legible on both themes, and `prefers-reduced-motion` disables the
+transitions. This release also fixes the label's spacing, where a flex `gap` split
+`已完成 / 1 / 项` into three separate items, and the pill being clipped by the host
+frame's rounded corner.
 
 ### v0.9.4 — cache safety and write reliability
 
