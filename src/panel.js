@@ -36,7 +36,7 @@ let mounted = false
 let jumpButton = null
 /** Reader's choice: reveal finished work. Off by default. */
 let openFinished = false
-/** The last painted document, so the fold can re-render without a file read. */
+/** The last painted document, so the toggle can re-render without a file read. */
 let lastDoc = null
 let timer = null
 let lastKey = ""
@@ -92,37 +92,50 @@ function render(doc) {
   const { rows, phases } = buildTree(shown, doc.phases)
   const done = finishedCount(doc.todos)
   const total = doc.todos.length
+  const hidden = total - kept.length
 
   el("title").textContent = titleFor(doc)
-  el("meta").textContent = `${done}/${total}`
+  el("count").textContent = `${done}/${total}`
   el("bar").firstElementChild.style.width = `${total ? Math.round((done / total) * 100) : 0}%`
+
+  // The toggle lives in the header, not at the end of the list: a long list
+  // should never make the reader scroll to reach it. Its count is the work it
+  // hides, so it is absent when nothing is hidden.
+  const toggle = el("finished")
+  toggle.hidden = hidden === 0
+  toggle.setAttribute("aria-expanded", String(openFinished))
+  el("finishedN").textContent = String(hidden)
 
   el("legend").innerHTML = phases
     .map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`)
     .join("")
 
-  const body = rows.map((row) => rowHtml(row, row.synthetic ? { content: row.content } : shown[row.index])).join("")
-  const hidden = total - kept.length
-  const fold = hidden
-    ? `<button class="fold" type="button" data-fold aria-expanded="${openFinished}">已完成 ${hidden} 项</button>`
-    : ""
-  el("list").innerHTML = body + fold
+  const body = rows
+    .map((row) => rowHtml(row, row.synthetic ? { content: row.content } : shown[row.index]))
+    .join("")
+  // Opening the toggle re-orders everything around the reader's view; the list
+  // is repainted whole, so the scroll offset is carried across by hand.
+  const list = el("list")
+  const scroll = list.scrollTop
+  list.innerHTML = body || (total ? `<div class="empty">全部任务已完成</div>` : "")
+  list.scrollTop = scroll
   syncJump()
 }
 
-/** The finished fold reveals the done work on demand (and hides it again). */
-el("list").addEventListener("click", (event) => {
-  const fold = event.target instanceof Element ? event.target.closest("[data-fold]") : null
-  if (!fold) return
+/** The finished toggle reveals the done work on demand (and hides it again). */
+el("finished").addEventListener("click", () => {
   openFinished = !openFinished
   if (lastDoc) render(lastDoc)
 })
 
 function paintMessage(text) {
   el("title").textContent = "Todos"
-  el("meta").textContent = ""
+  el("count").textContent = ""
   el("bar").firstElementChild.style.width = "0"
   el("legend").innerHTML = ""
+  const toggle = el("finished")
+  toggle.hidden = true
+  toggle.setAttribute("aria-expanded", "false")
   el("list").innerHTML = `<div class="empty">${esc(text)}</div>`
   syncJump()
 }

@@ -145,7 +145,8 @@
         ],
       }
 
-      // 2 open + 1 finished: three rows, one of them the fold — fits, no scroll.
+      // 2 open + 1 finished: two rows, because the finished one sits behind the
+      // header toggle — fits, no scroll.
       const FEW = {
         sessionID: "ses_demo",
         updatedAt: Date.now(),
@@ -536,15 +537,15 @@
           flush()
         }
 
-        // 2 · 3 rows (one of them the fold): the elastic frame fits them; the
-        // last row is fully inside, not clipped.
+        // 2 · 2 open rows (the finished one is behind the header toggle): the
+        // elastic frame fits them; the last row is fully inside, not clipped.
         {
           const { body } = parts("b1")
           const rows = body.children.length
           const fits = body.scrollHeight <= body.clientHeight + 1
           const last = body.children[rows - 1]
           const inside = last.offsetTop + last.offsetHeight <= body.clientHeight + 1
-          say("2 3 rows fit and the last row is inside the frame", rows === 3 && fits && inside,
+          say("2 2 rows fit and the last row is inside the frame", rows === 2 && fits && inside,
               `rows=${rows} last=${last.offsetTop + last.offsetHeight} clientH=${body.clientHeight}`)
           flush()
         }
@@ -589,6 +590,10 @@
         {
           const { body } = parts("a1")
           const win = frameOf("a1")
+          // Check 4 repaints a row, and its exit animation keeps that row in the
+          // list for another 220ms. Measure only once the list is back to its
+          // own row count, or the snap's nearest-row maths runs on an extra row.
+          await waitFor(() => body.children.length === 15, 2000)
           const starts = startsOf(body)
           const target = starts[3]
           const calls = []
@@ -599,9 +604,15 @@
           await wait(600)                      // snap fires SNAP_QUIET_MS after the scroll
           body.scrollTo = real
           const call = calls.find((c) => c && typeof c.top === "number")
-          const aimed = call ? Math.abs(call.top - target) <= 1 : false
+          const max = body.scrollHeight - body.clientHeight
+          // A rest can be a row start or the bottom: the bottom is a resting
+          // place in its own right (`snap` picks whichever is nearer), so a row
+          // start that sits 20px above the end loses to it.
+          const aimed = call
+            ? Math.abs(call.top - target) <= 1 || Math.abs(call.top - max) <= 1
+            : false
           const detail = call
-            ? `scrollTo(top=${call.top}, ${call.behavior}) rowStart=${target}`
+            ? `scrollTo(top=${call.top}, ${call.behavior}) rowStart=${target} max=${max}`
             : "no scrollTo call"
           say("5 a rested scroll snaps to a row start", aimed, detail)
           flush()
@@ -648,21 +659,34 @@
           flush()
         }
 
-        // 8 · the fold expands without moving the reader.
+        // 8 · the toggle is a header control, not the last row: it is on screen
+        // without scrolling, and opening it adds the finished row in place.
         {
           const { doc, body } = parts("b1")
           body.scrollTop = 0
           await wait(150)
-          const before = body.scrollTop
+          const toggle = doc.getElementById("finished")
+          const top = doc.getElementById("top").getBoundingClientRect()
+          const rect = toggle.getBoundingClientRect()
+          const inHeader = !toggle.hidden && rect.height >= 20 &&
+            rect.top >= top.top - 1 && rect.bottom <= top.bottom + 1
+          say("8 the finished toggle sits in the header", inHeader,
+              `hidden=${toggle.hidden} h=${Math.round(rect.height)} top=${Math.round(rect.top)} header=${Math.round(top.top)}-${Math.round(top.bottom)}`)
           const openBefore = doc.querySelectorAll(".item").length
-          doc.querySelector(".fold").click()
+          toggle.click()
           await wait(400)
           const openAfter = doc.querySelectorAll(".item").length
-          const after = body.scrollTop
-          say("8 expanding the fold keeps scrollTop", openAfter > openBefore && Math.abs(after - before) <= 1,
-              `items ${openBefore}->${openAfter} scrollTop ${before}->${after}`)
+          const expanded = toggle.getAttribute("aria-expanded") === "true"
+          say("8b the toggle opens the finished rows in place", openAfter === openBefore + 1 && expanded,
+              `items ${openBefore}->${openAfter} aria-expanded=${expanded}`)
           // Put it back so the panel looks as it did.
-          doc.querySelector(".fold").click()
+          toggle.click()
+          await wait(200)
+          say("8c closing removes the finished row and the count stays readable",
+              doc.querySelectorAll(".item").length === openBefore &&
+                toggle.getAttribute("aria-expanded") === "false" &&
+                toggle.textContent.includes("已完成 1 项"),
+              `items=${doc.querySelectorAll(".item").length} 文本=${toggle.textContent.trim()}`)
           flush()
         }
 
@@ -771,17 +795,20 @@
         )
         const reducedMotion = frameOf("e1").matchMedia("(prefers-reduced-motion: reduce)").matches
 
-        await waitFor(() => body.querySelector(".fold"), 2500)
+        const toggle = () => doc.getElementById("finished")
+        const toggleText = () => (toggle()?.textContent || "").replace(/\s+/g, " ").trim()
+
+        await waitFor(() => toggle() && !toggle().hidden, 2500)
         const initialChars = doc.querySelectorAll(".type-char").length
         say("首轮加载不打字", initialChars === 0, `字符片段=${initialChars}`)
 
         if (reducedMotion) {
-          doc.querySelector(".fold")?.click()
+          toggle()?.click()
           const expandedRows = Array.from(body.querySelectorAll(".item.completed"))
           say("减少动态效果：展开直接到最终态", expandedRows.length === 2 &&
             expandedRows.every((node) => node.getAnimations().length === 0),
             `完成行=${expandedRows.length}`)
-          doc.querySelector(".fold")?.click()
+          toggle()?.click()
           say("减少动态效果：折叠不保留退场行",
             !body.querySelector(".item.completed") && !doc.querySelector(".completion-ghost"),
             `完成行=${body.querySelectorAll(".item.completed").length}`)
@@ -789,7 +816,7 @@
           const reducedCompletion = copy(ANIMATION_INITIAL)
           reducedCompletion.todos[1].status = "completed"
           await update(reducedCompletion)
-          const reducedFoldText = doc.querySelector(".fold")?.textContent || ""
+          const reducedFoldText = toggleText()
           say("减少动态效果：完成不等待且不造副本",
             !rowFor("待完成任务") && reducedFoldText.includes("已完成 3 项") &&
               !doc.querySelector(".completion-ghost"),
@@ -809,27 +836,44 @@
           return
         }
 
-        // Expanding old completed items must animate their row height; collapsing
-        // keeps the rows in layout until the exit animation settles.
-        doc.querySelector(".fold")?.click()
+        // The toggle's reveal is one layout step plus a fade, not a cascade:
+        // every revealed row has its final height immediately and only opacity
+        // animates. Collapsing is a single step too — no rows left exiting.
+        toggle()?.click()
         await wait(40)
         let doneRows = Array.from(body.querySelectorAll(".item.completed"))
-        const entersWithHeight = doneRows.length === 2 && doneRows.every(hasHeightAnimation)
-        say("展开旧任务有高度过渡", entersWithHeight, `完成行=${doneRows.length}`)
-        await wait(280)
-        const exitingRows = Array.from(body.querySelectorAll(".item.completed"))
-        doc.querySelector(".fold")?.click()
-        const exitsInPlace = exitingRows.length === 2 && exitingRows.every((node) =>
-          node.isConnected && hasHeightAnimation(node),
+        const fadesIn = doneRows.length === 2 && doneRows.every((node) =>
+          !hasHeightAnimation(node) && node.getAnimations().some((animation) =>
+            animation.effect?.getKeyframes().some((frame) => "opacity" in frame),
+          ),
         )
-        say("折叠时完成行先留在 DOM 做退场", exitsInPlace,
-          `仍连接=${exitingRows.filter((node) => node.isConnected).length}/${exitingRows.length}`)
-        await wait(300)
-        say("折叠动画结束后移除完成行", !body.querySelector(".item.completed"),
+        say("展开旧任务即时定高、只淡入", fadesIn, `完成行=${doneRows.length}`)
+        await wait(220)
+        toggle()?.click()
+        say("折叠一次到位，不留退场行", !body.querySelector(".item.completed") && !body.querySelector(".row-exiting"),
           `完成行=${body.querySelectorAll(".item.completed").length}`)
         say("无残留退场标记", !body.querySelector(".row-exiting") && !doc.querySelector("[data-exiting]"),
           `残留=${body.querySelectorAll(".row-exiting").length}`)
         flush()
+
+        // Whatever the list is doing, the toggle must not move the row the
+        // reader is looking at: the anchored offset survives close and reopen.
+        {
+          body.scrollTop = Math.max(0, body.scrollHeight - body.clientHeight)
+          await wait(300)
+          const anchor = Array.from(body.querySelectorAll(".item")).find((node) =>
+            node.offsetTop + node.offsetHeight > body.scrollTop)
+          const before = anchor ? anchor.offsetTop - body.scrollTop : null
+          toggle()?.click()
+          await wait(220)
+          toggle()?.click()
+          await wait(220)
+          const after = anchor && anchor.isConnected ? anchor.offsetTop - body.scrollTop : null
+          say("开关不移动读者正在看的行", before !== null && after !== null && Math.abs(after - before) <= 1,
+            `锚定偏移 ${before}->${after}`)
+          body.scrollTop = 0
+          flush()
+        }
 
         // A collapsed completion first draws the strike-through, then flies a
         // decorative clone to the summary without making it accessible content.
@@ -841,12 +885,17 @@
         const marking = collapsedRow?.isConnected && collapsedRow.classList.contains("completion-marking")
         say("折叠完成先保留原行划线", marking,
           `保留=${Boolean(collapsedRow?.isConnected)} 阶段=${collapsedRow?.dataset.completionPhase || "无"}`)
-        await wait(190)
+        await waitFor(() => doc.querySelector(".completion-ghost"), 600)
         const ghost = doc.querySelector(".completion-ghost")
+        const ghostFlight = ghost?.getAnimations()[0]?.effect?.getKeyframes().at(-1)?.transform || ""
         const ghostIsDecorative = ghost?.getAttribute("aria-hidden") === "true" &&
+          ghost?.parentElement?.id === "ghosts" &&
           ghost?.getAnimations().length > 0
-        say("折叠完成用 aria-hidden 副本飞向汇总行", Boolean(ghostIsDecorative),
-          `副本=${Boolean(ghost)} aria-hidden=${ghost?.getAttribute("aria-hidden") || "无"}`)
+        // The toggle is above the list, so the clone must travel up and out of
+        // the scrolling body without being clipped on the way.
+        const fliesUp = /translate\([^,]+,\s*-\d/.test(ghostFlight)
+        say("折叠完成用 aria-hidden 副本飞向顶部开关", Boolean(ghostIsDecorative) && fliesUp,
+          `副本=${Boolean(ghost)} 层=${ghost?.parentElement?.id || "无"} 终点=${ghostFlight || "无"}`)
         // Cloned nodes restart CSS animations; the ghost must carry no per-char
         // spans, or its text re-types from opacity 0 and arrives incomplete.
         const ghostText = ghost?.querySelector(".txt") || null
@@ -854,8 +903,8 @@
           Boolean(ghost) && ghost.querySelectorAll(".type-char").length === 0 &&
             ghostText?.textContent === "待完成任务",
           `片段=${ghost?.querySelectorAll(".type-char").length || 0} 文本="${ghostText?.textContent || "无"}"`)
-        await wait(300)
-        const foldText = doc.querySelector(".fold")?.textContent || ""
+        await waitFor(() => !doc.querySelector(".completion-ghost"), 900)
+        const foldText = toggleText()
         say("折叠完成后汇总数更新且无残留副本",
           foldText.includes("已完成 3 项") && !doc.querySelector(".completion-ghost") && !rowFor("待完成任务"),
           `${foldText}; 副本=${Boolean(doc.querySelector(".completion-ghost"))}`)
@@ -864,7 +913,7 @@
         // In the expanded list the same row waits through the strike, then FLIPs
         // to the end of the completed group.
         await update(ANIMATION_INITIAL)
-        doc.querySelector(".fold")?.click()
+        toggle()?.click()
         await wait(280)
         const movingRow = rowFor("待完成任务")
         const expandedData = copy(ANIMATION_INITIAL)

@@ -13,3 +13,6 @@ test-extension/
 
 # status/main.js is committed on purpose: OpenChamber installs extensions
 # without building them, so the built page has to ship.
+
+# Playwright MCP artifacts (page snapshots, console logs).
+.playwright-mcp/

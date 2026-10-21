@@ -79,6 +79,8 @@ const MOVE_STAGGER_MS = 30
 const MOVE_STAGGER_CAP_MS = 90
 const ENTER_STAGGER_MS = 40
 const ENTER_STAGGER_CAP_MS = 160
+/** The toggle's reveal: one short fade for the rows it opens, no height animation. */
+const REVEAL_MS = 140
 /**
  * Springs sampled from a damped harmonic, so motion reads as physics rather
  * than a preset: ~9% overshoot for travel, ~20% for the tick and the fold's
@@ -135,6 +137,10 @@ const completionTransitions = new Map()
 const exitingRows = new Set()
 const completionGhosts = new Set()
 let suppressAnimationsForNextPaint = true
+/** Set by the header toggle: the rows it reveals fade in rather than cascade. */
+let revealNextPaint = false
+/** Last finish count on the toggle, so only a real growth flips the number. */
+let finishedShown = null
 
 // ---- height and scroll state ----
 /** The list as last painted, so a fold click can relayout without a file read. */
@@ -281,7 +287,7 @@ function rowKeys(list) {
   })
 }
 
-/** Rows for the flat list: open work in order, then the finished fold. */
+/** Rows for the flat list: open work in order, then the finished rows when open. */
 function buildRows(list) {
   const keys = rowKeys(list)
   const keyOf = new Map(list.map((todo, index) => [todo, keys[index]]))
@@ -297,13 +303,11 @@ function buildRows(list) {
   })
   const rows = open.map((todo) => ({ kind: "item", status: todo.status, key: keyOf.get(todo), todo }))
 
-  if (finished.length) {
-    const expanded = openFinished && finishedFor === sessionID
-    rows.push({ kind: "fold", status: "fold", key: "fold", count: finished.length, expanded })
-    if (expanded) {
-      for (const todo of finished) {
-        rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo })
-      }
+  // Finished work is hidden behind the header toggle; when it is open the rows
+  // join the list in their own order, with no control row of their own.
+  if (openFinished && finishedFor === sessionID) {
+    for (const todo of finished) {
+      rows.push({ kind: "item", status: todo.status, key: keyOf.get(todo), todo })
     }
   }
 
@@ -312,9 +316,9 @@ function buildRows(list) {
 
 /**
  * Rows for the structured list: a DFS walk of the task tree. Finished work is
- * hidden by default (kept only when it leads to unfinished work) and summarised
- * by one "finished" fold, so the open tasks are not buried under a done tail.
- * The key is the same content+occurrence identity the flat list uses.
+ * hidden by default (kept only when it leads to unfinished work) behind the
+ * header toggle, so the open tasks are not buried under a done tail. The key is
+ * the same content+occurrence identity the flat list uses.
  */
 function treeRows(list, phases) {
   const keys = rowKeys(list)
@@ -330,10 +334,6 @@ function treeRows(list, phases) {
     const key = tree.synthetic ? tree.key : keyOf.get(todo)
     return { kind: "item", status: tree.status, key, todo, tree }
   })
-  const hidden = list.length - kept.length
-  if (hidden) {
-    out.push({ kind: "fold", status: "fold", key: "fold", count: hidden, expanded })
-  }
   return out
 }
 
@@ -344,9 +344,6 @@ function currentRows() {
 }
 
 function rowHtml(row, typing = false) {
-  if (row.kind === "fold") {
-    return `<button class="fold" type="button" data-row-key="fold" data-count="${row.count}" aria-expanded="${row.expanded}">已完成 <span class="n">${row.count}</span> 项</button>`
-  }
   return itemHtml(row.todo, row.key, typing, row.tree || null)
 }
 
@@ -357,24 +354,6 @@ function createRowNode(row, typing = false) {
 }
 
 function updateRowNode(node, row, animateStatus = true) {
-  if (row.kind === "fold") {
-    const expanded = String(row.expanded)
-    if (node.getAttribute("aria-expanded") !== expanded) node.setAttribute("aria-expanded", expanded)
-    const count = String(row.count)
-    if (node.dataset.count !== count) {
-      const grew = node.dataset.count !== "" && Number(count) > Number(node.dataset.count)
-      node.dataset.count = count
-      const n = node.querySelector(".n")
-      if (n) {
-        n.textContent = count
-        if (grew && !reducedMotion()) animateCountFlip(n)
-      } else {
-        node.textContent = `已完成 ${row.count} 项`
-      }
-    }
-    return
-  }
-
   const todo = row.todo
   const previousStatus = node.dataset.status
   if (node.dataset.rowKey !== row.key) node.dataset.rowKey = row.key
@@ -511,7 +490,7 @@ function animateRow(node, from, to, duration, onFinish, delay = 0) {
   return animation
 }
 
-/** The fold's count tick: the new number steps up into place rather than jumping. */
+/** The toggle's count tick: the new number steps up into place rather than jumping. */
 function animateCountFlip(n) {
   animateRow(n,
     { transform: "translateY(5px)", opacity: 0 },
@@ -561,9 +540,9 @@ function animateRowExit(node, epoch) {
   }, () => {})
 }
 
-function completionGhost(body, source, row) {
+function completionGhost(source, row) {
   const sourceRect = source.getBoundingClientRect()
-  const bodyRect = body.getBoundingClientRect()
+  const rootRect = el("root").getBoundingClientRect()
   const ghost = source.cloneNode(true)
   updateRowNode(ghost, row, false)
   // Cloned nodes restart CSS animations, so a cloned typewriter would re-type
@@ -576,21 +555,30 @@ function completionGhost(body, source, row) {
   ghost.setAttribute("aria-hidden", "true")
   ghost.inert = true
   ghost.style.position = "absolute"
-  ghost.style.left = `${sourceRect.left - bodyRect.left + body.scrollLeft}px`
-  ghost.style.top = `${sourceRect.top - bodyRect.top + body.scrollTop}px`
+  ghost.style.left = `${sourceRect.left - rootRect.left}px`
+  ghost.style.top = `${sourceRect.top - rootRect.top}px`
   ghost.style.width = `${sourceRect.width}px`
   ghost.style.height = `${sourceRect.height}px`
   ghost.style.margin = "0"
   ghost.style.zIndex = "2"
   ghost.style.pointerEvents = "none"
-  body.append(ghost)
+  const layer = el("ghosts") || el("root")
+  layer.append(ghost)
   completionGhosts.add(ghost)
   return { ghost, sourceRect }
 }
 
-function animateCompletionGhosts(body, ghosts) {
-  const fold = Array.from(body.children).find((node) => node.dataset.rowKey === "fold")
-  if (!fold) {
+/**
+ * Fly the swallowed row to the header toggle.
+ *
+ * The toggle is in the header, above the scrolling list, so the ghost cannot
+ * live inside the list: it would be clipped the moment it crossed the top edge.
+ * It rides the overlay layer instead, and the target — a control that never
+ * moves with the list — is the same point for every completion.
+ */
+function animateCompletionGhosts(ghosts) {
+  const toggle = el("finished")
+  if (!toggle || toggle.hidden) {
     for (const { ghost } of ghosts) {
       completionGhosts.delete(ghost)
       ghost.remove()
@@ -598,7 +586,7 @@ function animateCompletionGhosts(body, ghosts) {
     return
   }
 
-  const target = fold.getBoundingClientRect()
+  const target = toggle.getBoundingClientRect()
   let landed = false
   for (const { ghost, sourceRect } of ghosts) {
     const deltaX = target.left - sourceRect.left
@@ -612,7 +600,7 @@ function animateCompletionGhosts(body, ghosts) {
         ghost.remove()
         if (!landed) {
           landed = true
-          pulseFold(fold)
+          pulseFold(toggle)
         }
       },
     )
@@ -716,7 +704,7 @@ function reconcileRows(rows, options = {}) {
     if (used.has(node)) continue
     const ghostRow = options.ghostRows?.get(node.dataset.rowKey)
     if (ghostRow) {
-      ghosts.push(completionGhost(body, node, ghostRow))
+      ghosts.push(completionGhost(node, ghostRow))
       node.remove()
     } else if (animate) {
       animateRowExit(node, epoch)
@@ -725,9 +713,26 @@ function reconcileRows(rows, options = {}) {
     }
   }
 
-  if (ghosts.length) animateCompletionGhosts(body, ghosts)
+  if (ghosts.length) animateCompletionGhosts(ghosts)
+  if (options.reveal && entering.length) revealRows(entering)
   animateRows(body, firstTops, entering, previous.some((node) => node.dataset.rowKey), used, animate)
   return { staged: false, entering }
+}
+
+/**
+ * Fade in the rows a toggle revealed: opacity only, no height, no stagger.
+ *
+ * The layout is already final when this runs, so nothing under the reader moves
+ * — the new rows simply arrive together. A dozen height animations with a
+ * stagger would instead push the list around for half a second.
+ */
+function revealRows(nodes) {
+  if (reducedMotion()) return
+  requestAnimationFrame(() => {
+    for (const node of nodes) {
+      if (node.isConnected) animateRow(node, { opacity: 0 }, { opacity: 1 }, REVEAL_MS)
+    }
+  })
 }
 
 function animateRows(body, firstTops, entering, hadRows, used, animate) {
@@ -788,9 +793,11 @@ const smooth = () => (reducedMotion() ? "auto" : "smooth")
  */
 function frameHeight(headerH) {
   const rows = rowNodes()
-  if (rows.length === 0) return MIN_H
+  // With the control row gone, a list whose work is all finished and hidden has
+  // no rows at all. The header (and the toggle in it) still needs its space, so
+  // an empty list measures as header plus padding rather than falling to MIN_H.
   const last = rows[rows.length - 1]
-  const content = last.offsetTop + last.offsetHeight
+  const content = last ? last.offsetTop + last.offsetHeight : 0
   return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H)
 }
 
@@ -897,7 +904,7 @@ function armIdle() {
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "])
 
 /**
- * Input: the fold click, the settle snap, and the signals that arm the idle
+ * Input: the toggle click, the settle snap, and the signals that arm the idle
  * return.
  *
  * Everything here is passive or non-prevented, so wheel, touch, arrow keys,
@@ -911,15 +918,8 @@ function wireInput() {
   /** A drag on the list or its bar: the one manual scroll that fires no wheel. */
   let pointerDown = false
 
-  body.addEventListener("click", (event) => {
-    const fold = event.target instanceof Element ? event.target.closest(".fold") : null
-    if (!fold) return
-    openFinished = !(openFinished && finishedFor === sessionID)
-    finishedFor = sessionID
-    // The poll's key carries the fold state; clear it so the next read repaints.
-    lastKey = ""
-    if (painted.length) paint(painted, paintedPhases)
-  })
+  const toggle = el("finished")
+  if (toggle) toggle.addEventListener("click", toggleFinished)
 
   body.addEventListener("scroll", () => {
     // A drag scrolls the container without a wheel event; the pointer being down
@@ -956,6 +956,75 @@ function legendHtml(phases) {
     .join("")
 }
 
+/**
+ * The header toggle: how many finished rows are hidden, and whether they are
+ * open. It lives beside the count rather than at the end of the list, so the
+ * reader never has to scroll to reach it; for the same reason the list carries
+ * no control row that the frame height would have to account for.
+ */
+function syncFinishedToggle(todos) {
+  const toggle = el("finished")
+  if (!toggle) return
+  const hidden = todos.length - pruneFinished(todos).length
+  const expanded = openFinished && finishedFor === sessionID
+  toggle.hidden = hidden === 0
+  toggle.setAttribute("aria-expanded", String(expanded))
+
+  const label = el("finishedN")
+  if (!label) return
+  const next = String(hidden)
+  if (label.textContent === next) return
+  const grew = finishedShown !== null && hidden > finishedShown
+  label.textContent = next
+  finishedShown = hidden
+  if (grew && !reducedMotion()) animateCountFlip(label)
+}
+
+/**
+ * The first row still touching the viewport, and how far its top sits above it.
+ *
+ * Opening or closing the finished rows reorders everything around the reader's
+ * view. Rather than trust the browser's own scroll anchoring (which a re-parent
+ * or a re-keyed node can drop), the row under the viewport edge is remembered
+ * by its key and put back where it was.
+ */
+function captureScrollAnchor() {
+  const body = el("body")
+  if (!body || body.scrollTop <= 0) return null
+  const top = body.scrollTop
+  const node = rowNodes().find((row) => row.offsetTop + row.offsetHeight > top)
+  if (!node || !node.dataset.rowKey) return null
+  return { key: node.dataset.rowKey, delta: node.offsetTop - top }
+}
+
+function restoreScrollAnchor(anchor) {
+  if (!anchor) return
+  const body = el("body")
+  const node = rowNodes().find((row) => row.dataset.rowKey === anchor.key)
+  if (!node) return
+  body.scrollTop = clampScroll(node.offsetTop - anchor.delta, body.scrollHeight - body.clientHeight)
+}
+
+/**
+ * Open or close the finished rows.
+ *
+ * Height animations are suppressed for this paint: the rows appear or vanish in
+ * one layout step and only fade, so a list with a dozen finished tasks does not
+ * cascade for half a second or leave the frame briefly empty at the bottom. The
+ * chevron and the toggle's own state carry the motion instead.
+ */
+function toggleFinished() {
+  const anchor = captureScrollAnchor()
+  openFinished = !(openFinished && finishedFor === sessionID)
+  finishedFor = sessionID
+  // The poll's key carries the fold state; clear it so the next read repaints.
+  lastKey = ""
+  revealNextPaint = true
+  suppressAnimationsForNextPaint = true
+  if (painted.length) paint(painted, paintedPhases)
+  restoreScrollAnchor(anchor)
+}
+
 function paint(todos, phases = []) {
   cancelRowAnimations()
   if (!todos.length) {
@@ -970,6 +1039,8 @@ function paint(todos, phases = []) {
   const newTaskKeys = rememberTaskKeys(todos)
   const animate = !suppressAnimationsForNextPaint
   suppressAnimationsForNextPaint = false
+  const reveal = revealNextPaint
+  revealNextPaint = false
   el("root").dataset.mode = "work"
   const view = structured ? "tree" : "flat"
   if (el("root").dataset.view && el("root").dataset.view !== view) {
@@ -985,6 +1056,7 @@ function paint(todos, phases = []) {
   el("count").textContent = `${done}/${todos.length}`
   top.querySelector("#bar").dataset.full = done > 0 && done === todos.length ? "true" : "false"
   top.querySelector("#bar > i").style.transform = `scaleX(${done / todos.length})`
+  syncFinishedToggle(todos)
 
   const legend = el("legend")
   if (structured && phases.length) {
@@ -995,8 +1067,8 @@ function paint(todos, phases = []) {
     legend.hidden = true
   }
 
-  const result = reconcileRows(currentRows(), { animate, newTaskKeys })
-  if (!result.staged) applyListHeight(result.entering.length > 0)
+  const result = reconcileRows(currentRows(), { animate, newTaskKeys, reveal })
+  if (!result.staged) applyListHeight(result.entering.length > 0 || !animate)
 }
 
 /**
