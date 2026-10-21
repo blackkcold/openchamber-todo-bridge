@@ -3002,8 +3002,8 @@ export default {
   function frameHeight(headerH) {
     const rows = rowNodes();
     const last = rows[rows.length - 1];
-    const content = last ? last.offsetTop + last.offsetHeight : 0;
-    return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H);
+    const content = last ? last.getBoundingClientRect().bottom - el2("body").getBoundingClientRect().top : 0;
+    return clamp(Math.ceil(headerH + content + bodyPadding()), MIN_H, MAX_H);
   }
   function applyHeight(height, immediate = false) {
     const wanted = clamp(height, MIN_H, MAX_H);

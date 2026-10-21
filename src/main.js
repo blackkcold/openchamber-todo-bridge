@@ -790,6 +790,12 @@ const smooth = () => (reducedMotion() ? "auto" : "smooth")
  * 320px ceiling, past which the list scrolls. Capping at a fixed row count
  * instead clipped a tall (multi-line) last row even when there was room to show
  * it whole.
+ *
+ * Measured from rects and rounded up rather than from `offsetTop + offsetHeight`:
+ * a row's height comes from `line-height` and lands on a fraction (23.4px), while
+ * the `offset*` pair reports whole pixels. The pair rounded 46.4px of rows to 46,
+ * and the frame then sat 1px short of its content — enough for a short list, which
+ * is not supposed to scroll at all, to grow a scrollbar.
  */
 function frameHeight(headerH) {
   const rows = rowNodes()
@@ -797,8 +803,10 @@ function frameHeight(headerH) {
   // no rows at all. The header (and the toggle in it) still needs its space, so
   // an empty list measures as header plus padding rather than falling to MIN_H.
   const last = rows[rows.length - 1]
-  const content = last ? last.offsetTop + last.offsetHeight : 0
-  return clamp(headerH + Math.round(content) + bodyPadding(), MIN_H, MAX_H)
+  const content = last
+    ? last.getBoundingClientRect().bottom - el("body").getBoundingClientRect().top
+    : 0
+  return clamp(Math.ceil(headerH + content + bodyPadding()), MIN_H, MAX_H)
 }
 
 /**

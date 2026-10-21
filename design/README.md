@@ -5,8 +5,9 @@ Reference material for the Work Status section. Not shipped to OpenChamber.
 ![Rendered section](preview.jpg)
 
 Rendered from the real `status/index.html` + `status/main.js`, driven by a stub
-of the host protocol. Left: default. Middle: finished items expanded. Bottom:
-dark theme.
+of the host protocol at 2×. Left: a task tree, finished items hidden. Middle: the
+same tree with `已完成` expanded in place. Right: the dark theme, three items, no
+scrolling.
 
 ## The problem with the first version
 
@@ -27,7 +28,7 @@ The section worked but looked like a terminal:
 | Real checkbox (13px, 4px radius, CSS-drawn tick) | Matches `.oc-sdk-check-box`; no icon font the sandboxed frame cannot load |
 | 2px progress bar under the count | Progress is visible without reading numbers |
 | Work in progress pinned to the top | The open item is what the reader wants first |
-| Finished items collapse into `已完成 N 项` | Spends the frame on open work; expands on click, and the choice survives re-renders |
+| Finished items toggle from the header, not a row at the end of the list | The control is reachable without scrolling a long list, and the rows it hides leave no trace in the tree |
 | Priority as a rising mark: `⌃⌃` / `⌃` / `·` | Visible at a glance, does not compete with the text |
 | Long text wraps; row height stays predictable | |
 | Frame height follows the list (24–320px) | An empty list collapses to a line instead of holding a box open |
@@ -41,11 +42,16 @@ same numbers the section uses (`eL`/`tL` in OpenChamber's own status container).
 
 The height is **measured from the rows about to be shown**, not estimated from
 `rowCount x rowHeight`. A row is only approximately the same height as the next:
-the finished-group row is a control rather than a line of text, and a long task
-name wraps. `frameHeight` takes the top of the last row plus its height, so the
-measure includes the fold's own top margin, and the frame is elastic — it holds
+it comes from `line-height`, so a wrapped task name and a single-line one are not
+multiples of each other. `frameHeight` takes the header plus the last row's bottom
+edge, measured in rects and rounded **up**, and the frame is elastic — it holds
 every todo up to the host's 320px ceiling. `src/viewport.js` holds the bounds and
 the surrounding arithmetic; `scripts/test-viewport.mjs` exercises it under Node.
+
+The rounding is not cosmetic. The `offsetTop + offsetHeight` pair reports whole
+pixels, so a 46.4px column of rows measured as 46 and the frame sat 1px short —
+enough for a short list, which is meant never to scroll, to grow a scrollbar. The
+rects carry the fraction and `Math.ceil` spends the extra pixel.
 
 The measurement has no feedback loop for the reason the old estimate was built
 to avoid one: the frame is decided from the rows *before* they are laid out
@@ -138,15 +144,17 @@ paint is readable before the theme lands.
 
 ## Files here
 
-- `preview.html` — three candidate layouts side by side, light and dark. The
-  chosen one is **A · Checklist**.
+- `preview.html` — the first iteration's three candidate layouts side by side,
+  light and dark. The chosen one is **A · Checklist**; it is the design record,
+  not the shipped page.
 - `verify.html` — renders the real shipped page against a protocol stub, so a
-  change to `status/` or `src/` can be checked without installing it. Four
-  panes: a 15-item list (over the 320px cap, scrolls), a **task tree** (nested
-  `parentId` + phases), a 3-item list (fits, with the fold), an empty list
-  (collapsed), and a 2× pane for judging the priority marks. Two buttons drive
-  it: 跑滚动自检 asserts the nine scroll-model checks, and 回位自检（约 32 秒）
-  asserts that the idle return fires exactly once and never re-arms.
+  change to `status/` or `src/` can be checked without installing it. Panes: a
+  15-item list (over the 320px cap, scrolls), a **task tree** (nested `parentId` +
+  phases), a 3-item list (fits, finished items behind the header toggle), an empty
+  list (collapsed), a 2× pane for judging the priority marks, and an animation
+  sample. Three buttons drive it: 跑滚动自检 asserts the scroll model, 跑渲染自检
+  the repaint behaviour, 跑动画自检 the reveal/flight timing (the idle-return
+  check, 回位自检, takes about 32 seconds).
 - `verify-pages.html` — the same stub for the **rail panel** (`panel/index.html`)
   and the **task board** (`board/index.html`). It answers `file-read` and
   `file-list`, swallows compose/clipboard/toast, and clicks a board row to show
