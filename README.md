@@ -24,7 +24,25 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.5` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.6` to the URL.
+
+### v0.9.6 — a frosted bottom edge on the list
+
+The rail panel's list frosts its bottom edge while rows remain below: a 28px strip of
+`backdrop-filter` blur with a mask that tapers upward, tinted from the host palette, so a
+long tree dissolves into whatever sits beneath the panel instead of ending on a half-cut
+row. The frost clears in 160ms once the reader reaches the end, and the list carries 40px
+of bottom padding, so the last row always scrolls clear of it. Nothing is drawn when the
+list fits without scrolling; `prefers-reduced-motion` makes the appearance instant, and a
+host without `backdrop-filter` falls back to the tint alone, which still reads as a fade.
+
+The flag lives on `#root[data-more]` and is refreshed on scroll, on rail resize, and after
+every repaint — a taller list fires no scroll event, so the repaint hook is what keeps the
+edge honest when the finished toggle expands the tree. The task board and the Work Status
+section are untouched: at 56px tall, a frost there would eat half the section this panel
+is meant to fit into.
+
+Also fixes the 1px frame shortfall and refreshes the design preview pages.
 
 ### v0.9.5 — a finished toggle you can always reach
 

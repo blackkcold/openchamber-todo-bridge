@@ -85,6 +85,19 @@ function rowHtml(tree, todo) {
   )
 }
 
+/**
+ * The list's bottom edge. A frost marks that rows continue below; it clears
+ * once the reader reaches the end, so the last row is never left veiled. CSS
+ * draws it, this only keeps `data-more` in step — and it has to be called after
+ * every repaint, since a taller list fires no scroll event.
+ */
+function syncEdge() {
+  const root = el("root")
+  const list = el("list")
+  if (!root || !list) return
+  root.dataset.more = String(list.scrollTop + list.clientHeight < list.scrollHeight - 1)
+}
+
 function render(doc) {
   lastDoc = doc
   const kept = pruneFinished(doc.todos)
@@ -119,8 +132,13 @@ function render(doc) {
   const scroll = list.scrollTop
   list.innerHTML = body || (total ? `<div class="empty">全部任务已完成</div>` : "")
   list.scrollTop = scroll
+  syncEdge()
   syncJump()
 }
+
+el("list").addEventListener("scroll", syncEdge, { passive: true })
+// The host can resize the rail without the list scrolling; re-check then too.
+if (typeof ResizeObserver === "function") new ResizeObserver(syncEdge).observe(el("list"))
 
 /** The finished toggle reveals the done work on demand (and hides it again). */
 el("finished").addEventListener("click", () => {
@@ -137,6 +155,7 @@ function paintMessage(text) {
   toggle.hidden = true
   toggle.setAttribute("aria-expanded", "false")
   el("list").innerHTML = `<div class="empty">${esc(text)}</div>`
+  syncEdge()
   syncJump()
 }
 

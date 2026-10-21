@@ -1770,6 +1770,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     return `<div class="row ${esc(todo.status)}" data-status="${esc(todo.status)}">` + `<span class="gut" style="width:${width}px">${gutterSvg(tree, todo.status)}</span>` + `<span class="txt">${esc(todo.content)}</span></div>`;
   }
+  function syncEdge() {
+    const root = el2("root");
+    const list = el2("list");
+    if (!root || !list)
+      return;
+    root.dataset.more = String(list.scrollTop + list.clientHeight < list.scrollHeight - 1);
+  }
   function render(doc) {
     lastDoc = doc;
     const kept = pruneFinished(doc.todos);
@@ -1791,8 +1798,12 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const scroll = list.scrollTop;
     list.innerHTML = body || (total ? `<div class="empty">全部任务已完成</div>` : "");
     list.scrollTop = scroll;
+    syncEdge();
     syncJump();
   }
+  el2("list").addEventListener("scroll", syncEdge, { passive: true });
+  if (typeof ResizeObserver === "function")
+    new ResizeObserver(syncEdge).observe(el2("list"));
   el2("finished").addEventListener("click", () => {
     openFinished = !openFinished;
     if (lastDoc)
@@ -1807,6 +1818,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     toggle.hidden = true;
     toggle.setAttribute("aria-expanded", "false");
     el2("list").innerHTML = `<div class="empty">${esc(text)}</div>`;
+    syncEdge();
     syncJump();
   }
   async function refresh() {

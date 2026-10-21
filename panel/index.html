@@ -80,7 +80,36 @@
       #legend:empty { display: none; }
       .lg { display: inline-flex; align-items: center; gap: 4px; }
       .lg > i { width: 7px; height: 7px; border-radius: 999px; }
-      #list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 12px 12px; }
+      /*
+        The list is wrapped so its bottom edge can carry a frost: a long tree
+        dissolves into whatever sits below the panel instead of ending on a cut
+        row. The frost is a sibling of the scroller (not a child), so it stays
+        put while rows pass beneath it, and the list keeps enough bottom padding
+        that the last row scrolls clear of it.
+      */
+      #body { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+      #list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 12px 40px; }
+      #frost {
+        position: absolute; left: 0; right: 0; bottom: 0;
+        height: 28px; pointer-events: none;
+        /* Only while rows remain below. `data-more` is set by syncEdge(). */
+        opacity: 0; transition: opacity 160ms ease;
+        /* The tint keeps blurred text from turning grey; it comes from the host
+           palette, and stays clear when the host has not sent one yet. */
+        background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 70%, transparent));
+        -webkit-backdrop-filter: blur(6px) saturate(1.1);
+        backdrop-filter: blur(6px) saturate(1.1);
+        /* Taper the blur upward so the edge has no seam. */
+        -webkit-mask-image: linear-gradient(to bottom, transparent, #000 82%);
+        mask-image: linear-gradient(to bottom, transparent, #000 82%);
+      }
+      #root[data-more="true"] #frost { opacity: 1; }
+      /* Without backdrop-filter the blur is gone, so lean on the tint alone —
+         the edge still reads as a fade rather than a cut. */
+      @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+        #frost { background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 92%, transparent)); }
+      }
+      @media (prefers-reduced-motion: reduce) { #frost { transition: none; } }
       .row { display: flex; gap: 7px; align-items: flex-start; padding: 3px 0; border-radius: 5px; }
       .row .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
       .row.completed .txt, .row.cancelled .txt { color: var(--t-muted); text-decoration: line-through; }
@@ -104,7 +133,10 @@
         <div id="bar"><i></i></div>
         <div id="legend"></div>
       </div>
-      <div id="list"><div class="empty">Loading…</div></div>
+      <div id="body">
+        <div id="list"><div class="empty">Loading…</div></div>
+        <div id="frost"></div>
+      </div>
     </div>
     <script src="main.js"></script>
   </body>
