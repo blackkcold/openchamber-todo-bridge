@@ -24,7 +24,25 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.7` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.8` to the URL.
+
+### v0.9.8 — a progressive frost
+
+The edge is a ramp now, not a step. Five sibling strips of 8px stack up a 40px band,
+with the blur rising from 0.8px to 8px and the tint rising alongside, so a row goes
+crisp, then soft, then unreadable, then gone across about two lines instead of snapping
+from sharp to mush one line further down.
+
+Two constraints shaped the markup, both measured rather than assumed. The strips cannot
+nest: a parent carrying its own blur re-blurs its child's output, so the band doubles in
+strength where layers overlap. And they cannot fade in: Chromium drops a layer's backdrop
+blur while that layer is translucent, so the old 160ms opacity transition flashed a sharp
+band before the blur landed. The edge therefore toggles with `display`, and its clearance
+grew with it — 52px of bottom padding for the 40px band, so the last row still scrolls
+clear at the end of the list.
+
+The `data-more` flag, the tint fallback for hosts without `backdrop-filter`, and the
+behaviour at the end of the list are unchanged.
 
 ### v0.9.7 — a frost you can actually see
 

@@ -81,41 +81,47 @@
       .lg { display: inline-flex; align-items: center; gap: 4px; }
       .lg > i { width: 7px; height: 7px; border-radius: 999px; }
       /*
-        The list is wrapped so its bottom edge can carry a frost: a long tree
-        dissolves into whatever sits below the panel instead of ending on a cut
-        row. The frost is a sibling of the scroller (not a child), so it stays
-        put while rows pass beneath it, and the list keeps enough bottom padding
-        that the last row scrolls clear of it.
+        The list is wrapped so its bottom edge can carry a progressive frost: a
+        long tree dissolves into whatever sits below the panel instead of ending
+        on a cut row.
+
+        A backdrop blur has one strength, so a gradient of blur has to come from
+        several layers. These are sibling strips — never nested, since a parent
+        with its own blur would re-blur its child's output — of 8px each, ramping
+        0.8px to 8px with the tint rising alongside. They sit beside the scroller
+        rather than inside it, so they stay put while rows pass beneath, and the
+        list keeps bottom padding that clears the whole band.
       */
       #body { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-      #list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 12px 40px; }
-      #frost {
-        position: absolute; left: 0; right: 0; bottom: 0;
-        height: 28px; pointer-events: none;
-        /* Only while rows remain below. `data-more` is set by syncEdge(). */
-        opacity: 0; transition: opacity 160ms ease;
-        /* The tint keeps blurred text from turning grey; it comes from the host
-           palette, and stays clear when the host has not sent one yet. Past
-           ~60% it swallows the only genuinely blurred rows and the edge reads
-           as a plain fade. */
-        background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 55%, transparent));
-        -webkit-backdrop-filter: blur(6px) saturate(1.1);
-        backdrop-filter: blur(6px) saturate(1.1);
-        /* A mask composites the blurred layer at partial alpha instead of
-           weakening the blur: from `transparent` upward, most of the strip is
-           sharp rows under a thin veil, which is why the edge first read as a
-           fade with no blur at all. Starting at .45 and going opaque by 45%
-           keeps a soft entry and leaves ~15px of full-strength blur. */
-        -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .45), #000 45%);
-        mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .45), #000 45%);
+      #list { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 2px 12px 52px; }
+      #edge {
+        position: absolute; left: 0; right: 0; bottom: 0; height: 40px;
+        pointer-events: none; display: none;
       }
-      #root[data-more="true"] #frost { opacity: 1; }
-      /* Without backdrop-filter the blur is gone, so lean on the tint alone —
-         the edge still reads as a fade rather than a cut. */
+      /* Only while rows remain below. `data-more` is set by syncEdge().
+         Shown outright, without a fade: an opacity below 1 on a strip makes
+         Chromium drop its backdrop blur, so a transition would flash a sharp
+         band before the blur lands. */
+      #root[data-more="true"] #edge { display: block; }
+      #edge > i {
+        position: absolute; left: 0; right: 0; display: block; height: 8px;
+        -webkit-backdrop-filter: blur(var(--b)) saturate(1.05);
+        backdrop-filter: blur(var(--b)) saturate(1.05);
+      }
+      /* The tint is the host's own background, so blurred text settles into the
+         panel instead of turning grey. Kept light at the top of the band: it is
+         there to seat the blur, not to hide it. */
+      #edge > i:nth-child(1) { top: 0;    --b: .8px; background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 6%, transparent)); }
+      #edge > i:nth-child(2) { top: 8px;  --b: 1.8px; background: linear-gradient(to bottom, color-mix(in srgb, var(--oc-bg, transparent) 6%, transparent), color-mix(in srgb, var(--oc-bg, transparent) 14%, transparent)); }
+      #edge > i:nth-child(3) { top: 16px; --b: 3.2px; background: linear-gradient(to bottom, color-mix(in srgb, var(--oc-bg, transparent) 14%, transparent), color-mix(in srgb, var(--oc-bg, transparent) 26%, transparent)); }
+      #edge > i:nth-child(4) { top: 24px; --b: 5.2px; background: linear-gradient(to bottom, color-mix(in srgb, var(--oc-bg, transparent) 26%, transparent), color-mix(in srgb, var(--oc-bg, transparent) 40%, transparent)); }
+      #edge > i:nth-child(5) { top: 32px; --b: 8px;   background: linear-gradient(to bottom, color-mix(in srgb, var(--oc-bg, transparent) 40%, transparent), color-mix(in srgb, var(--oc-bg, transparent) 58%, transparent)); }
+      /* Without backdrop-filter there is no blur to ramp, so the edge falls back
+         to one tint gradient — a fade, but not a cut. */
       @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-        #frost { background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 92%, transparent)); }
+        #edge { background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--oc-bg, transparent) 55%, transparent)); }
+        #edge > i { background: none; }
       }
-      @media (prefers-reduced-motion: reduce) { #frost { transition: none; } }
       .row { display: flex; gap: 7px; align-items: flex-start; padding: 3px 0; border-radius: 5px; }
       .row .txt { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
       .row.completed .txt, .row.cancelled .txt { color: var(--t-muted); text-decoration: line-through; }
@@ -141,7 +147,7 @@
       </div>
       <div id="body">
         <div id="list"><div class="empty">Loading…</div></div>
-        <div id="frost"></div>
+        <div id="edge" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
       </div>
     </div>
     <script src="main.js"></script>
