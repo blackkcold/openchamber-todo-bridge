@@ -60,7 +60,15 @@ import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { isFinished, parseDoc } from "./doc.js"
 import { ensureInstalled, PLUGIN_DIR_PATH } from "./plugin-install.js"
 
-const POLL_MS = 2000
+/**
+ * Two clocks. A turn in flight rewrites its list within seconds, so the section
+ * follows it closely; an idle session changes only when the reader or another
+ * window touches it, so a few seconds of latency cost nothing. A hidden page
+ * reads nothing at all — nobody is looking, and a background frame must not
+ * touch a file forever.
+ */
+const BUSY_POLL_MS = 600
+const IDLE_POLL_MS = 3000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
 const ROW_ENTER_MS = 180
@@ -118,6 +126,10 @@ const el = (id) => document.getElementById(id)
 let host = null
 let sessionID = null
 let timer = null
+/** The loop is enabled; a fatal host error turns it off for good. */
+let polling = false
+/** Whether the session's turn is in flight, as last reported by the host. */
+let sessionBusy = false
 let lastKey = ""
 let refreshSequence = 0
 let booted = false
@@ -131,6 +143,16 @@ let observedTaskSession = null
 let previousTaskKeys = new Set()
 const pendingTypewriterKeys = new Set()
 const completedAtEnd = new Map()
+/**
+ * The row each painted node last stood for.
+ *
+ * A task that finishes is pruned from the rendered tree, so the row it had
+ * cannot be rebuilt from the new list — and the fly-to-the-toggle ghost is a
+ * clone of the node as it was drawn. The node is the only record of that shape
+ * (depth, indent width, connectors); without it the ghost is mistaken for a
+ * flat row and `updateRowNode` reaches for a `.box` a tree row does not have.
+ */
+const paintedRows = new WeakMap()
 let completionSequence = 0
 let motionEpoch = 0
 const completionTransitions = new Map()
@@ -273,14 +295,29 @@ function itemHtml(todo, key, typing = false, tree = null) {
 }
 
 /**
- * Identity for a row across repaints: content plus its occurrence at that
- * content. `todowrite` replaces the whole list each call, so this is what keeps
- * an unchanged task's row — and its animation state — stable while everything
- * around it moves.
+ * Identity for a row across repaints: the task's stable `id` when it has one,
+ * otherwise its content plus the occurrence of that content.
+ *
+ * `todowrite` replaces the whole list each call, so this is what keeps an
+ * unchanged task's row — and its animation state — stable while everything
+ * around it moves. The id is preferred because content is not identity: editing
+ * a task's wording, or pruning one of two tasks that share a title, would
+ * otherwise hand a row to a different task (and with it that row's depth,
+ * gutter and completion animation).
  */
 function rowKeys(list) {
   const occurrences = new Map()
+  const taken = new Set()
   return list.map((todo) => {
+    const id = typeof todo.id === "string" ? todo.id : ""
+    if (id !== "") {
+      const key = `id:${id}`
+      // A repeated id cannot name two rows; the later one falls back to text.
+      if (!taken.has(key)) {
+        taken.add(key)
+        return key
+      }
+    }
     const occurrence = occurrences.get(todo.content) || 0
     occurrences.set(todo.content, occurrence + 1)
     return `item:${JSON.stringify([todo.content, occurrence])}`
@@ -353,9 +390,23 @@ function createRowNode(row, typing = false) {
   return template.content.firstElementChild
 }
 
+/** The shape a tree row draws its gutter from. Changes when the tree moves. */
+function shapeKey(row) {
+  const tree = row.tree
+  if (!tree) return "flat"
+  return `${tree.synthetic ? "g" : "t"}${tree.depth}:${tree.isLast ? 1 : 0}:` +
+    `${tree.ancestorLast.map((last) => (last ? 1 : 0)).join("")}:${tree.blocked ? 1 : 0}:${tree.colorIndex}`
+}
+
 function updateRowNode(node, row, animateStatus = true) {
   const todo = row.todo
   const previousStatus = node.dataset.status
+  const previousRow = paintedRows.get(node)
+  // A row can keep its task, its status and its colour while the tree around it
+  // moves: a sibling appears, a finished branch is pruned, a phase group folds
+  // away. The gutter is drawn from that shape, so it has to be redrawn too —
+  // otherwise the indent and the connector lines describe the old tree.
+  const reshaped = previousRow !== undefined && shapeKey(previousRow) !== shapeKey(row)
   if (node.dataset.rowKey !== row.key) node.dataset.rowKey = row.key
   if (previousStatus !== todo.status) {
     node.dataset.status = todo.status
@@ -367,13 +418,19 @@ function updateRowNode(node, row, animateStatus = true) {
   const text = node.querySelector(".txt")
   if (text.textContent !== todo.content) text.textContent = todo.content
 
-  // The mark changed with the status, or a phase re-coloured it.
+  // The mark changed with the status, a phase re-coloured it, or the tree moved.
   const recolor = row.tree && node.dataset.color !== String(row.tree.colorIndex)
-  if (previousStatus !== todo.status || recolor) {
+  if (previousStatus !== todo.status || recolor || reshaped) {
     if (row.tree) {
       node.dataset.color = String(row.tree.colorIndex)
+      node.dataset.depth = String(row.tree.depth)
+      node.dataset.last = row.tree.isLast ? "1" : "0"
       const gut = node.querySelector(".gut")
-      if (gut) gut.innerHTML = gutterSvg(row.tree, todo.status)
+      if (gut) {
+        const width = `${row.tree.depth * INDENT + GUT_NODE}px`
+        if (gut.style.width !== width) gut.style.width = width
+        gut.innerHTML = gutterSvg(row.tree, todo.status)
+      }
       if (previousStatus !== todo.status && animateStatus && todo.status === "completed" && !reducedMotion()) {
         const tick = node.querySelector(".gut .gut-tick")
         if (tick) {
@@ -382,13 +439,20 @@ function updateRowNode(node, row, animateStatus = true) {
         }
       }
     } else {
+      // Shape and content can disagree for one paint — a row cloned for the
+      // completion flight, or a list that changed from tree to flat mid-flight.
+      // A missing box means there is simply no mark to draw; it must never
+      // throw inside the reconcile loop, where it would strand every row queued
+      // behind it.
       const box = node.querySelector(".box")
-      box.innerHTML = statusMarkHtml(todo.status)
-      if (animateStatus && todo.status === "completed" && !reducedMotion()) {
-        const tick = box.querySelector(".tick")
-        if (tick) {
-          node.classList.add("just-completed")
-          tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true })
+      if (box) {
+        box.innerHTML = statusMarkHtml(todo.status)
+        if (animateStatus && todo.status === "completed" && !reducedMotion()) {
+          const tick = box.querySelector(".tick")
+          if (tick) {
+            node.classList.add("just-completed")
+            tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true })
+          }
         }
       }
     }
@@ -409,13 +473,9 @@ function updateRowNode(node, row, animateStatus = true) {
   }
 }
 
+/** The same identity `rowKeys` assigns, as a set. */
 function taskKeys(list) {
-  const occurrences = new Map()
-  return new Set(list.map((todo) => {
-    const occurrence = occurrences.get(todo.content) || 0
-    occurrences.set(todo.content, occurrence + 1)
-    return `item:${JSON.stringify([todo.content, occurrence])}`
-  }))
+  return new Set(rowKeys(list))
 }
 
 function rememberTaskKeys(list) {
@@ -653,19 +713,33 @@ function reconcileRows(rows, options = {}) {
   const body = el("body")
   const animate = options.animate !== false && !reducedMotion()
   const previous = Array.from(body.children).filter((node) => node.dataset.motionOnly !== "true")
-  const byKey = new Map(previous.filter((node) => node.dataset.rowKey).map((node) => [node.dataset.rowKey, node]))
+  // A row on its way out is not a row that can be reused: its exit animation
+  // owns the node and will remove it when it finishes, whatever the list says
+  // by then. Reusing one made a task disappear for good.
+  const byKey = new Map(
+    previous
+      .filter((node) => node.dataset.rowKey && node.dataset.exiting !== "true")
+      .map((node) => [node.dataset.rowKey, node]),
+  )
 
   if (animate && !options.skipCompletionDetection) {
-    const occurrences = new Map()
-    const completing = painted
-      .filter((todo) => todo.status === "completed")
-      .map((todo) => {
-        const occurrence = occurrences.get(todo.content) || 0
-        occurrences.set(todo.content, occurrence + 1)
-        const row = { kind: "item", status: todo.status, key: `item:${JSON.stringify([todo.content, occurrence])}`, todo }
-        return { node: byKey.get(row.key), row }
-      })
-      .filter(({ node }) => node && node.dataset.status !== "completed")
+    // Keys come from the whole painted list, not from the completed subset: an
+    // occurrence number is only meaningful against every row that shares the
+    // content, finished or not.
+    const paintedKeys = rowKeys(painted)
+    const completing = []
+    painted.forEach((todo, index) => {
+      if (todo.status !== "completed") return
+      const key = paintedKeys[index]
+      const node = byKey.get(key)
+      if (!node || node.dataset.status === "completed") return
+      const row = { kind: "item", status: todo.status, key, todo }
+      // The finished row is about to be pruned, so it cannot be looked up in
+      // the new tree; borrow the shape it is drawn with right now.
+      const paintedRow = paintedRows.get(node)
+      if (paintedRow && paintedRow.tree) row.tree = paintedRow.tree
+      completing.push({ node, row })
+    })
     if (completing.length) {
       finishCompletionTransitions(completing, animate)
       return { staged: true, entering: [] }
@@ -691,6 +765,7 @@ function reconcileRows(rows, options = {}) {
       }
       entering.push(node)
     }
+    paintedRows.set(node, row)
     used.add(node)
 
     if (node !== cursor) body.insertBefore(node, cursor)
@@ -702,9 +777,18 @@ function reconcileRows(rows, options = {}) {
   const epoch = motionEpoch
   for (const node of previous) {
     if (used.has(node)) continue
+    // Already collapsing: its own animation owns the removal, and calling
+    // animateRowExit twice would leave the node in the list for good.
+    if (node.dataset.exiting === "true") continue
     const ghostRow = options.ghostRows?.get(node.dataset.rowKey)
     if (ghostRow) {
-      ghosts.push(completionGhost(node, ghostRow))
+      try {
+        ghosts.push(completionGhost(node, ghostRow))
+      } catch (error) {
+        // The flight is decoration. Losing one must never leave the row — or
+        // the rows queued behind it — in the list.
+        console.error("[todo-bridge] completion ghost skipped:", error)
+      }
       node.remove()
     } else if (animate) {
       animateRowExit(node, epoch)
@@ -1188,24 +1272,65 @@ async function refresh() {
   }
 
   // Skip the DOM write when nothing changed, so a poll does not disturb
-  // scrolling or the finished-group toggle.
+  // scrolling or the finished-group toggle. The key is remembered only after a
+  // paint that finished: a throw halfway through the reconcile leaves the list
+  // half-merged, and a key remembered too early makes that state permanent.
   const key = JSON.stringify([requestedSessionID, doc.todos, doc.phases, openFinished])
   if (key === lastKey) return
-  lastKey = key
   paint(doc.todos, doc.phases)
+  lastKey = key
+}
+
+const pollDelay = () => (sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS)
+
+/** Arm the next read, unless the loop is off or the page is hidden. */
+function arm() {
+  if (!polling || document.hidden) return
+  clearTimeout(timer)
+  timer = setTimeout(tick, pollDelay())
+}
+
+async function tick() {
+  timer = null
+  try {
+    await refresh()
+  } finally {
+    // A fatal read error calls stop(); arm() then does nothing.
+    arm()
+  }
 }
 
 function start() {
+  polling = true
   if (timer !== null) return
-  timer = setInterval(() => { void refresh() }, POLL_MS)
+  arm()
+}
+
+/** A busy flip must not wait out the idle delay. */
+function reschedule() {
+  if (!polling) return
+  arm()
 }
 
 function stop() {
   refreshSequence += 1
+  polling = false
   if (timer === null) return
-  clearInterval(timer)
+  clearTimeout(timer)
   timer = null
 }
+
+// A hidden frame reads nothing; coming back reads once at once, then resumes.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(timer)
+    timer = null
+    return
+  }
+  if (!polling) return
+  void refresh()
+  arm()
+})
 
 /** The iframe's parent is OpenChamber; a top-level tab has itself as parent. */
 function insideHostFrame() {
@@ -1252,6 +1377,7 @@ function boot() {
     // onto the frame root. Runs on every refresh so theme changes follow.
     applyHostReady(ctx, document.documentElement)
 
+    sessionBusy = Boolean(ctx && ctx.session && ctx.session.busy === true)
     const next = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     if (next !== sessionID) {
       cancelRowAnimations()
@@ -1299,6 +1425,7 @@ function boot() {
 
   host.onSession((session) => {
     const next = session && typeof session.id === "string" ? session.id : null
+    sessionBusy = Boolean(session && session.busy === true)
     if (next !== sessionID) {
       cancelRowAnimations()
       sessionID = next
@@ -1314,6 +1441,8 @@ function boot() {
     }
     lastKey = ""
     void refresh()
+    // The turn's start and its end are the two moments the cadence changes.
+    reschedule()
   })
 }
 

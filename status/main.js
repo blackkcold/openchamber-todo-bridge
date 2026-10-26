@@ -1823,6 +1823,20 @@ const SESSION_CACHE_TTL_MS = 30_000
 const SESSION_CACHE_MAX = 200
 const sessionCache = new Map()
 
+/**
+ * sessionID -> the list last written (or last read fresh).
+ *
+ * \`todowrite\` replaces the whole list, and agents routinely re-send the same
+ * one — once to correct wording the list already has, once because the model
+ * restated its plan. Writing that again costs two durable writes and a full
+ * \`_index.json\` scan, and it moves the session to the top of the board for a
+ * change nobody made. The digest is the guard: equal means the mirror, the
+ * storage record and the index already say exactly this.
+ */
+const sessionSignatures = new Map()
+
+const signatureOf = (todos, phases) => JSON.stringify([todos, phases])
+
 function cacheRecord(sessionID, record, readAt = Date.now()) {
   sessionCache.delete(sessionID)
   sessionCache.set(sessionID, { record, readAt })
@@ -1859,6 +1873,10 @@ async function readRecord(ctx, sessionID, { fresh = false } = {}) {
       phases: parsePhases(value),
       updatedAt: value && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
     }
+    // A fresh read is how a write from another process (or an older plugin
+    // generation) becomes visible; remember it so a later identical write is
+    // recognised as a no-op rather than overwriting it blind.
+    sessionSignatures.set(sessionID, signatureOf(record.todos, record.phases))
     cacheRecord(sessionID, record, now)
     return record
   } catch (error) {
@@ -2270,6 +2288,7 @@ export default {
     // cached records across setup calls (this also isolates tests).
     sessionCache.clear()
     sessionWrites.clear()
+    sessionSignatures.clear()
     summaryCache.clear()
     indexDir = ""
     lastFullRefresh = 0
@@ -2304,17 +2323,28 @@ export default {
             const previous = hasPhases
               ? sessionCache.get(context.sessionID)?.record || null
               : await readRecord(ctx, context.sessionID, { fresh: true })
-            const phases = hasPhases ? normalized.phases : previous.phases
+            const phases = (hasPhases ? normalized.phases : previous.phases) || []
+            const signature = signatureOf(todos, phases)
+            if (sessionSignatures.get(context.sessionID) === signature) {
+              // Storage, the mirror and the index already say exactly this. A
+              // rewrite would touch three files and re-order the board for a
+              // change nobody made.
+              return { content: resultContent(todos, phases) }
+            }
             const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
-            const record = { todos, phases: phases || [], updatedAt }
+            const record = { todos, phases, updatedAt }
             await ctx.storage.set(storageKey(context.sessionID), record)
             cacheRecord(context.sessionID, record)
             // Mirror after the durable write: a mirror failure must not lose the list.
+            let mirrored = true
             try {
               await mirror(context.sessionID, todos, phases, updatedAt)
             } catch (error) {
+              mirrored = false
               logMirrorError(error)
             }
+            // A failed mirror is retried by the next write, even an identical one.
+            if (mirrored) sessionSignatures.set(context.sessionID, signature)
             return { content: resultContent(todos, phases) }
           })
         },
@@ -2373,7 +2403,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -2455,7 +2485,8 @@ export default {
   }
 
   // src/main.js
-  var POLL_MS = 2000;
+  var BUSY_POLL_MS = 600;
+  var IDLE_POLL_MS = 3000;
   var REQUEST_TIMEOUT_MS = 3000;
   var BOOT_WATCHDOG_MS = 1600;
   var ROW_ENTER_MS = 180;
@@ -2489,6 +2520,8 @@ export default {
   var host = null;
   var sessionID = null;
   var timer = null;
+  var polling = false;
+  var sessionBusy = false;
   var lastKey = "";
   var refreshSequence = 0;
   var booted = false;
@@ -2500,6 +2533,7 @@ export default {
   var previousTaskKeys = new Set;
   var pendingTypewriterKeys = new Set;
   var completedAtEnd = new Map;
+  var paintedRows = new WeakMap;
   var completionSequence = 0;
   var motionEpoch = 0;
   var completionTransitions = new Map;
@@ -2586,7 +2620,16 @@ export default {
   }
   function rowKeys(list) {
     const occurrences = new Map;
+    const taken = new Set;
     return list.map((todo) => {
+      const id = typeof todo.id === "string" ? todo.id : "";
+      if (id !== "") {
+        const key = `id:${id}`;
+        if (!taken.has(key)) {
+          taken.add(key);
+          return key;
+        }
+      }
       const occurrence = occurrences.get(todo.content) || 0;
       occurrences.set(todo.content, occurrence + 1);
       return `item:${JSON.stringify([todo.content, occurrence])}`;
@@ -2642,9 +2685,17 @@ export default {
     template.innerHTML = rowHtml(row, typing);
     return template.content.firstElementChild;
   }
+  function shapeKey(row) {
+    const tree = row.tree;
+    if (!tree)
+      return "flat";
+    return `${tree.synthetic ? "g" : "t"}${tree.depth}:${tree.isLast ? 1 : 0}:` + `${tree.ancestorLast.map((last) => last ? 1 : 0).join("")}:${tree.blocked ? 1 : 0}:${tree.colorIndex}`;
+  }
   function updateRowNode(node, row, animateStatus = true) {
     const todo = row.todo;
     const previousStatus = node.dataset.status;
+    const previousRow = paintedRows.get(node);
+    const reshaped = previousRow !== undefined && shapeKey(previousRow) !== shapeKey(row);
     if (node.dataset.rowKey !== row.key)
       node.dataset.rowKey = row.key;
     if (previousStatus !== todo.status) {
@@ -2656,12 +2707,18 @@ export default {
     if (text.textContent !== todo.content)
       text.textContent = todo.content;
     const recolor = row.tree && node.dataset.color !== String(row.tree.colorIndex);
-    if (previousStatus !== todo.status || recolor) {
+    if (previousStatus !== todo.status || recolor || reshaped) {
       if (row.tree) {
         node.dataset.color = String(row.tree.colorIndex);
+        node.dataset.depth = String(row.tree.depth);
+        node.dataset.last = row.tree.isLast ? "1" : "0";
         const gut = node.querySelector(".gut");
-        if (gut)
+        if (gut) {
+          const width = `${row.tree.depth * INDENT + GUT_NODE}px`;
+          if (gut.style.width !== width)
+            gut.style.width = width;
           gut.innerHTML = gutterSvg(row.tree, todo.status);
+        }
         if (previousStatus !== todo.status && animateStatus && todo.status === "completed" && !reducedMotion()) {
           const tick = node.querySelector(".gut .gut-tick");
           if (tick) {
@@ -2671,12 +2728,14 @@ export default {
         }
       } else {
         const box = node.querySelector(".box");
-        box.innerHTML = statusMarkHtml(todo.status);
-        if (animateStatus && todo.status === "completed" && !reducedMotion()) {
-          const tick = box.querySelector(".tick");
-          if (tick) {
-            node.classList.add("just-completed");
-            tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+        if (box) {
+          box.innerHTML = statusMarkHtml(todo.status);
+          if (animateStatus && todo.status === "completed" && !reducedMotion()) {
+            const tick = box.querySelector(".tick");
+            if (tick) {
+              node.classList.add("just-completed");
+              tick.addEventListener("animationend", () => node.classList.remove("just-completed"), { once: true });
+            }
           }
         }
       }
@@ -2698,12 +2757,7 @@ export default {
     }
   }
   function taskKeys(list) {
-    const occurrences = new Map;
-    return new Set(list.map((todo) => {
-      const occurrence = occurrences.get(todo.content) || 0;
-      occurrences.set(todo.content, occurrence + 1);
-      return `item:${JSON.stringify([todo.content, occurrence])}`;
-    }));
+    return new Set(rowKeys(list));
   }
   function rememberTaskKeys(list) {
     const current = taskKeys(list);
@@ -2894,15 +2948,23 @@ export default {
     const body = el2("body");
     const animate = options.animate !== false && !reducedMotion();
     const previous = Array.from(body.children).filter((node) => node.dataset.motionOnly !== "true");
-    const byKey = new Map(previous.filter((node) => node.dataset.rowKey).map((node) => [node.dataset.rowKey, node]));
+    const byKey = new Map(previous.filter((node) => node.dataset.rowKey && node.dataset.exiting !== "true").map((node) => [node.dataset.rowKey, node]));
     if (animate && !options.skipCompletionDetection) {
-      const occurrences = new Map;
-      const completing = painted.filter((todo) => todo.status === "completed").map((todo) => {
-        const occurrence = occurrences.get(todo.content) || 0;
-        occurrences.set(todo.content, occurrence + 1);
-        const row = { kind: "item", status: todo.status, key: `item:${JSON.stringify([todo.content, occurrence])}`, todo };
-        return { node: byKey.get(row.key), row };
-      }).filter(({ node }) => node && node.dataset.status !== "completed");
+      const paintedKeys = rowKeys(painted);
+      const completing = [];
+      painted.forEach((todo, index) => {
+        if (todo.status !== "completed")
+          return;
+        const key = paintedKeys[index];
+        const node = byKey.get(key);
+        if (!node || node.dataset.status === "completed")
+          return;
+        const row = { kind: "item", status: todo.status, key, todo };
+        const paintedRow = paintedRows.get(node);
+        if (paintedRow && paintedRow.tree)
+          row.tree = paintedRow.tree;
+        completing.push({ node, row });
+      });
       if (completing.length) {
         finishCompletionTransitions(completing, animate);
         return { staged: true, entering: [] };
@@ -2928,6 +2990,7 @@ export default {
         }
         entering.push(node);
       }
+      paintedRows.set(node, row);
       used.add(node);
       if (node !== cursor)
         body.insertBefore(node, cursor);
@@ -2941,9 +3004,15 @@ export default {
     for (const node of previous) {
       if (used.has(node))
         continue;
+      if (node.dataset.exiting === "true")
+        continue;
       const ghostRow = options.ghostRows?.get(node.dataset.rowKey);
       if (ghostRow) {
-        ghosts.push(completionGhost(node, ghostRow));
+        try {
+          ghosts.push(completionGhost(node, ghostRow));
+        } catch (error) {
+          console.error("[todo-bridge] completion ghost skipped:", error);
+        }
         node.remove();
       } else if (animate) {
         animateRowExit(node, epoch);
@@ -3268,23 +3337,54 @@ export default {
     const key = JSON.stringify([requestedSessionID, doc.todos, doc.phases, openFinished]);
     if (key === lastKey)
       return;
-    lastKey = key;
     paint(doc.todos, doc.phases);
+    lastKey = key;
+  }
+  var pollDelay = () => sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS;
+  function arm() {
+    if (!polling || document.hidden)
+      return;
+    clearTimeout(timer);
+    timer = setTimeout(tick, pollDelay());
+  }
+  async function tick() {
+    timer = null;
+    try {
+      await refresh();
+    } finally {
+      arm();
+    }
   }
   function start() {
+    polling = true;
     if (timer !== null)
       return;
-    timer = setInterval(() => {
-      refresh();
-    }, POLL_MS);
+    arm();
+  }
+  function reschedule() {
+    if (!polling)
+      return;
+    arm();
   }
   function stop() {
     refreshSequence += 1;
+    polling = false;
     if (timer === null)
       return;
-    clearInterval(timer);
+    clearTimeout(timer);
     timer = null;
   }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    if (!polling)
+      return;
+    refresh();
+    arm();
+  });
   function insideHostFrame() {
     try {
       return window.parent !== window;
@@ -3317,6 +3417,7 @@ export default {
         clearTimeout(watchdog);
       }
       applyHostReady(ctx, document.documentElement);
+      sessionBusy = Boolean(ctx && ctx.session && ctx.session.busy === true);
       const next = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null;
       if (next !== sessionID) {
         cancelRowAnimations();
@@ -3354,6 +3455,7 @@ export default {
     });
     host.onSession((session) => {
       const next = session && typeof session.id === "string" ? session.id : null;
+      sessionBusy = Boolean(session && session.busy === true);
       if (next !== sessionID) {
         cancelRowAnimations();
         sessionID = next;
@@ -3369,9 +3471,10 @@ export default {
       }
       lastKey = "";
       refresh();
+      reschedule();
     });
   }
   boot();
 })();
 
-// plugin-source-sha256: 5aef360cc5d638abb380866a66ac05b1c47abbdd66aa957c588c7b76fe6d3cf5
+// plugin-source-sha256: 72501435a337ca2ef9f96d2b58afd5b59a9b19521ebaf0c859d07b3d81647b6b

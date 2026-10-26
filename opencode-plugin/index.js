@@ -154,6 +154,20 @@ const SESSION_CACHE_TTL_MS = 30_000
 const SESSION_CACHE_MAX = 200
 const sessionCache = new Map()
 
+/**
+ * sessionID -> the list last written (or last read fresh).
+ *
+ * `todowrite` replaces the whole list, and agents routinely re-send the same
+ * one — once to correct wording the list already has, once because the model
+ * restated its plan. Writing that again costs two durable writes and a full
+ * `_index.json` scan, and it moves the session to the top of the board for a
+ * change nobody made. The digest is the guard: equal means the mirror, the
+ * storage record and the index already say exactly this.
+ */
+const sessionSignatures = new Map()
+
+const signatureOf = (todos, phases) => JSON.stringify([todos, phases])
+
 function cacheRecord(sessionID, record, readAt = Date.now()) {
   sessionCache.delete(sessionID)
   sessionCache.set(sessionID, { record, readAt })
@@ -190,6 +204,10 @@ async function readRecord(ctx, sessionID, { fresh = false } = {}) {
       phases: parsePhases(value),
       updatedAt: value && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
     }
+    // A fresh read is how a write from another process (or an older plugin
+    // generation) becomes visible; remember it so a later identical write is
+    // recognised as a no-op rather than overwriting it blind.
+    sessionSignatures.set(sessionID, signatureOf(record.todos, record.phases))
     cacheRecord(sessionID, record, now)
     return record
   } catch (error) {
@@ -601,6 +619,7 @@ export default {
     // cached records across setup calls (this also isolates tests).
     sessionCache.clear()
     sessionWrites.clear()
+    sessionSignatures.clear()
     summaryCache.clear()
     indexDir = ""
     lastFullRefresh = 0
@@ -635,17 +654,28 @@ export default {
             const previous = hasPhases
               ? sessionCache.get(context.sessionID)?.record || null
               : await readRecord(ctx, context.sessionID, { fresh: true })
-            const phases = hasPhases ? normalized.phases : previous.phases
+            const phases = (hasPhases ? normalized.phases : previous.phases) || []
+            const signature = signatureOf(todos, phases)
+            if (sessionSignatures.get(context.sessionID) === signature) {
+              // Storage, the mirror and the index already say exactly this. A
+              // rewrite would touch three files and re-order the board for a
+              // change nobody made.
+              return { content: resultContent(todos, phases) }
+            }
             const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
-            const record = { todos, phases: phases || [], updatedAt }
+            const record = { todos, phases, updatedAt }
             await ctx.storage.set(storageKey(context.sessionID), record)
             cacheRecord(context.sessionID, record)
             // Mirror after the durable write: a mirror failure must not lose the list.
+            let mirrored = true
             try {
               await mirror(context.sessionID, todos, phases, updatedAt)
             } catch (error) {
+              mirrored = false
               logMirrorError(error)
             }
+            // A failed mirror is retried by the next write, even an identical one.
+            if (mirrored) sessionSignatures.set(context.sessionID, signature)
             return { content: resultContent(todos, phases) }
           })
         },

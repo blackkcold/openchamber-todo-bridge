@@ -40,7 +40,13 @@ import {
   withoutArchived,
 } from "./archive.js"
 
-const POLL_MS = 4000
+/**
+ * The board is a workspace view, not a live transcript: the index only moves
+ * when some session writes its list. Follow a running turn more closely, idle
+ * slowly, and read nothing while the page is hidden.
+ */
+const BUSY_POLL_MS = 1500
+const IDLE_POLL_MS = 5000
 const REQUEST_TIMEOUT_MS = 8000
 const TODOS_DIR = "~/.config/openchamber/todos"
 const UNGROUPED = "未分组"
@@ -62,7 +68,20 @@ const isDone = (status) => status === "completed" || status === "cancelled"
 let host = null
 let mounted = false
 let timer = null
+/** The loop is enabled; nothing turns it off yet, but a fatal error may. */
+let polling = false
+/** Whether the current session's turn is in flight, as last reported by the host. */
+let sessionBusy = false
 let lastKey = ""
+/**
+ * The index as last read, with the stamp (`kind:size:mtime`) it was read at.
+ *
+ * `_index.json` is the whole workspace, so it is the one file whose cost grows
+ * with use: a few tens of KB parsed every poll. The stamp makes a quiet poll a
+ * 200-byte stat instead of a full read and parse.
+ */
+let indexStamp = ""
+let indexMetas = null
 /** Every session, newest first, from the index alone — no mirror is opened for this. */
 let allMetas = []
 /** The sessions to show: `allMetas` minus the ones the reader has set aside. */
@@ -839,13 +858,34 @@ function mountToolbar() {
 
 // ---- lifecycle ---------------------------------------------------------------
 
+/**
+ * The index metas, re-read only when the file's stat moved.
+ *
+ * The stamp is the cheap half of the pair: the host still answers with one
+ * round trip, but a quiet poll never ships or parses the workspace index.
+ * `host.stat` is absent on older hosts, which simply falls back to reading.
+ */
+async function readIndexMetas() {
+  const path = `${TODOS_DIR}/_index.json`
+  let stamp = ""
+  if (typeof host.stat === "function") {
+    const info = await host.stat(path)
+    stamp = `${info.kind}:${info.size}:${info.mtime}`
+    if (indexMetas !== null && stamp === indexStamp) return indexMetas
+  }
+  const { content } = await host.readFile(path)
+  const metas = parseIndex(content)
+  if (metas === null) throw new Error("BAD_INDEX")
+  indexStamp = stamp
+  indexMetas = metas
+  return metas
+}
+
 async function refresh() {
   if (!host) return
   let metas
   try {
-    const { content } = await host.readFile(`${TODOS_DIR}/_index.json`)
-    metas = parseIndex(content)
-    if (metas === null) throw new Error("BAD_INDEX")
+    metas = await readIndexMetas()
   } catch (error) {
     const code = error && error.code
     const message = String((error && error.message) || "")
@@ -928,6 +968,46 @@ async function refresh() {
   await renderBoard()
 }
 
+const pollDelay = () => (sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS)
+
+/** Arm the next read, unless the loop is off or the page is hidden. */
+function arm() {
+  if (!polling || document.hidden) return
+  clearTimeout(timer)
+  timer = setTimeout(tick, pollDelay())
+}
+
+async function tick() {
+  timer = null
+  try {
+    await refresh()
+  } finally {
+    arm()
+  }
+}
+
+function start() {
+  polling = true
+  if (timer !== null) return
+  arm()
+}
+
+function reschedule() {
+  if (!polling) return
+  arm()
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(timer)
+    timer = null
+    return
+  }
+  if (!polling) return
+  void refresh()
+  arm()
+})
+
 function insideHostFrame() {
   try {
     return window.parent !== window
@@ -962,9 +1042,13 @@ function boot() {
     currentID = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     mountToolbar()
     void refresh()
-    if (timer === null) timer = setInterval(() => { void refresh() }, POLL_MS)
+    start()
   })
-  host.onSession((session) => setCurrent(session))
+  host.onSession((session) => {
+    sessionBusy = Boolean(session && session.busy === true)
+    setCurrent(session)
+    reschedule()
+  })
 }
 
 boot()
