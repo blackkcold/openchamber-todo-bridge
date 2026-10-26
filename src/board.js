@@ -29,6 +29,7 @@ import { TOP_N, buildRows, familyIndex, groupFamilies, normalizePhase, splitTop 
 import {
   TAXONOMY_KEY,
   buildPrompt,
+  describeGenerateError,
   emptyStore,
   failStore,
   gate,
@@ -62,7 +63,6 @@ import {
  */
 const BUSY_POLL_MS = 1500
 const IDLE_POLL_MS = 5000
-const REQUEST_TIMEOUT_MS = 8000
 const TODOS_DIR = "~/.config/openchamber/todos"
 const UNGROUPED = "未分组"
 const CHIP_W = DAG_COL - 34
@@ -161,6 +161,8 @@ let classifying = false
 let aiToastShown = false
 /** The management panel is open. */
 let manageOpen = false
+/** The explicit Small Model probe: idle / running / ok / fail, with its message. */
+let aiTest = { state: "idle", text: "" }
 /** When the page became visible; the automatic pass waits out a short idle first. */
 let aiArmedAt = Date.now()
 
@@ -621,7 +623,7 @@ function paintSummary() {
       ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` +
         `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>`
       : "") +
-    (rows.length ? `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` : "") +
+    `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` +
     `</div>` +
     `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` +
     (groups.length
@@ -636,13 +638,23 @@ function paintSummary() {
         (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") +
         `<button type="button" class="ph-toggle" data-manage>收起</button></div>` +
         `<div class="ph-manage-list">` +
-        rows
-          .slice(0, 24)
-          .map((row) =>
-            `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` +
-            `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`,
-          )
-          .join("") +
+        (rows.length
+          ? rows
+              .slice(0, 24)
+              .map((row) =>
+                `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` +
+                `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`,
+              )
+              .join("")
+          : `<span class="ph-none">暂无阶段</span>`) +
+        `</div>` +
+        `<div class="ph-ai">` +
+        `<span class="ph-ai-l">Small Model</span>` +
+        `<button type="button" class="ph-toggle" data-ai-test${aiTest.state === "running" ? " disabled" : ""}>` +
+        `${aiTest.state === "running" ? "请求中…" : "测试连接"}</button>` +
+        (aiTest.text
+          ? `<span class="ph-ai-msg ${aiTest.state}">${esc(aiTest.text)}</span>`
+          : `<span class="ph-ai-hint">发一次最小请求：不写词表、不占归类配额</span>`) +
         `</div>` +
         `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` +
         `</div>`
@@ -756,6 +768,41 @@ function togglePin(key, on) {
   if (on) pinned.push(key)
   applyStore({ ...taxonomyStore, pinned })
   void saveTaxonomy()
+  paintSummary()
+}
+
+/**
+ * The explicit Small Model probe.
+ *
+ * One tiny request, no store writes, no gate consumption: it must be safe to press
+ * while diagnosing, and its result must not change what the automatic pass does.
+ * This is the only place the reader can see *why* classification is or is not
+ * working — the automatic path stays silent by design.
+ */
+async function testSmallModel() {
+  if (aiTest.state === "running") return
+  if (!host || typeof host.generate !== "function") {
+    aiTest = { state: "fail", text: "当前 OpenChamber 不支持主机生成（需 2.0.4+）" }
+    paintSummary()
+    return
+  }
+  aiTest = { state: "running", text: "" }
+  paintSummary()
+  const started = Date.now()
+  try {
+    const result = await host.generate({
+      prompt: "Reply with exactly: ok",
+      system: "Answer with one word. No punctuation, no prose.",
+      maxOutputTokens: 8,
+    })
+    const text = String((result && result.text) || "").replace(/\s+/g, " ").trim()
+    const ms = Date.now() - started
+    aiTest = text
+      ? { state: "ok", text: `已连通 · 返回「${truncate(text, 24)}」· ${ms}ms` }
+      : { state: "fail", text: "模型返回了空内容" }
+  } catch (error) {
+    aiTest = { state: "fail", text: describeGenerateError(error && error.code) }
+  }
   paintSummary()
 }
 
@@ -1193,6 +1240,7 @@ function mountToolbar() {
     if (target.closest("[data-expand]")) { phaseView.expanded = true; paintSummary(); return }
     if (target.closest("[data-collapse]")) { phaseView.expanded = false; paintSummary(); return }
     if (target.closest("[data-classify]")) { runClassifyNow(); return }
+    if (target.closest("[data-ai-test]")) { void testSmallModel(); return }
     if (target.closest("[data-manage]")) { manageOpen = !manageOpen; paintSummary(); return }
     if (target.closest("[data-undo-classify]")) { void undoClassification(); return }
   })
@@ -1409,7 +1457,10 @@ function boot() {
     return
   }
   try {
-    host = connectHost({ requestTimeoutMs: REQUEST_TIMEOUT_MS })
+    // No `requestTimeoutMs` on purpose: the SDK then gives ordinary calls 20 s and
+    // `generate` its own 90 s. Overriding it would cap the model at the file-read
+    // timeout, which is why a slow Small Model used to fail as HOST_TIMEOUT.
+    host = connectHost()
   } catch {
     el("sessions").innerHTML = `<div class="note">无法连接 OpenChamber。</div>`
     return

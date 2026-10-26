@@ -2403,7 +2403,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",

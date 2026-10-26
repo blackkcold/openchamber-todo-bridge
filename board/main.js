@@ -2629,6 +2629,21 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       nextTryAt: now
     };
   }
+  function describeGenerateError(code) {
+    const key = typeof code === "string" ? code : "";
+    if (key === "NO_MODEL")
+      return "未配置 Small Model：在 OpenChamber 设置里选择一个小模型";
+    if (key === "PERMISSION_DENIED" || key === "UNSUPPORTED" || key === "NO_CAPABILITY") {
+      return "缺少 model 权限：在扩展设置里重新批准后重试";
+    }
+    if (key === "HOST_TIMEOUT")
+      return "超时：模型没有在时限内返回";
+    if (key === "MODEL_FAILED")
+      return "模型调用失败：检查该 Small Model 的可用性";
+    if (key === "HOST_UNAVAILABLE")
+      return "无法连接 OpenChamber";
+    return key ? `失败：${key}` : "失败：未知错误";
+  }
 
   // src/archive.js
   var ARCHIVE_KEY = "archive";
@@ -2759,7 +2774,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   // src/board.js
   var BUSY_POLL_MS = 1500;
   var IDLE_POLL_MS = 5000;
-  var REQUEST_TIMEOUT_MS = 8000;
   var TODOS_DIR = "~/.config/openchamber/todos";
   var UNGROUPED2 = "未分组";
   var CHIP_W = DAG_COL - 34;
@@ -2812,6 +2826,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var classifying = false;
   var aiToastShown = false;
   var manageOpen = false;
+  var aiTest = { state: "idle", text: "" };
   var aiArmedAt = Date.now();
   var ARCHIVE_UNDO_MS = 9000;
   var IDLE_AI_MS = 5000;
@@ -3155,7 +3170,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const seg = (mode, label) => `<button type="button" class="ph-seg${phaseView.sort === mode ? " on" : ""}" data-sort="${mode}">${label}</button>`;
     const more = hidden ? `<button type="button" class="ph-more" data-expand>+ ${hidden} 其他</button>` : phaseView.expanded && rows.length > TOP_N && !openGroup ? `<button type="button" class="ph-more" data-collapse>收起</button>` : "";
     const ungroupedChip = ungrouped ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED2)}</span><b>${ungrouped}</b></span>` : "";
-    el2("summary").innerHTML = `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` + `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` + `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` + `<div class="phases"><span class="ph-label">阶段分布</span>` + `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` + `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` + `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` + (unknownCount ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` + `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>` : "") + (rows.length ? `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` : "") + `</div>` + `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` + (groups.length ? `<div class="ph-row ph-fams">` + (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") + groups.map(familyChipHtml).join("") + `</div>` : "") + (manageOpen ? `<div class="ph-manage">` + `<div class="ph-manage-head"><b>阶段管理</b>` + (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") + `<button type="button" class="ph-toggle" data-manage>收起</button></div>` + `<div class="ph-manage-list">` + rows.slice(0, 24).map((row) => `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` + `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`).join("") + `</div>` + `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` + `</div>` : "");
+    el2("summary").innerHTML = `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` + `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` + `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` + `<div class="phases"><span class="ph-label">阶段分布</span>` + `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` + `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` + `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` + (unknownCount ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` + `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>` : "") + `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` + `</div>` + `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` + (groups.length ? `<div class="ph-row ph-fams">` + (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") + groups.map(familyChipHtml).join("") + `</div>` : "") + (manageOpen ? `<div class="ph-manage">` + `<div class="ph-manage-head"><b>阶段管理</b>` + (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") + `<button type="button" class="ph-toggle" data-manage>收起</button></div>` + `<div class="ph-manage-list">` + (rows.length ? rows.slice(0, 24).map((row) => `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` + `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`).join("") : `<span class="ph-none">暂无阶段</span>`) + `</div>` + `<div class="ph-ai">` + `<span class="ph-ai-l">Small Model</span>` + `<button type="button" class="ph-toggle" data-ai-test${aiTest.state === "running" ? " disabled" : ""}>` + `${aiTest.state === "running" ? "请求中…" : "测试连接"}</button>` + (aiTest.text ? `<span class="ph-ai-msg ${aiTest.state}">${esc(aiTest.text)}</span>` : `<span class="ph-ai-hint">发一次最小请求：不写词表、不占归类配额</span>`) + `</div>` + `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` + `</div>` : "");
   }
   function togglePhaseFilter(key) {
     filter.phase = filter.phase === key ? "all" : key;
@@ -3248,6 +3263,31 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       pinned.push(key);
     applyStore({ ...taxonomyStore, pinned });
     saveTaxonomy();
+    paintSummary();
+  }
+  async function testSmallModel() {
+    if (aiTest.state === "running")
+      return;
+    if (!host || typeof host.generate !== "function") {
+      aiTest = { state: "fail", text: "当前 OpenChamber 不支持主机生成（需 2.0.4+）" };
+      paintSummary();
+      return;
+    }
+    aiTest = { state: "running", text: "" };
+    paintSummary();
+    const started = Date.now();
+    try {
+      const result = await host.generate({
+        prompt: "Reply with exactly: ok",
+        system: "Answer with one word. No punctuation, no prose.",
+        maxOutputTokens: 8
+      });
+      const text = String(result && result.text || "").replace(/\s+/g, " ").trim();
+      const ms = Date.now() - started;
+      aiTest = text ? { state: "ok", text: `已连通 · 返回「${truncate(text, 24)}」· ${ms}ms` } : { state: "fail", text: "模型返回了空内容" };
+    } catch (error) {
+      aiTest = { state: "fail", text: describeGenerateError(error && error.code) };
+    }
     paintSummary();
   }
   function paintDetails() {
@@ -3648,6 +3688,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         runClassifyNow();
         return;
       }
+      if (target.closest("[data-ai-test]")) {
+        testSmallModel();
+        return;
+      }
       if (target.closest("[data-manage]")) {
         manageOpen = !manageOpen;
         paintSummary();
@@ -3874,7 +3918,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return;
     }
     try {
-      host = connectHost({ requestTimeoutMs: REQUEST_TIMEOUT_MS });
+      host = connectHost();
     } catch {
       el2("sessions").innerHTML = `<div class="note">无法连接 OpenChamber。</div>`;
       return;

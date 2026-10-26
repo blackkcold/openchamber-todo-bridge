@@ -253,3 +253,19 @@ export function rollbackStore(store, now) {
     nextTryAt: now,
   }
 }
+
+/**
+ * Turn a `host.generate` failure into one line a reader can act on. Kept here, not
+ * in the page, so the wording is pinned by a test instead of drifting per call site.
+ */
+export function describeGenerateError(code) {
+  const key = typeof code === "string" ? code : ""
+  if (key === "NO_MODEL") return "未配置 Small Model：在 OpenChamber 设置里选择一个小模型"
+  if (key === "PERMISSION_DENIED" || key === "UNSUPPORTED" || key === "NO_CAPABILITY") {
+    return "缺少 model 权限：在扩展设置里重新批准后重试"
+  }
+  if (key === "HOST_TIMEOUT") return "超时：模型没有在时限内返回"
+  if (key === "MODEL_FAILED") return "模型调用失败：检查该 Small Model 的可用性"
+  if (key === "HOST_UNAVAILABLE") return "无法连接 OpenChamber"
+  return key ? `失败：${key}` : "失败：未知错误"
+}
