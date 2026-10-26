@@ -2287,11 +2287,357 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return `<svg class="gut-svg" aria-hidden="true">${body}</svg>`;
   }
 
+  // src/taxonomy.js
+  var OTHER_FAMILY = "其他";
+  var FAMILIES = ["优先级", "批次", "质量", "发版", "界面", "实现"];
+  var FAMILY_ORDER = [...FAMILIES, OTHER_FAMILY];
+  var TOP_N = 12;
+  var RULES = [
+    { family: "优先级", re: /^p[0-4](?:[\s:：-]|$)/i },
+    { family: "批次", re: /^(批次|第\s*\d+\s*批|batch\s*\d+)/i },
+    { family: "质量", re: /(验证|核查|核验|复核|验收|检查|审计|排查|回归|质检|评审)/ },
+    { family: "发版", re: /(发版|发布|部署|打包|上线|交付|灰度|回滚)/ },
+    { family: "界面", re: /(ui|界面|动效|图标|画布|渲染|选择器|布局|样式|视觉|交互)/i },
+    { family: "实现", re: /(实现|开发|编码|修复|重构|实施|接入|迁移|优化|性能)/ }
+  ];
+  function normalizePhase(name) {
+    if (typeof name !== "string")
+      return "";
+    let out = name.normalize("NFKC");
+    out = out.replace(/[\u00a0\u3000]/g, " ").replace(/\s+/g, " ").trim();
+    out = out.replace(/^[\s\-–—_·•|/\\]+/, "");
+    out = out.replace(/[\s\-–—_·•|/\\:：、,，.。;；!！?？]+$/, "");
+    return out;
+  }
+  function familyOf(name) {
+    const text = normalizePhase(name);
+    if (!text)
+      return OTHER_FAMILY;
+    for (const rule of RULES) {
+      if (rule.re.test(text))
+        return rule.family;
+    }
+    return OTHER_FAMILY;
+  }
+  function familyIndex(family) {
+    const index = FAMILIES.indexOf(family);
+    return index < 0 ? -1 : index;
+  }
+  function labelOf(name, aliases) {
+    const key = normalizePhase(name);
+    if (!key)
+      return "";
+    const alias = aliases && typeof aliases === "object" ? aliases[key] : undefined;
+    return typeof alias === "string" && alias !== "" ? alias : key;
+  }
+  function buildRows(byPhase, opts = {}) {
+    const aliases = opts.aliases && typeof opts.aliases === "object" ? opts.aliases : {};
+    const familyMap = opts.familyMap && typeof opts.familyMap === "object" ? opts.familyMap : {};
+    const pinned = Array.isArray(opts.pinned) ? opts.pinned : [];
+    const pinIndex = new Map;
+    for (const pin of pinned) {
+      const key = normalizePhase(pin);
+      if (key && !pinIndex.has(key))
+        pinIndex.set(key, pinIndex.size);
+    }
+    const merged = new Map;
+    let ungrouped = 0;
+    for (const [raw, count] of Object.entries(byPhase || {})) {
+      const n = Number.isFinite(count) ? count : 0;
+      const key = normalizePhase(raw);
+      if (!key) {
+        ungrouped += n;
+        continue;
+      }
+      if (merged.has(key))
+        merged.set(key, merged.get(key) + n);
+      else
+        merged.set(key, n);
+    }
+    const showEmpty = opts.showEmpty === true;
+    let rows = [];
+    for (const [key, count] of merged) {
+      if (!showEmpty && count <= 0)
+        continue;
+      const label = labelOf(key, aliases);
+      const override = familyMap[key];
+      rows.push({
+        key,
+        label,
+        family: typeof override === "string" && FAMILY_ORDER.includes(override) ? override : familyOf(key),
+        count,
+        pin: pinIndex.has(key) ? pinIndex.get(key) : -1
+      });
+    }
+    const mode = opts.sort === "name" || opts.sort === "declare" ? opts.sort : "count";
+    if (mode === "count")
+      rows.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label, "zh"));
+    else if (mode === "name")
+      rows.sort((a, b) => a.label.localeCompare(b.label, "zh"));
+    if (mode !== "declare") {
+      rows = rows.map((row, index) => ({ row, index })).sort((a, b) => {
+        const ap = a.row.pin < 0 ? 1 : 0;
+        const bp = b.row.pin < 0 ? 1 : 0;
+        return ap - bp || a.row.pin - b.row.pin || a.index - b.index;
+      }).map((entry) => entry.row);
+    }
+    for (const row of rows)
+      row.colorIndex = familyIndex(row.family);
+    return { rows, ungrouped };
+  }
+  function groupFamilies(rows) {
+    const groups = new Map;
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!groups.has(row.family))
+        groups.set(row.family, { family: row.family, count: 0, rows: [] });
+      const group = groups.get(row.family);
+      group.count += row.count;
+      group.rows.push(row);
+    }
+    return [...groups.values()].sort((a, b) => {
+      if (a.family === OTHER_FAMILY)
+        return 1;
+      if (b.family === OTHER_FAMILY)
+        return -1;
+      return b.count - a.count || FAMILY_ORDER.indexOf(a.family) - FAMILY_ORDER.indexOf(b.family);
+    });
+  }
+  function splitTop(rows, topN = TOP_N) {
+    const list = Array.isArray(rows) ? rows : [];
+    const pinnedRows = list.filter((row) => row.pin >= 0);
+    const rest = list.filter((row) => row.pin < 0);
+    const shown = [...pinnedRows, ...rest.slice(0, Math.max(0, topN))];
+    return { shown, hidden: Math.max(0, rest.length - Math.max(0, topN)) };
+  }
+
+  // src/taxonomy-ai.js
+  var TAXONOMY_KEY = "phase:taxonomy";
+  var STORE_VERSION = 1;
+  var MAX_BATCH = 60;
+  var MAX_LABEL = 24;
+  var COOLDOWN_MS = 6 * 3600 * 1000;
+  var MAX_PER_DAY = 3;
+  var BACKOFF_MS = [5 * 60 * 1000, 3600 * 1000, 6 * 3600 * 1000, 24 * 3600 * 1000];
+  function emptyStore() {
+    return {
+      version: STORE_VERSION,
+      aliases: {},
+      familyMap: {},
+      pinned: [],
+      lastRunAt: 0,
+      lastHash: "",
+      fails: 0,
+      nextTryAt: 0,
+      dayKey: "",
+      runsToday: 0,
+      previous: null
+    };
+  }
+  function parseStore(raw) {
+    const out = emptyStore();
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+      return out;
+    if (raw.aliases && typeof raw.aliases === "object" && !Array.isArray(raw.aliases)) {
+      for (const [key, label] of Object.entries(raw.aliases)) {
+        const k = normalizePhase(key);
+        if (!k || typeof label !== "string")
+          continue;
+        const text = label.trim().slice(0, MAX_LABEL);
+        if (text)
+          out.aliases[k] = text;
+      }
+    }
+    if (raw.familyMap && typeof raw.familyMap === "object" && !Array.isArray(raw.familyMap)) {
+      for (const [key, family] of Object.entries(raw.familyMap)) {
+        const k = normalizePhase(key);
+        if (k && typeof family === "string" && FAMILY_ORDER.includes(family))
+          out.familyMap[k] = family;
+      }
+    }
+    if (Array.isArray(raw.pinned)) {
+      for (const name of raw.pinned) {
+        const k = normalizePhase(name);
+        if (k && !out.pinned.includes(k))
+          out.pinned.push(k);
+      }
+    }
+    if (Number.isFinite(raw.lastRunAt))
+      out.lastRunAt = raw.lastRunAt;
+    if (typeof raw.lastHash === "string")
+      out.lastHash = raw.lastHash;
+    if (Number.isFinite(raw.fails) && raw.fails >= 0)
+      out.fails = Math.floor(raw.fails);
+    if (Number.isFinite(raw.nextTryAt))
+      out.nextTryAt = raw.nextTryAt;
+    if (typeof raw.dayKey === "string")
+      out.dayKey = raw.dayKey;
+    if (Number.isFinite(raw.runsToday) && raw.runsToday >= 0)
+      out.runsToday = Math.floor(raw.runsToday);
+    if (raw.previous && typeof raw.previous === "object") {
+      const previous = parseStore({ aliases: raw.previous.aliases, familyMap: raw.previous.familyMap });
+      out.previous = { aliases: previous.aliases, familyMap: previous.familyMap };
+    }
+    return out;
+  }
+  function unknownNames(byPhase, store, limit = MAX_BATCH) {
+    const aliases = store && store.aliases || {};
+    const merged = new Map;
+    for (const [raw, count] of Object.entries(byPhase || {})) {
+      const key = normalizePhase(raw);
+      if (!key)
+        continue;
+      if (aliases[key])
+        continue;
+      if (familyOf(key) !== OTHER_FAMILY)
+        continue;
+      merged.set(key, (merged.get(key) || 0) + (Number.isFinite(count) ? count : 0));
+    }
+    return [...merged.entries()].map(([n, c]) => ({ n, c })).sort((a, b) => b.c - a.c || a.n.localeCompare(b.n, "zh")).slice(0, Math.max(0, limit));
+  }
+  function hashNames(names) {
+    const text = (Array.isArray(names) ? names : []).map((item) => item.n).join("\x00");
+    let hash = 2166136261;
+    for (let i = 0;i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+  function buildPrompt(names, store) {
+    const aliases = store && store.aliases ? Object.values(store.aliases).slice(0, 40) : [];
+    const list = (Array.isArray(names) ? names : []).map((item, index) => `${index + 1}. ${item.n} (${item.c})`).join(`
+`);
+    const system = [
+      "You tidy phase labels on a developer's task board.",
+      "Answer with JSON only. No prose, no code fence.",
+      `Allowed families: ${FAMILY_ORDER.join(", ")}.`
+    ].join(" ");
+    const prompt = [
+      "Phase labels from a task board, with how many tasks use each:",
+      list,
+      "",
+      aliases.length ? `Already in use: ${aliases.join(", ")}` : "",
+      "For every label above, pick the best family from the allowed list.",
+      `Also give a short canonical label (at most ${MAX_LABEL} characters) that merges near-duplicates — for example "P0 止血" and "止血" both become "P0 止血".`,
+      "Use the input label verbatim in `n`. Never invent labels.",
+      'Reply exactly: {"map":[{"n":"<input label>","family":"<family>","label":"<canonical>"}]}'
+    ].filter((line) => line !== "").join(`
+`);
+    return { system, prompt };
+  }
+  function extractJson(text) {
+    if (typeof text !== "string")
+      return null;
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start < 0 || end <= start)
+      return null;
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      return null;
+    }
+  }
+  function parseAnswer(text, names) {
+    const allowed = new Set((Array.isArray(names) ? names : []).map((item) => normalizePhase(item.n)));
+    const parsed = extractJson(text);
+    const map = [];
+    const seen = new Set;
+    if (!parsed || !Array.isArray(parsed.map))
+      return { map };
+    for (const item of parsed.map) {
+      if (!item || typeof item !== "object")
+        continue;
+      const key = normalizePhase(item.n);
+      if (!key || !allowed.has(key) || seen.has(key))
+        continue;
+      const family = typeof item.family === "string" && FAMILY_ORDER.includes(item.family) ? item.family : OTHER_FAMILY;
+      const raw = typeof item.label === "string" ? item.label.trim().slice(0, MAX_LABEL) : "";
+      seen.add(key);
+      map.push({ n: key, family, label: raw || key });
+    }
+    return { map };
+  }
+  function dayKey(now) {
+    return new Date(now).toISOString().slice(0, 10);
+  }
+  function gate(store, hash, now) {
+    const state = store || emptyStore();
+    if (!Number.isFinite(now))
+      return { ok: false, reason: "bad-clock" };
+    if (state.nextTryAt > now)
+      return { ok: false, reason: "backoff" };
+    if (hash && state.lastHash === hash)
+      return { ok: false, reason: "unchanged" };
+    if (state.lastRunAt && now - state.lastRunAt < COOLDOWN_MS)
+      return { ok: false, reason: "cooldown" };
+    const runs = state.dayKey === dayKey(now) ? state.runsToday : 0;
+    if (runs >= MAX_PER_DAY)
+      return { ok: false, reason: "daily-cap" };
+    return { ok: true, reason: "" };
+  }
+  function mergeStore(store, answer, hash, now) {
+    const base = parseStore(store);
+    const next = {
+      ...base,
+      aliases: { ...base.aliases },
+      familyMap: { ...base.familyMap },
+      previous: { aliases: { ...base.aliases }, familyMap: { ...base.familyMap } },
+      lastRunAt: now,
+      lastHash: hash || "",
+      fails: 0,
+      nextTryAt: 0,
+      dayKey: dayKey(now),
+      runsToday: (base.dayKey === dayKey(now) ? base.runsToday : 0) + 1
+    };
+    for (const item of answer && answer.map || []) {
+      const key = normalizePhase(item.n);
+      if (!key)
+        continue;
+      if (item.label)
+        next.aliases[key] = item.label;
+      if (item.family && item.family !== familyOf(key))
+        next.familyMap[key] = item.family;
+      else
+        delete next.familyMap[key];
+    }
+    return next;
+  }
+  function failStore(store, now, reason = "") {
+    const base = parseStore(store);
+    const fails = base.fails + 1;
+    const wait = reason === "no-model" ? BACKOFF_MS[BACKOFF_MS.length - 1] : BACKOFF_MS[Math.min(fails - 1, BACKOFF_MS.length - 1)];
+    return {
+      ...base,
+      fails,
+      nextTryAt: now + wait,
+      dayKey: dayKey(now),
+      runsToday: (base.dayKey === dayKey(now) ? base.runsToday : 0) + 1
+    };
+  }
+  function rollbackStore(store, now) {
+    const base = parseStore(store);
+    if (!base.previous)
+      return base;
+    return {
+      ...base,
+      aliases: { ...base.previous.aliases },
+      familyMap: { ...base.previous.familyMap },
+      previous: null,
+      lastHash: "",
+      lastRunAt: 0,
+      nextTryAt: now
+    };
+  }
+
   // src/archive.js
   var ARCHIVE_KEY = "archive";
   var ARCHIVE_VERSION = 1;
   var PREFS_KEY = "archive:prefs";
-  var PREFS_VERSION = 1;
+  var PREFS_VERSION = 2;
+  var DEFAULT_DAYS = 7;
+  var MAX_DAYS = 365;
+  var DAY_MS = 86400000;
   function emptyArchive() {
     return { version: ARCHIVE_VERSION, sessions: {} };
   }
@@ -2312,7 +2658,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return out;
   }
   function emptyPrefs() {
-    return { version: PREFS_VERSION, auto: true };
+    return { version: PREFS_VERSION, auto: true, days: DEFAULT_DAYS };
+  }
+  function clampDays(value, fallback = DEFAULT_DAYS) {
+    const n = Number(value);
+    if (!Number.isFinite(n))
+      return fallback;
+    return Math.min(MAX_DAYS, Math.max(0, Math.floor(n)));
   }
   function parsePrefs(raw) {
     const out = emptyPrefs();
@@ -2320,6 +2672,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return out;
     if (typeof raw.auto === "boolean")
       out.auto = raw.auto;
+    if (Number.isFinite(raw.days))
+      out.days = clampDays(raw.days);
+    else if (raw.version === 1)
+      out.days = 0;
     return out;
   }
   function isArchived(entry, meta) {
@@ -2347,25 +2703,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return false;
     return (meta.doing || 0) === 0 && (meta.pending || 0) === 0;
   }
-  function finishedSessionIDs(metas, entry, keepActiveID) {
-    const ids = [];
-    for (const meta of Array.isArray(metas) ? metas : []) {
-      if (meta.sessionID === keepActiveID)
-        continue;
-      if (isArchived(entry, meta))
-        continue;
-      if (isFullyFinished(meta))
-        ids.push(meta.sessionID);
-    }
-    return ids;
-  }
-  function autoArchiveIDs(metas, entry, opts = {}) {
-    if (!opts.readOk)
-      return [];
+  function archiveCandidates(metas, entry, opts = {}) {
+    const finished = [];
+    const stale = [];
     const keep = new Set(Array.isArray(opts.keep) ? opts.keep : []);
     const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {};
-    const now = Number.isFinite(opts.now) ? opts.now : Infinity;
-    const ids = [];
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+    const days = clampDays(opts.days, 0);
     for (const meta of Array.isArray(metas) ? metas : []) {
       if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "")
         continue;
@@ -2373,17 +2717,29 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         continue;
       if (isArchived(entry, meta))
         continue;
-      if (!isFullyFinished(meta))
-        continue;
       const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
       if (updated > now)
         continue;
       const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity;
       if (updated <= restored)
         continue;
-      ids.push(meta.sessionID);
+      const age = (now - updated) / DAY_MS;
+      if (age < days)
+        continue;
+      if ((meta.blocked || 0) > 0)
+        continue;
+      const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) };
+      if (isFullyFinished(meta))
+        finished.push(item);
+      else
+        stale.push(item);
     }
-    return ids;
+    return { finished, stale };
+  }
+  function autoArchiveIDs(metas, entry, opts = {}) {
+    if (!opts.readOk)
+      return [];
+    return archiveCandidates(metas, entry, opts).finished.map((item) => item.sessionID);
   }
   function withArchived(entry, ids, now) {
     const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
@@ -2446,7 +2802,19 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var hold = {};
   var readOk = false;
   var sweepPaused = false;
+  var candidates = { finished: [], stale: [] };
+  var staleIncluded = false;
+  var archiveOpen = false;
+  var phaseView = { sort: "count", showEmpty: false, expanded: false, openFamily: "" };
+  var taxonomy = { aliases: {}, familyMap: {}, pinned: [] };
+  var taxonomyStore = emptyStore();
+  var taxonomyLoaded = false;
+  var classifying = false;
+  var aiToastShown = false;
+  var manageOpen = false;
+  var aiArmedAt = Date.now();
   var ARCHIVE_UNDO_MS = 9000;
+  var IDLE_AI_MS = 5000;
   var metaOf = (sessionID) => allMetas.find((meta) => meta.sessionID === sessionID) || null;
   function docOf(meta) {
     const cached = meta ? docCache.get(meta.sessionID) : null;
@@ -2468,7 +2836,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return false;
     if (filter.status !== "all" && todo.status !== filter.status)
       return false;
-    if (filter.phase !== "all" && (todo.phase || "") !== filter.phase)
+    if (filter.phase !== "all" && normalizePhase(todo.phase || "") !== filter.phase)
       return false;
     return true;
   }
@@ -2722,9 +3090,9 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       return;
     paint();
   }
-  function paintSummary() {
+  function workspaceCounts() {
     let doing = 0, pending = 0, done = 0, blocked = 0, total = 0;
-    const byPhase = new Map;
+    const byPhase = {};
     for (const meta of agenda) {
       if (Number.isFinite(meta.total)) {
         total += meta.total;
@@ -2733,7 +3101,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         pending += meta.pending || 0;
         blocked += meta.blocked || 0;
         for (const [phase, count] of Object.entries(meta.byPhase || {})) {
-          byPhase.set(phase, (byPhase.get(phase) || 0) + count);
+          byPhase[phase] = (byPhase[phase] || 0) + count;
         }
         continue;
       }
@@ -2755,15 +3123,132 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed"))
           blocked += 1;
         const phase = todo.phase || "";
-        byPhase.set(phase, (byPhase.get(phase) || 0) + 1);
+        byPhase[phase] = (byPhase[phase] || 0) + 1;
       }
     }
-    const ungrouped = byPhase.get("") || 0;
-    const phaseChips = globalPhases.map((phase) => {
-      const index = globalPhases.indexOf(phase);
-      return `<span class="pg"><i style="background:${colorAt(index)}"></i>${esc(phase)} <b>${byPhase.get(phase) || 0}</b></span>`;
-    }).join("") + (ungrouped ? `<span class="pg"><i style="background:${colorAt(-1)}"></i>${esc(UNGROUPED2)} <b>${ungrouped}</b></span>` : "");
-    el2("summary").innerHTML = `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${doing} 进行中</span>` + `<span>○ ${pending} 待办</span><span class="blocked">⛓ ${blocked} 受阻</span><span>✓ ${done} 完成</span>` + `<span>共 ${total} 项</span></div>` + `<div class="phases"><span style="color:var(--b-muted)">阶段分布</span>${phaseChips}</div>`;
+    return { byPhase, stats: { doing, pending, done, blocked, total } };
+  }
+  function phaseChipHtml(row) {
+    const on = filter.phase === row.key ? " on" : "";
+    return `<button type="button" class="ph-chip${on}" data-phase="${esc(row.key)}" title="${esc(row.key)} · ${esc(row.family)}">` + `<i style="background:${colorAt(row.colorIndex)}"></i><span>${esc(row.label)}</span><b>${row.count}</b></button>`;
+  }
+  function familyChipHtml(group) {
+    const on = phaseView.openFamily === group.family ? " on" : "";
+    return `<button type="button" class="ph-fam${on}" data-family="${esc(group.family)}" title="展开 ${esc(group.family)}">` + `<i style="background:${colorAt(familyIndex(group.family))}"></i>${esc(group.family)}<b>${group.count}</b>` + `<span class="ph-caret">${on ? "◂" : "▸"}</span></button>`;
+  }
+  function paintSummary() {
+    const { byPhase, stats } = workspaceCounts();
+    const { rows, ungrouped } = buildRows(byPhase, {
+      aliases: taxonomy.aliases,
+      familyMap: taxonomy.familyMap,
+      pinned: taxonomy.pinned,
+      sort: phaseView.sort,
+      showEmpty: phaseView.showEmpty
+    });
+    const groups = groupFamilies(rows);
+    const unknownCount = unknownNames(byPhase, taxonomyStore, Number.MAX_SAFE_INTEGER).length;
+    const openGroup = phaseView.openFamily ? groups.find((group) => group.family === phaseView.openFamily) || null : null;
+    if (phaseView.openFamily && !openGroup)
+      phaseView.openFamily = "";
+    const budget = phaseView.expanded ? rows.length : TOP_N;
+    const { shown, hidden } = openGroup ? { shown: openGroup.rows, hidden: 0 } : splitTop(rows, budget);
+    const seg = (mode, label) => `<button type="button" class="ph-seg${phaseView.sort === mode ? " on" : ""}" data-sort="${mode}">${label}</button>`;
+    const more = hidden ? `<button type="button" class="ph-more" data-expand>+ ${hidden} 其他</button>` : phaseView.expanded && rows.length > TOP_N && !openGroup ? `<button type="button" class="ph-more" data-collapse>收起</button>` : "";
+    const ungroupedChip = ungrouped ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED2)}</span><b>${ungrouped}</b></span>` : "";
+    el2("summary").innerHTML = `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` + `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` + `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` + `<div class="phases"><span class="ph-label">阶段分布</span>` + `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` + `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` + `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` + (unknownCount ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` + `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>` : "") + (rows.length ? `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` : "") + `</div>` + `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` + (groups.length ? `<div class="ph-row ph-fams">` + (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") + groups.map(familyChipHtml).join("") + `</div>` : "") + (manageOpen ? `<div class="ph-manage">` + `<div class="ph-manage-head"><b>阶段管理</b>` + (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") + `<button type="button" class="ph-toggle" data-manage>收起</button></div>` + `<div class="ph-manage-list">` + rows.slice(0, 24).map((row) => `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` + `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`).join("") + `</div>` + `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` + `</div>` : "");
+  }
+  function togglePhaseFilter(key) {
+    filter.phase = filter.phase === key ? "all" : key;
+    if (controls.phase)
+      controls.phase.update({ value: filter.phase });
+    lastKey = "";
+    paintSummary();
+    paint();
+  }
+  function applyStore(next) {
+    taxonomyStore = next;
+    taxonomy = { aliases: next.aliases, familyMap: next.familyMap, pinned: next.pinned };
+  }
+  async function loadTaxonomy() {
+    if (taxonomyLoaded || !host)
+      return;
+    taxonomyLoaded = true;
+    try {
+      applyStore(parseStore(await host.storage.get(TAXONOMY_KEY)));
+    } catch {
+      applyStore(emptyStore());
+    }
+  }
+  async function saveTaxonomy() {
+    try {
+      await host.storage.set(TAXONOMY_KEY, taxonomyStore);
+    } catch {}
+  }
+  function maybeClassify() {
+    if (classifying || !host || typeof host.generate !== "function")
+      return;
+    if (document.hidden || sessionBusy)
+      return;
+    if (Date.now() - aiArmedAt < IDLE_AI_MS)
+      return;
+    const { byPhase } = workspaceCounts();
+    const names = unknownNames(byPhase, taxonomyStore);
+    if (!names.length)
+      return;
+    const hash = hashNames(names);
+    if (!gate(taxonomyStore, hash, Date.now()).ok)
+      return;
+    runClassify(names, hash);
+  }
+  async function runClassify(names, hash) {
+    if (classifying || !names.length)
+      return;
+    classifying = true;
+    paintSummary();
+    try {
+      const { system, prompt } = buildPrompt(names, taxonomyStore);
+      const result = await host.generate({ prompt, system, maxOutputTokens: 2000 });
+      const answer = parseAnswer(result && result.text, names);
+      if (!answer.map.length)
+        throw new Error("EMPTY_ANSWER");
+      applyStore(mergeStore(taxonomyStore, answer, hash, Date.now()));
+      await saveTaxonomy();
+    } catch (error) {
+      const code = String(error && error.code || "");
+      applyStore(failStore(taxonomyStore, Date.now(), code === "NO_MODEL" ? "no-model" : ""));
+      await saveTaxonomy();
+      if (!aiToastShown && (code === "NO_MODEL" || code === "PERMISSION_DENIED" || code === "UNSUPPORTED")) {
+        aiToastShown = true;
+        host.toast({ kind: "info", message: "未配置 Small Model，阶段归类暂用内置规则。" });
+      }
+    } finally {
+      classifying = false;
+      lastKey = "";
+      refresh();
+    }
+  }
+  function runClassifyNow() {
+    const { byPhase } = workspaceCounts();
+    const names = unknownNames(byPhase, taxonomyStore);
+    if (!names.length)
+      return;
+    runClassify(names, hashNames(names));
+  }
+  async function undoClassification() {
+    if (!taxonomyStore.previous)
+      return;
+    applyStore(rollbackStore(taxonomyStore, Date.now()));
+    await saveTaxonomy();
+    lastKey = "";
+    await refresh();
+  }
+  function togglePin(key, on) {
+    const pinned = taxonomyStore.pinned.filter((name) => name !== key);
+    if (on)
+      pinned.push(key);
+    applyStore({ ...taxonomyStore, pinned });
+    saveTaxonomy();
+    paintSummary();
   }
   function paintDetails() {
     for (const handle of detailHandles)
@@ -2904,14 +3389,106 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const previous = archive;
     await commitArchive(withoutArchived(archive, [sessionID]), previous, "已恢复 1 个会话", "已恢复 1 个会话。");
   }
-  async function archiveFinished() {
-    const ids = finishedSessionIDs(allMetas, archive, currentID);
-    if (!ids.length) {
-      host.toast({ kind: "info", message: "没有已完成的会话可归档。" });
+  async function archiveChosen(ids) {
+    if (!ids.length)
+      return;
+    archiveOpen = false;
+    staleIncluded = false;
+    renderArchivePopover();
+    const previous = archive;
+    await commitArchive(withArchived(archive, ids, Date.now()), previous, `已归档 ${ids.length} 个会话`, `已归档 ${ids.length} 个会话，可在「已归档」里恢复。`);
+  }
+  var idsOf = (list) => list.map((item) => item.sessionID);
+  function paintArchiveControl() {
+    const total = candidates.finished.length + candidates.stale.length;
+    if (controls.archive)
+      controls.archive.update({ label: total ? `归档候选 ${total}` : "归档候选 0" });
+    if (archiveOpen)
+      renderArchivePopover();
+  }
+  function onOutsidePointer(event) {
+    const hostEl = el2("archiveHost");
+    if (hostEl && event.target instanceof Node && hostEl.contains(event.target))
+      return;
+    closeArchivePopover();
+  }
+  function closeArchivePopover() {
+    archiveOpen = false;
+    const hostEl = el2("archiveHost");
+    const pop = hostEl ? hostEl.querySelector(".arch-pop") : null;
+    if (pop)
+      pop.remove();
+    document.removeEventListener("pointerdown", onOutsidePointer, true);
+  }
+  function toggleArchivePopover() {
+    if (archiveOpen) {
+      closeArchivePopover();
       return;
     }
-    const previous = archive;
-    await commitArchive(withArchived(archive, ids, Date.now()), previous, `已归档 ${ids.length} 个会话`, `已归档 ${ids.length} 个已完成会话，可在「已归档」里恢复。`);
+    archiveOpen = true;
+    renderArchivePopover();
+    document.addEventListener("pointerdown", onOutsidePointer, true);
+  }
+  function renderArchivePopover() {
+    const hostEl = el2("archiveHost");
+    if (!hostEl)
+      return;
+    let pop = hostEl.querySelector(".arch-pop");
+    if (!archiveOpen) {
+      if (pop)
+        pop.remove();
+      return;
+    }
+    if (!pop) {
+      pop = document.createElement("div");
+      pop.className = "arch-pop";
+      pop.setAttribute("role", "dialog");
+      pop.setAttribute("aria-label", "归档");
+      hostEl.append(pop);
+    }
+    const fin = candidates.finished.length;
+    const stale = candidates.stale.length;
+    const all = fin + (staleIncluded ? stale : 0);
+    pop.innerHTML = `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` + `<span>已完成 ${fin} · 超期 ${stale}</span></div>` + `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` + `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` + `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` + `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` + `<div class="ap-hint">未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` + `<div class="ap-hr"></div>` + `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` + `<span class="ap-l">自动归档已完成</span></label>` + `<div class="ap-row ap-days"><span>超过</span>` + `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` + `<span>天</span></div>` + `<div class="ap-hr"></div>` + `<div class="ap-actions">` + `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>仅归档已完成 ${fin}</button>` + (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn pri">全部归档 ${all}</button>` : "") + `</div>`;
+    const staleBox = pop.querySelector("#apStale");
+    if (staleBox) {
+      staleBox.addEventListener("change", () => {
+        staleIncluded = staleBox.checked;
+        renderArchivePopover();
+      });
+    }
+    const autoBox = pop.querySelector("#apAuto");
+    if (autoBox) {
+      autoBox.addEventListener("change", () => {
+        prefs.auto = autoBox.checked;
+        savePrefs();
+        lastKey = "";
+        refresh();
+      });
+    }
+    const daysInput = pop.querySelector("#apDays");
+    if (daysInput) {
+      daysInput.addEventListener("change", () => {
+        const next = clampDays(daysInput.value, prefs.days);
+        daysInput.value = String(next);
+        if (next === prefs.days)
+          return;
+        prefs.days = next;
+        savePrefs();
+        lastKey = "";
+        refresh();
+      });
+    }
+    const finishedButton = pop.querySelector("#apFinished");
+    if (finishedButton)
+      finishedButton.addEventListener("click", () => {
+        archiveChosen(idsOf(candidates.finished));
+      });
+    const allButton = pop.querySelector("#apAll");
+    if (allButton)
+      allButton.addEventListener("click", () => {
+        archiveChosen([...idsOf(candidates.finished), ...idsOf(candidates.stale)]);
+      });
   }
   async function restoreAllArchived() {
     const ids = archived.map((meta) => meta.sessionID);
@@ -2944,8 +3521,15 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   function updatePhaseOptions() {
     if (!controls.phase)
       return;
-    const options = [{ id: "all", label: "全部阶段" }, ...globalPhases.map((phase) => ({ id: phase, label: phase }))];
-    controls.phase.update({ options });
+    const { byPhase } = workspaceCounts();
+    const { rows } = buildRows(byPhase, { aliases: taxonomy.aliases, familyMap: taxonomy.familyMap, showEmpty: false });
+    const options = [{ id: "all", label: "全部阶段" }];
+    for (const row of rows)
+      options.push({ id: row.key, label: `${row.label} (${row.count})` });
+    if (filter.phase !== "all" && !rows.some((row) => row.key === filter.phase)) {
+      options.push({ id: filter.phase, label: filter.phase });
+    }
+    controls.phase.update({ options, value: filter.phase });
   }
   function mountToolbar() {
     controls.search = mountSearchField(el2("searchHost"), {
@@ -3016,25 +3600,71 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       }
     });
     controls.archive = mountButton(el2("archiveHost"), {
-      label: "批量归档已完成",
+      label: "归档候选 0",
       variant: "secondary",
       size: "sm",
       onClick: () => {
-        archiveFinished();
-      }
-    });
-    controls.auto = mountCheckbox(el2("autoArchiveHost"), {
-      label: "自动归档已完成",
-      checked: prefs.auto,
-      onChange: (checked) => {
-        prefs.auto = checked;
-        controls.auto.update({ checked });
-        savePrefs();
-        lastKey = "";
-        refresh();
+        toggleArchivePopover();
       }
     });
     el2("sessions").addEventListener("scroll", onSessionsScroll, { passive: true });
+    el2("summary").addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target)
+        return;
+      const chip = target.closest("[data-phase]");
+      if (chip) {
+        togglePhaseFilter(chip.dataset.phase);
+        return;
+      }
+      const family = target.closest("[data-family]");
+      if (family) {
+        phaseView.openFamily = phaseView.openFamily === family.dataset.family ? "" : family.dataset.family;
+        paintSummary();
+        return;
+      }
+      const sort = target.closest("[data-sort]");
+      if (sort) {
+        phaseView.sort = sort.dataset.sort;
+        paintSummary();
+        return;
+      }
+      if (target.closest("[data-show-empty]")) {
+        phaseView.showEmpty = !phaseView.showEmpty;
+        paintSummary();
+        return;
+      }
+      if (target.closest("[data-expand]")) {
+        phaseView.expanded = true;
+        paintSummary();
+        return;
+      }
+      if (target.closest("[data-collapse]")) {
+        phaseView.expanded = false;
+        paintSummary();
+        return;
+      }
+      if (target.closest("[data-classify]")) {
+        runClassifyNow();
+        return;
+      }
+      if (target.closest("[data-manage]")) {
+        manageOpen = !manageOpen;
+        paintSummary();
+        return;
+      }
+      if (target.closest("[data-undo-classify]")) {
+        undoClassification();
+        return;
+      }
+    });
+    el2("summary").addEventListener("change", (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const box = target ? target.closest("[data-pin]") : null;
+      if (!box)
+        return;
+      togglePin(box.dataset.pin, box.checked);
+    });
     el2("sessions").addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target)
@@ -3100,6 +3730,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   async function refresh() {
     if (!host)
       return;
+    if (!taxonomyLoaded)
+      await loadTaxonomy();
     let metas;
     try {
       metas = await readIndexMetas();
@@ -3120,15 +3752,12 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     let nextArchive = parseArchive(rawArchive);
     try {
       const stored = parsePrefs(await host.storage.get(PREFS_KEY));
-      if (stored.auto !== prefs.auto) {
+      if (stored.auto !== prefs.auto || stored.days !== prefs.days)
         prefs = stored;
-        if (controls.auto)
-          controls.auto.update({ checked: prefs.auto });
-      }
     } catch {}
     if (prefs.auto && readOk && !sweepPaused) {
       const now = Date.now();
-      const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk });
+      const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk, days: prefs.days });
       if (ids.length) {
         const merged = await sweepArchive(ids, now);
         if (merged)
@@ -3149,11 +3778,24 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
           phases.push(phase);
         }
     }
-    const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount, prefs.auto, hold]);
+    candidates = archiveCandidates(metas, nextArchive, { keep: keepIDs(), hold, now: Date.now(), days: prefs.days });
+    const key = JSON.stringify([
+      metas,
+      loadedCount,
+      filter,
+      currentID,
+      nextArchive,
+      showArchived,
+      archivedLoadedCount,
+      prefs.auto,
+      prefs.days,
+      hold,
+      candidates.finished.length,
+      candidates.stale.length
+    ]);
     if (key === lastKey)
       return;
     lastKey = key;
-    const phasesChanged = JSON.stringify(phases) !== JSON.stringify(globalPhases);
     allMetas = metas;
     archive = nextArchive;
     const split = partition(metas, archive, currentID);
@@ -3166,10 +3808,9 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         filter.session = "all";
     }
     updateSessionOptions();
-    if (phasesChanged)
-      updatePhaseOptions();
-    el2("legend").innerHTML = globalPhases.map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`).join("");
+    updatePhaseOptions();
     paintSummary();
+    paintArchiveControl();
     await renderBoard();
   }
   var pollDelay = () => sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS;
@@ -3183,6 +3824,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     timer = null;
     try {
       await refresh();
+      maybeClassify();
     } finally {
       arm();
     }
@@ -3206,6 +3848,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     if (!polling)
       return;
+    aiArmedAt = Date.now();
     refresh();
     arm();
   });

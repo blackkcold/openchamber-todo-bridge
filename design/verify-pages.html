@@ -165,6 +165,15 @@
           ok({ content: JSON.stringify(data) })
           return
         }
+        // The board stats the index before reading it, so a quiet poll is a stat
+        // rather than a parse. A constant mtime keeps the stub's data "unchanged".
+        if (msg.type === "file-stat") {
+          const path = (msg.payload && msg.payload.path) || ""
+          const id = path.split("/").pop().replace(/\.json$/, "")
+          if (!FILES[id]) { answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false, code: "NOT_FOUND", error: "stub: no such file" }); return }
+          ok({ kind: "file", size: 4096, mtime: 1 })
+          return
+        }
         if (msg.type === "file-list") {
           say("file-list")
           ok({ entries: Object.keys(FILES).map((name) => ({ name: `${name}.json`, kind: "file" })) })

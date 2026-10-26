@@ -5,6 +5,9 @@
 // archived, what a bulk run picks up, and how a stored value degrades when it is
 // missing, partial, or written by an older version.
 import {
+  MAX_DAYS,
+  archiveCandidates,
+  clampDays,
   emptyArchive,
   emptyPrefs,
   parseArchive,
@@ -79,12 +82,21 @@ console.log("\nfinishedSessionIDs — the bulk run")
 
 console.log("\nparsePrefs — the auto-archive preference")
 check("the default is auto on", emptyPrefs().auto === true)
+check("the default age gate is a week", emptyPrefs().days === 7)
+check("the prefs version moved to 2", emptyPrefs().version === 2)
 check("a missing value defaults to auto on", parsePrefs(undefined).auto === true)
 check("garbage defaults to auto on", parsePrefs("nope").auto === true)
 check("an array defaults to auto on", parsePrefs([]).auto === true)
 check("an explicit false is kept", parsePrefs({ version: 1, auto: false }).auto === false)
 check("an explicit true is kept", parsePrefs({ auto: true }).auto === true)
 check("a non-boolean auto defaults to on", parsePrefs({ auto: "no" }).auto === true)
+check("a v1 document migrates to no age gate", parsePrefs({ version: 1, auto: true }).days === 0)
+check("a v2 days value is kept", parsePrefs({ version: 2, auto: true, days: 3 }).days === 3)
+check("a negative days value clamps to 0", parsePrefs({ version: 2, days: -4 }).days === 0)
+check("a huge days value clamps to the cap", parsePrefs({ version: 2, days: 9999 }).days === MAX_DAYS)
+check("a fractional days value floors", parsePrefs({ version: 2, days: 2.9 }).days === 2)
+check("a non-numeric days falls back to a week", parsePrefs({ version: 2, days: "3" }).days === 7)
+check("clampDays keeps the fallback for garbage", clampDays(undefined, 0) === 0)
 
 console.log("\nautoArchiveIDs — the silent sweep")
 {
@@ -103,6 +115,36 @@ console.log("\nautoArchiveIDs — the silent sweep")
   const before = emptyArchive()
   autoArchiveIDs(metas, before, { now: 100, readOk: true })
   check("the sweep does not mutate its inputs", Object.keys(before.sessions).length === 0)
+}
+
+console.log("\narchiveCandidates — the two lists the board shows")
+{
+  const DAY = 86400000
+  const now = 10 * DAY
+  const finished = (id, daysAgo, extra = {}) =>
+    meta(id, now - daysAgo * DAY, { total: 2, done: 2, doing: 0, pending: 0, ...extra })
+  const open = (id, daysAgo, extra = {}) =>
+    meta(id, now - daysAgo * DAY, { total: 2, done: 1, doing: 1, pending: 0, ...extra })
+  const metas = [finished("old-fin", 9), finished("new-fin", 2), open("old-open", 30), open("new-open", 1)]
+  const run = (opts = {}) => archiveCandidates(metas, emptyArchive(), { now, days: 7, ...opts })
+  const names = (list) => list.map((item) => item.sessionID).join(",")
+
+  check("a finished session past the threshold is a candidate", names(run().finished) === "old-fin")
+  check("a finished session inside the threshold is not", !names(run().finished).includes("new-fin"))
+  check("an open session past the threshold is only stale", names(run().stale) === "old-open")
+  check("an open session inside the threshold is not listed", !names(run().stale).includes("new-open"))
+  check("the two lists never overlap", run().finished.every((item) => !names(run().stale).includes(item.sessionID)))
+  check("the age is reported in whole days", run().finished[0].ageDays === 9)
+  check("the threshold is inclusive at exactly N days", names(archiveCandidates([finished("edge", 7)], emptyArchive(), { now, days: 7 }).finished) === "edge")
+  check("one day under the threshold is out", archiveCandidates([finished("edge", 7)], emptyArchive(), { now, days: 8 }).finished.length === 0)
+  check("days 0 keeps every finished session (v1 behaviour)", archiveCandidates([finished("fresh", 0)], emptyArchive(), { now, days: 0 }).finished.length === 1)
+  check("a blocked session is never suggested", archiveCandidates([finished("blk", 30, { blocked: 2 })], emptyArchive(), { now, days: 7 }).finished.length === 0)
+  check("a blocked open session is never suggested", archiveCandidates([open("blk2", 30, { blocked: 1 })], emptyArchive(), { now, days: 7 }).stale.length === 0)
+  check("a held session is skipped", run({ hold: { "old-fin": now - DAY } }).finished.length === 0)
+  check("a kept session is skipped", run({ keep: ["old-fin", "old-open"] }).finished.length === 0 && run({ keep: ["old-fin", "old-open"] }).stale.length === 0)
+  check("an already-archived session is skipped", archiveCandidates(metas, { version: 1, sessions: { "old-fin": now } }, { now, days: 7 }).finished.length === 0)
+  check("a future stamp is skipped", archiveCandidates([finished("future", -1)], emptyArchive(), { now, days: 7 }).finished.length === 0)
+  check("a candidate list is never built without a threshold default", archiveCandidates([finished("x", 3)], emptyArchive(), { now }).finished.length === 1)
 }
 
 console.log("\nwithArchived / withoutArchived — pure edits")
