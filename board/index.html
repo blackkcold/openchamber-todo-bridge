@@ -29,11 +29,48 @@
       #sessionHost { min-width: 180px; }
       #viewHost { min-width: 120px; }
       #statusHost, #phaseHost { min-width: 130px; }
-      #finishedHost, #autoArchiveHost { flex: 0 0 auto; }
-      #archiveHost { flex: 0 0 auto; }
-      #legend { display: flex; flex-wrap: wrap; gap: 2px 10px; color: var(--b-muted); font-size: 11px; margin-left: auto; }
-      .lg { display: inline-flex; align-items: center; gap: 4px; }
-      .lg > i { width: 8px; height: 8px; border-radius: 999px; }
+      #finishedHost { flex: 0 0 auto; }
+      #archiveHost { flex: 0 0 auto; position: relative; }
+      /* the archive control: one button whose label is the candidate count, and a
+         popover holding the sweep switch, its age threshold and the bulk runs */
+      .arch-pop {
+        position: absolute; top: calc(100% + 8px); right: 0; z-index: 50;
+        width: 320px; max-width: calc(100vw - 28px); padding: 10px;
+        border: 1px solid var(--b-border); border-radius: 10px;
+        background: var(--oc-elevated, var(--oc-bg, #fff)); color: var(--oc-elevated-fg, var(--b-fg));
+        box-shadow: 0 10px 28px rgba(0, 0, 0, .18);
+        display: flex; flex-direction: column; gap: 6px; font-size: 11px;
+      }
+      .arch-pop .ap-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+      .arch-pop .ap-head b { font-size: 12px; }
+      .arch-pop .ap-head > span { margin-left: auto; color: var(--b-muted); }
+      .arch-pop .ap-row { display: flex; align-items: center; gap: 6px; min-height: 22px; }
+      .arch-pop .ap-l { flex: 1 1 auto; min-width: 0; }
+      .arch-pop .ap-n { font-variant-numeric: tabular-nums; }
+      .arch-pop .ap-tag {
+        flex: 0 0 auto; font-size: 10px; color: var(--b-muted);
+        border: 1px solid var(--b-border); border-radius: 999px; padding: 0 6px;
+      }
+      .arch-pop .ap-tag.manual { color: var(--oc-warning-text, var(--oc-warning, #b7791f)); border-color: currentColor; }
+      .arch-pop .ap-check { cursor: pointer; }
+      .arch-pop .ap-check.muted { opacity: .5; }
+      .arch-pop .ap-check input { margin: 0; flex: 0 0 auto; }
+      .arch-pop .ap-hint { color: var(--b-muted); font-size: 10px; line-height: 1.45; padding-left: 20px; }
+      .arch-pop .ap-hr { height: 1px; background: var(--b-border); margin: 2px 0; }
+      .arch-pop .ap-days { color: var(--b-muted); }
+      .arch-pop .ap-days input {
+        width: 52px; font: inherit; text-align: center; padding: 2px 4px;
+        border: 1px solid var(--b-border); border-radius: 5px;
+        background: var(--oc-bg, transparent); color: var(--b-fg);
+      }
+      .arch-pop .ap-actions { display: flex; gap: 6px; justify-content: flex-end; }
+      .arch-pop .ap-btn {
+        font: inherit; font-size: 11px; padding: 3px 10px; cursor: pointer;
+        border: 1px solid var(--b-border); border-radius: 6px;
+        background: none; color: var(--b-fg);
+      }
+      .arch-pop .ap-btn.pri { background: var(--oc-primary, #205ea6); border-color: transparent; color: var(--oc-primary-fg, #fff); }
+      .arch-pop .ap-btn:disabled { opacity: .45; cursor: default; }
 
       #summary {
         flex: 0 0 auto; padding: 10px 14px; border-bottom: 1px solid var(--b-border);
@@ -42,10 +79,61 @@
       #summary .stats { display: flex; gap: 16px; flex-wrap: wrap; color: var(--b-muted); align-items: baseline; }
       #summary .stats b { color: var(--b-fg); }
       #summary .blocked { color: var(--oc-error, #af3029); }
-      #summary .phases { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
-      #summary .pg { display: inline-flex; align-items: center; gap: 5px; color: var(--b-muted); }
-      #summary .pg > i { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 auto; }
-      #summary .pg > b { color: var(--b-fg); font-weight: 600; }
+      #summary .phases { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-size: 11px; color: var(--b-muted); }
+      #summary .ph-tools { display: inline-flex; border: 1px solid var(--b-border); border-radius: 6px; overflow: hidden; }
+      #summary .ph-seg {
+        font: inherit; font-size: 10px; padding: 1px 7px; border: 0; background: none;
+        color: var(--b-muted); cursor: pointer;
+      }
+      #summary .ph-seg.on { background: var(--oc-hover, rgba(0, 0, 0, .07)); color: var(--b-fg); }
+      #summary .ph-toggle {
+        font: inherit; font-size: 10px; padding: 1px 7px; cursor: pointer;
+        border: 1px solid var(--b-border); border-radius: 6px; background: none; color: var(--b-muted);
+      }
+      #summary .ph-toggle.on { color: var(--b-fg); border-color: var(--b-fg); }
+      #summary .ph-row { display: flex; flex-wrap: wrap; gap: 3px 6px; align-items: center; }
+      #summary .ph-chip, #summary .ph-fam, #summary .ph-more, #summary .ph-back {
+        display: inline-flex; align-items: center; gap: 4px; font: inherit; font-size: 11px;
+        padding: 1px 7px; border: 1px solid transparent; border-radius: 999px;
+        background: var(--oc-subtle, rgba(0, 0, 0, .03)); color: var(--b-fg); cursor: pointer;
+      }
+      #summary .ph-chip:hover, #summary .ph-fam:hover { border-color: var(--b-border); }
+      #summary .ph-chip.on {
+        border-color: var(--oc-primary, #205ea6);
+        background: color-mix(in srgb, var(--oc-primary, #205ea6) 12%, transparent);
+      }
+      #summary .ph-chip.static { cursor: default; }
+      #summary .ph-chip > i { width: 6px; height: 6px; border-radius: 999px; flex: 0 0 auto; }
+      #summary .ph-chip > b, #summary .ph-fam > b {
+        color: var(--b-muted); font-weight: 500; font-variant-numeric: tabular-nums; font-size: 10px;
+      }
+      #summary .ph-fam { border-color: var(--b-border); background: none; }
+      #summary .ph-fam > i { width: 3px; align-self: stretch; min-height: 12px; border-radius: 2px; flex: 0 0 auto; }
+      #summary .ph-fam.on { border-color: var(--b-fg); }
+      #summary .ph-caret { color: var(--b-muted); font-size: 9px; }
+      #summary .ph-more { color: var(--oc-primary, #205ea6); border: 1px dashed var(--b-border); background: none; }
+      #summary .ph-back { color: var(--b-muted); border: 1px solid var(--b-border); background: none; }
+      #summary .ph-none { color: var(--b-muted); }
+      #summary .ph-toggle.ai { color: var(--oc-primary, #205ea6); border-color: color-mix(in srgb, var(--oc-primary, #205ea6) 45%, transparent); }
+      #summary .ph-toggle:disabled { opacity: .6; cursor: default; }
+      #summary .ph-manage {
+        display: flex; flex-direction: column; gap: 6px; padding: 8px 10px;
+        border: 1px solid var(--b-border); border-radius: 8px;
+        background: var(--oc-subtle, rgba(0, 0, 0, .03));
+      }
+      #summary .ph-manage-head { display: flex; align-items: center; gap: 8px; }
+      #summary .ph-manage-head b { font-size: 11px; }
+      #summary .ph-manage-head .ph-toggle:first-of-type { margin-left: auto; }
+      #summary .ph-manage-list {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 2px 12px;
+        max-height: 180px; overflow-y: auto;
+      }
+      #summary .ph-manage-row { display: flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer; }
+      #summary .ph-manage-row input { margin: 0; flex: 0 0 auto; }
+      #summary .ph-manage-row > span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #summary .ph-manage-row > b { color: var(--b-muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+      #summary .ph-manage-row > i { font-style: normal; color: var(--b-muted); font-size: 10px; width: 3.6em; text-align: right; }
+      #summary .ph-hint { color: var(--b-muted); font-size: 10px; line-height: 1.45; }
 
       #main { flex: 1 1 auto; min-height: 0; display: flex; }
       #sessions { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 12px 16px; }
@@ -141,9 +229,7 @@
         <div id="statusHost"></div>
         <div id="phaseHost"></div>
         <div id="finishedHost"></div>
-        <div id="autoArchiveHost"></div>
         <div id="archiveHost"></div>
-        <div id="legend"></div>
       </div>
       <div id="summary"></div>
       <div id="main">

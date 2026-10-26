@@ -1,6 +1,6 @@
 {
   "name": "openchamber-todo-bridge",
-  "version": "0.9.9",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -21,7 +21,7 @@
         "entry": "board/index.html",
         "title": "任务图"
       },
-      "capabilities": ["sessions"],
+      "capabilities": ["sessions", "model"],
       "statusSection": {
         "entry": "status/index.html",
         "title": "Todos",
@@ -37,7 +37,7 @@
     "build": "bun run scripts/build.ts",
     "test-extension": "bun run scripts/build-test-extension.ts",
     "validate": "bun run scripts/validate.ts",
-    "test": "node scripts/test-plugin.mjs && node scripts/test-context.mjs && node scripts/test-state.mjs && node scripts/test-cache.mjs && node scripts/test-index-state.mjs && node scripts/test-viewport.mjs && node scripts/test-graph.mjs && node scripts/test-dag.mjs && node scripts/test-index.mjs && node scripts/test-archive.mjs && node scripts/test-install.mjs && node scripts/test-build.mjs",
+    "test": "node scripts/test-plugin.mjs && node scripts/test-context.mjs && node scripts/test-state.mjs && node scripts/test-cache.mjs && node scripts/test-index-state.mjs && node scripts/test-viewport.mjs && node scripts/test-graph.mjs && node scripts/test-dag.mjs && node scripts/test-index.mjs && node scripts/test-archive.mjs && node scripts/test-taxonomy.mjs && node scripts/test-taxonomy-ai.mjs && node scripts/test-install.mjs && node scripts/test-build.mjs",
     "cache-audit": "node --no-warnings scripts/cache-audit.mjs"
   },
   "devDependencies": {

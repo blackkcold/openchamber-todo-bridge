@@ -14,7 +14,8 @@ Visualize OpenCode todos in OpenChamber: a live task tree for the current sessio
 
 - Restores `todowrite` / `todoread` for OpenCode v2 and displays session todos in OpenChamber.
 - Groups nested tasks into a tree; `phase` adds colour-coded stages, and unfinished dependencies are marked blocked.
-- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — manual, and optionally automatic for finished sessions.
+- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — manual, and optionally automatic once a finished session passes an age threshold (7 days by default; configurable, 0–365).
+- Keeps the board readable as phase names accumulate: cosmetic folding, rule-based families (优先级 / 批次 / 质量 / 发版 / 界面 / 实现), count-sorted and collapsible chips, pinning, and a one-shot Small Model pass that groups the long tail — the model only ever sees a list of words, never a session.
 
 ## Install
 
@@ -24,7 +25,33 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.9` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.0` to the URL.
+
+### v1.0.0 — everything in its place
+
+Finished sessions no longer leave the board only through a single "all finished"
+rule. A finished session now has to pass an age threshold — seven days by default,
+editable on the board, 0 to 365 — and the number of candidates sits on the toolbar
+button itself. A session that is overdue but still has open work is **counted, never
+swept**: hiding unfinished work is how work gets lost. Sessions with a blocked task
+are left alone for the same reason. The old preference migrates to a threshold of 0,
+so an upgrading reader sees exactly the behaviour they had.
+
+Phase names accumulate: every session invents its own, and the board used to lay all
+of them out side by side, half of them at zero. They are now folded first (full-width
+characters, stray spaces and punctuation), then sorted into six families by rule —
+优先级, 批次, 质量, 发版, 界面, 实现. Zero-count phases are hidden by default, the tail
+collapses behind "+N 其他", a family chip drills into its own phases, and a chip is now
+a filter rather than a statistic. Pins and ordering live in the extension's own
+storage; nothing is written back to a mirror.
+
+What the rules cannot place goes to OpenChamber's Small Model, once. It receives a
+list of words — no session, no history, no tools, nothing that could touch a
+conversation. Each batch is asked about once and the answer is frozen; the panel can
+roll one version back. Four gates (unchanged batch, cooldown, daily cap, failure
+backoff) plus a five-second idle window mean a quiet board spends nothing. This is the
+`model` permission, and an upgrade asks for it once more; declining simply leaves the
+tail in 其他.
 
 ### v0.9.9 — a ghost with a shape
 
@@ -175,6 +202,7 @@ changed, finished, and empty lists.
 - OpenCode v2
 - OpenChamber desktop or web, version 2.0.4 or later
 - `filesystem` for todo data and the OpenCode plugin directory; `sessions` to open the session a task belongs to
+- `model` is optional in practice: it lets the board ask OpenChamber's Small Model to group phase names the built-in rules could not place. It is one request per new batch of words, outside any session (no history, no tools), and the result is stored locally. Phase names are the only thing sent. Without it — or without a Small Model configured — the board falls back to the rules and says so once.
 
 ## Development
 

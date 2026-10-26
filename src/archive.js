@@ -23,11 +23,17 @@
 export const ARCHIVE_KEY = "archive"
 /** The stored document's shape version, for a future migration. */
 export const ARCHIVE_VERSION = 1
-/** A second key for the reader's archive preferences (`{ auto }`). Kept apart from
- *  the archive document so a preference never has to be taught to `parseArchive`. */
+/** A second key for the reader's archive preferences (`{ auto, days }`). Kept apart
+ *  from the archive document so a preference never has to be taught to
+ *  `parseArchive`. */
 export const PREFS_KEY = "archive:prefs"
-/** The preferences document's shape version. */
-export const PREFS_VERSION = 1
+/** The preferences document's shape version. v2 added the age threshold. */
+export const PREFS_VERSION = 2
+/** How long a finished session stays in "recent" before the sweep sets it aside. */
+export const DEFAULT_DAYS = 7
+/** The farthest an age threshold may reach. A year is already "all of it". */
+export const MAX_DAYS = 365
+const DAY_MS = 86400000
 
 /** An empty archive: what a missing, unreadable, or unknown value becomes. */
 export function emptyArchive() {
@@ -54,20 +60,33 @@ export function parseArchive(raw) {
   return out
 }
 
-/** The default preferences: automatic archiving is on. */
+/** The default preferences: automatic archiving is on, after a week. */
 export function emptyPrefs() {
-  return { version: PREFS_VERSION, auto: true }
+  return { version: PREFS_VERSION, auto: true, days: DEFAULT_DAYS }
+}
+
+/** A whole number of days, clamped to a range a threshold can actually mean. */
+export function clampDays(value, fallback = DEFAULT_DAYS) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(MAX_DAYS, Math.max(0, Math.floor(n)))
 }
 
 /**
  * Normalise a stored preferences value. Defensive like `parseArchive`: anything
  * that is not a boolean `auto` (a missing value, a string, an array) leaves the
  * default in place, so an unknown value never turns the sweep on or off by surprise.
+ *
+ * A v1 document has no `days`. It migrates to 0 — "no age gate" — because that is
+ * exactly what v1 did: a finished session was set aside on the next poll. Reading it
+ * as the new default of 7 would change behaviour behind the reader's back.
  */
 export function parsePrefs(raw) {
   const out = emptyPrefs()
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return out
   if (typeof raw.auto === "boolean") out.auto = raw.auto
+  if (Number.isFinite(raw.days)) out.days = clampDays(raw.days)
+  else if (raw.version === 1) out.days = 0
   return out
 }
 
@@ -113,6 +132,7 @@ export function isFullyFinished(meta) {
 /**
  * The sessions an "archive everything finished" run should set aside: every meta
  * that is not already archived, is not the session in view, and has no open work.
+ * No age gate: this is the reader asking for it explicitly.
  */
 export function finishedSessionIDs(metas, entry, keepActiveID) {
   const ids = []
@@ -125,36 +145,63 @@ export function finishedSessionIDs(metas, entry, keepActiveID) {
 }
 
 /**
- * The sessions an automatic sweep should set aside: fully finished, not already
- * archived, kept in view, or held, and not stamped with a future time. Pure, so
- * the board's trigger stays a thin wrapper and every guard runs under Node.
+ * The two candidate lists the board shows and the sweep acts on.
+ *
+ * - `finished` — no open work and older than `days`: the only list the silent
+ *   sweep may write. `days: 0` means "no age gate", which is what v1 did.
+ * - `stale` — still has open work but has not moved for `days`: **counted and
+ *   listed, never archived automatically.** Hiding open work would lose it.
+ *
+ * Guards shared with the sweep: the sessions in `keep` (the open one and the one
+ * being filtered), `hold` (restored or undone, until they move again), a clock
+ * that went backwards, and anything with a blocked task — a blocked session wants
+ * attention, not filing.
+ *
+ * Pure, index-only: `meta.updatedAt` and `meta.blocked` already carry everything
+ * this needs, so a poll never opens a mirror to decide.
+ */
+export function archiveCandidates(metas, entry, opts = {}) {
+  const finished = []
+  const stale = []
+  const keep = new Set(Array.isArray(opts.keep) ? opts.keep : [])
+  const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {}
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now()
+  const days = clampDays(opts.days, 0)
+  for (const meta of Array.isArray(metas) ? metas : []) {
+    if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "") continue
+    if (keep.has(meta.sessionID)) continue
+    if (isArchived(entry, meta)) continue
+    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0
+    if (updated > now) continue
+    const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity
+    if (updated <= restored) continue
+    const age = (now - updated) / DAY_MS
+    if (age < days) continue
+    if ((meta.blocked || 0) > 0) continue
+    const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) }
+    if (isFullyFinished(meta)) finished.push(item)
+    else stale.push(item)
+  }
+  return { finished, stale }
+}
+
+/**
+ * The sessions an automatic sweep should set aside. Thin wrapper over
+ * `archiveCandidates` so the count the reader sees and the ids the sweep writes
+ * can never disagree.
  *
  * - `opts.keep` — ids to leave alone: the open session and the one being filtered.
  * - `opts.hold` — id -> the time it was restored or undone; a session stays out of
  *   the sweep until it runs `todowrite` again (its `updatedAt` passes that time).
  * - `opts.now` — the sweep time. A session updated after it (a clock that went
  *   backwards) is skipped: a stamp could never hide it, so trying would only write.
+ * - `opts.days` — the age threshold. Absent means 0, which is v1's "any finished".
  * - `opts.readOk` — false when the stored archive could not be read. Skip entirely,
  *   so an unreadable archive is never replaced with a blind set.
  */
 export function autoArchiveIDs(metas, entry, opts = {}) {
   if (!opts.readOk) return []
-  const keep = new Set(Array.isArray(opts.keep) ? opts.keep : [])
-  const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {}
-  const now = Number.isFinite(opts.now) ? opts.now : Infinity
-  const ids = []
-  for (const meta of Array.isArray(metas) ? metas : []) {
-    if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "") continue
-    if (keep.has(meta.sessionID)) continue
-    if (isArchived(entry, meta)) continue
-    if (!isFullyFinished(meta)) continue
-    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0
-    if (updated > now) continue
-    const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity
-    if (updated <= restored) continue
-    ids.push(meta.sessionID)
-  }
-  return ids
+  return archiveCandidates(metas, entry, opts).finished.map((item) => item.sessionID)
 }
 
 /** A copy of `entry` with `ids` stamped as archived at `now`. Pure. */

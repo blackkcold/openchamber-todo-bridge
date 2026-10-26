@@ -25,13 +25,28 @@ import { buildTree, INDENT, phaseColor, pruneFinished } from "./graph.js"
 import { DAG_COL, dagLayout } from "./dag.js"
 import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { parseDoc, parseIndex } from "./doc.js"
+import { TOP_N, buildRows, familyIndex, groupFamilies, normalizePhase, splitTop } from "./taxonomy.js"
+import {
+  TAXONOMY_KEY,
+  buildPrompt,
+  emptyStore,
+  failStore,
+  gate,
+  hashNames,
+  mergeStore,
+  parseAnswer,
+  parseStore,
+  rollbackStore,
+  unknownNames,
+} from "./taxonomy-ai.js"
 import {
   ARCHIVE_KEY,
   PREFS_KEY,
+  archiveCandidates,
   autoArchiveIDs,
+  clampDays,
   emptyArchive,
   emptyPrefs,
-  finishedSessionIDs,
   isArchived,
   parseArchive,
   parsePrefs,
@@ -110,7 +125,7 @@ let observers = []
 /** The last archive change, offered back as an undo for a few seconds. */
 let undo = null
 let undoTimer = null
-/** The reader's archive preferences (currently just the auto sweep), from storage. */
+/** The reader's archive preferences ({ auto, days }), from storage. */
 let prefs = emptyPrefs()
 /** id -> the time it was restored or undone: held out of the sweep until it moves. */
 const hold = {}
@@ -119,8 +134,39 @@ let readOk = false
 /** Set after a failed auto write (e.g. the document is over the size cap): stop the
  *  silent retry every poll, so a full archive is not written against every 4s. */
 let sweepPaused = false
+/**
+ * The two candidate lists, recomputed from the index on every refresh — never a
+ * mirror read. `finished` is what the sweep may write; `stale` (open work, old) is
+ * only ever counted and listed, and archived only when the reader ticks it.
+ */
+let candidates = { finished: [], stale: [] }
+/** Whether the reader ticked "include the still-open ones" in the popover. */
+let staleIncluded = false
+/** The archive popover is open. */
+let archiveOpen = false
+/**
+ * The reader's phase view: chip order, whether empty phases are drawn, whether the
+ * cloud is fully expanded, and which family is drilled into. Page state, not data.
+ */
+const phaseView = { sort: "count", showEmpty: false, expanded: false, openFamily: "" }
+/** The learned taxonomy applied to the view: label overrides, family overrides, pins. */
+let taxonomy = { aliases: {}, familyMap: {}, pinned: [] }
+/** The whole stored document (aliases, gates, rollback snapshot) behind `taxonomy`. */
+let taxonomyStore = emptyStore()
+/** The store has been read once; later refreshes reuse it, so a poll costs no read. */
+let taxonomyLoaded = false
+/** A classification request is in flight. */
+let classifying = false
+/** The "no Small Model" toast is shown once per page, not once per failure. */
+let aiToastShown = false
+/** The management panel is open. */
+let manageOpen = false
+/** When the page became visible; the automatic pass waits out a short idle first. */
+let aiArmedAt = Date.now()
 
 const ARCHIVE_UNDO_MS = 9000
+/** A freshly opened board stays quiet this long before it may ask the model. */
+const IDLE_AI_MS = 5000
 
 // ---- index metadata ----------------------------------------------------------
 
@@ -149,7 +195,9 @@ function filtering() {
 function matches(todo) {
   if (filter.query && !todo.content.toLowerCase().includes(filter.query.toLowerCase())) return false
   if (filter.status !== "all" && todo.status !== filter.status) return false
-  if (filter.phase !== "all" && (todo.phase || "") !== filter.phase) return false
+  // The cloud merges names that fold together, so the filter compares the folded
+  // form too — otherwise a chip that says "P0 止血" would match nothing.
+  if (filter.phase !== "all" && normalizePhase(todo.phase || "") !== filter.phase) return false
   return true
 }
 
@@ -479,9 +527,13 @@ async function renderBoard() {
   paint()
 }
 
-function paintSummary() {
+/**
+ * One pass over the agenda for both the stat totals and the workspace's phase
+ * counts. Index summaries carry both, so this never opens a mirror.
+ */
+function workspaceCounts() {
   let doing = 0, pending = 0, done = 0, blocked = 0, total = 0
-  const byPhase = new Map()
+  const byPhase = {}
   for (const meta of agenda) {
     if (Number.isFinite(meta.total)) {
       total += meta.total
@@ -490,7 +542,7 @@ function paintSummary() {
       pending += meta.pending || 0
       blocked += meta.blocked || 0
       for (const [phase, count] of Object.entries(meta.byPhase || {})) {
-        byPhase.set(phase, (byPhase.get(phase) || 0) + count)
+        byPhase[phase] = (byPhase[phase] || 0) + count
       }
       continue
     }
@@ -507,22 +559,204 @@ function paintSummary() {
       else if (todo.status === "pending") pending += 1
       if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
       const phase = todo.phase || ""
-      byPhase.set(phase, (byPhase.get(phase) || 0) + 1)
+      byPhase[phase] = (byPhase[phase] || 0) + 1
     }
   }
-  const ungrouped = byPhase.get("") || 0
-  const phaseChips = globalPhases
-    .map((phase) => {
-      const index = globalPhases.indexOf(phase)
-      return `<span class="pg"><i style="background:${colorAt(index)}"></i>${esc(phase)} <b>${byPhase.get(phase) || 0}</b></span>`
-    })
-    .join("") +
-    (ungrouped ? `<span class="pg"><i style="background:${colorAt(-1)}"></i>${esc(UNGROUPED)} <b>${ungrouped}</b></span>` : "")
+  return { byPhase, stats: { doing, pending, done, blocked, total } }
+}
+
+function phaseChipHtml(row) {
+  const on = filter.phase === row.key ? " on" : ""
+  return `<button type="button" class="ph-chip${on}" data-phase="${esc(row.key)}" title="${esc(row.key)} · ${esc(row.family)}">` +
+    `<i style="background:${colorAt(row.colorIndex)}"></i><span>${esc(row.label)}</span><b>${row.count}</b></button>`
+}
+
+function familyChipHtml(group) {
+  const on = phaseView.openFamily === group.family ? " on" : ""
+  return `<button type="button" class="ph-fam${on}" data-family="${esc(group.family)}" title="展开 ${esc(group.family)}">` +
+    `<i style="background:${colorAt(familyIndex(group.family))}"></i>${esc(group.family)}<b>${group.count}</b>` +
+    `<span class="ph-caret">${on ? "◂" : "▸"}</span></button>`
+}
+
+/**
+ * The phase cloud. Three densities, in the order a reader needs them: the top
+ * phases (which is what the eye wants), the families (which is what the workspace
+ * actually means), and a drill-down per family. Everything is derived from the
+ * index in one pass; nothing here costs a file read.
+ */
+function paintSummary() {
+  const { byPhase, stats } = workspaceCounts()
+  const { rows, ungrouped } = buildRows(byPhase, {
+    aliases: taxonomy.aliases,
+    familyMap: taxonomy.familyMap,
+    pinned: taxonomy.pinned,
+    sort: phaseView.sort,
+    showEmpty: phaseView.showEmpty,
+  })
+  const groups = groupFamilies(rows)
+  const unknownCount = unknownNames(byPhase, taxonomyStore, Number.MAX_SAFE_INTEGER).length
+  const openGroup = phaseView.openFamily ? groups.find((group) => group.family === phaseView.openFamily) || null : null
+  if (phaseView.openFamily && !openGroup) phaseView.openFamily = ""
+  const budget = phaseView.expanded ? rows.length : TOP_N
+  const { shown, hidden } = openGroup ? { shown: openGroup.rows, hidden: 0 } : splitTop(rows, budget)
+  const seg = (mode, label) =>
+    `<button type="button" class="ph-seg${phaseView.sort === mode ? " on" : ""}" data-sort="${mode}">${label}</button>`
+  const more = hidden
+    ? `<button type="button" class="ph-more" data-expand>+ ${hidden} 其他</button>`
+    : phaseView.expanded && rows.length > TOP_N && !openGroup
+      ? `<button type="button" class="ph-more" data-collapse>收起</button>`
+      : ""
+  const ungroupedChip = ungrouped
+    ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED)}</span><b>${ungrouped}</b></span>`
+    : ""
   el("summary").innerHTML =
-    `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${doing} 进行中</span>` +
-    `<span>○ ${pending} 待办</span><span class="blocked">⛓ ${blocked} 受阻</span><span>✓ ${done} 完成</span>` +
-    `<span>共 ${total} 项</span></div>` +
-    `<div class="phases"><span style="color:var(--b-muted)">阶段分布</span>${phaseChips}</div>`
+    `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` +
+    `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` +
+    `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` +
+    `<div class="phases"><span class="ph-label">阶段分布</span>` +
+    `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` +
+    `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` +
+    `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` +
+    (unknownCount
+      ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` +
+        `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>`
+      : "") +
+    (rows.length ? `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` : "") +
+    `</div>` +
+    `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` +
+    (groups.length
+      ? `<div class="ph-row ph-fams">` +
+        (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") +
+        groups.map(familyChipHtml).join("") +
+        `</div>`
+      : "") +
+    (manageOpen
+      ? `<div class="ph-manage">` +
+        `<div class="ph-manage-head"><b>阶段管理</b>` +
+        (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") +
+        `<button type="button" class="ph-toggle" data-manage>收起</button></div>` +
+        `<div class="ph-manage-list">` +
+        rows
+          .slice(0, 24)
+          .map((row) =>
+            `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` +
+            `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`,
+          )
+          .join("") +
+        `</div>` +
+        `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` +
+        `</div>`
+      : "")
+}
+
+/** Clicking a chip is a filter, not a stat: same phase again clears it. */
+function togglePhaseFilter(key) {
+  filter.phase = filter.phase === key ? "all" : key
+  if (controls.phase) controls.phase.update({ value: filter.phase })
+  lastKey = ""
+  paintSummary()
+  paint()
+}
+
+// ---- learned taxonomy --------------------------------------------------------
+
+/** Point the view at a store. The view never reads the store directly. */
+function applyStore(next) {
+  taxonomyStore = next
+  taxonomy = { aliases: next.aliases, familyMap: next.familyMap, pinned: next.pinned }
+}
+
+/** Read the store once per page. A host that refuses it leaves the rules only. */
+async function loadTaxonomy() {
+  if (taxonomyLoaded || !host) return
+  taxonomyLoaded = true
+  try {
+    applyStore(parseStore(await host.storage.get(TAXONOMY_KEY)))
+  } catch {
+    applyStore(emptyStore())
+  }
+}
+
+async function saveTaxonomy() {
+  try {
+    await host.storage.set(TAXONOMY_KEY, taxonomyStore)
+  } catch {
+    /* the view already applied it; a reload simply falls back to the rules */
+  }
+}
+
+/**
+ * The automatic pass. Four gates and an in-flight guard stand between a poll and a
+ * model call, so a quiet board never spends anything: the words must be new, the
+ * cooldown expired, the daily budget unspent, and no backoff pending.
+ */
+function maybeClassify() {
+  if (classifying || !host || typeof host.generate !== "function") return
+  if (document.hidden || sessionBusy) return
+  if (Date.now() - aiArmedAt < IDLE_AI_MS) return
+  const { byPhase } = workspaceCounts()
+  const names = unknownNames(byPhase, taxonomyStore)
+  if (!names.length) return
+  const hash = hashNames(names)
+  if (!gate(taxonomyStore, hash, Date.now()).ok) return
+  void runClassify(names, hash)
+}
+
+/**
+ * One request, one frozen result. The answer is validated against the exact batch,
+ * so an invented label or family is dropped instead of entering the store.
+ */
+async function runClassify(names, hash) {
+  if (classifying || !names.length) return
+  classifying = true
+  paintSummary()
+  try {
+    const { system, prompt } = buildPrompt(names, taxonomyStore)
+    const result = await host.generate({ prompt, system, maxOutputTokens: 2000 })
+    const answer = parseAnswer(result && result.text, names)
+    if (!answer.map.length) throw new Error("EMPTY_ANSWER")
+    applyStore(mergeStore(taxonomyStore, answer, hash, Date.now()))
+    await saveTaxonomy()
+  } catch (error) {
+    const code = String((error && error.code) || "")
+    applyStore(failStore(taxonomyStore, Date.now(), code === "NO_MODEL" ? "no-model" : ""))
+    await saveTaxonomy()
+    // The permission/model problem is the reader's to fix; say it once, then stay quiet.
+    if (!aiToastShown && (code === "NO_MODEL" || code === "PERMISSION_DENIED" || code === "UNSUPPORTED")) {
+      aiToastShown = true
+      host.toast({ kind: "info", message: "未配置 Small Model，阶段归类暂用内置规则。" })
+    }
+  } finally {
+    classifying = false
+    lastKey = ""
+    void refresh()
+  }
+}
+
+/** The reader asked for it: skip the gates, keep the in-flight guard. */
+function runClassifyNow() {
+  const { byPhase } = workspaceCounts()
+  const names = unknownNames(byPhase, taxonomyStore)
+  if (!names.length) return
+  void runClassify(names, hashNames(names))
+}
+
+/** Undo the last learned batch. The words go back to being unknown, and may retry. */
+async function undoClassification() {
+  if (!taxonomyStore.previous) return
+  applyStore(rollbackStore(taxonomyStore, Date.now()))
+  await saveTaxonomy()
+  lastKey = ""
+  await refresh()
+}
+
+/** Pin (or unpin) a phase: pinned rows are drawn first in every sort mode. */
+function togglePin(key, on) {
+  const pinned = taxonomyStore.pinned.filter((name) => name !== key)
+  if (on) pinned.push(key)
+  applyStore({ ...taxonomyStore, pinned })
+  void saveTaxonomy()
+  paintSummary()
 }
 
 function paintDetails() {
@@ -721,20 +955,131 @@ async function restoreSession(sessionID) {
   await commitArchive(withoutArchived(archive, [sessionID]), previous, "已恢复 1 个会话", "已恢复 1 个会话。")
 }
 
-/** Archive every session with no open work; skip the one in view and the archived. */
-async function archiveFinished() {
-  const ids = finishedSessionIDs(allMetas, archive, currentID)
-  if (!ids.length) {
-    host.toast({ kind: "info", message: "没有已完成的会话可归档。" })
-    return
-  }
+/** Archive every candidate in `ids` as one undoable edit, then close the popover. */
+async function archiveChosen(ids) {
+  if (!ids.length) return
+  archiveOpen = false
+  staleIncluded = false
+  renderArchivePopover()
   const previous = archive
   await commitArchive(
     withArchived(archive, ids, Date.now()),
     previous,
     `已归档 ${ids.length} 个会话`,
-    `已归档 ${ids.length} 个已完成会话，可在「已归档」里恢复。`,
+    `已归档 ${ids.length} 个会话，可在「已归档」里恢复。`,
   )
+}
+
+const idsOf = (list) => list.map((item) => item.sessionID)
+
+/** The button's label is the candidate count; it is the only thing a poll touches. */
+function paintArchiveControl() {
+  const total = candidates.finished.length + candidates.stale.length
+  if (controls.archive) controls.archive.update({ label: total ? `归档候选 ${total}` : "归档候选 0" })
+  if (archiveOpen) renderArchivePopover()
+}
+
+function onOutsidePointer(event) {
+  const hostEl = el("archiveHost")
+  if (hostEl && event.target instanceof Node && hostEl.contains(event.target)) return
+  closeArchivePopover()
+}
+
+function closeArchivePopover() {
+  archiveOpen = false
+  const hostEl = el("archiveHost")
+  const pop = hostEl ? hostEl.querySelector(".arch-pop") : null
+  if (pop) pop.remove()
+  document.removeEventListener("pointerdown", onOutsidePointer, true)
+}
+
+function toggleArchivePopover() {
+  if (archiveOpen) {
+    closeArchivePopover()
+    return
+  }
+  archiveOpen = true
+  renderArchivePopover()
+  document.addEventListener("pointerdown", onOutsidePointer, true)
+}
+
+/**
+ * The popover: what the two candidate lists hold, the sweep switch and its age
+ * threshold, and the two bulk actions. Rebuilt only while open — a closed popover
+ * costs nothing per poll.
+ */
+function renderArchivePopover() {
+  const hostEl = el("archiveHost")
+  if (!hostEl) return
+  let pop = hostEl.querySelector(".arch-pop")
+  if (!archiveOpen) {
+    if (pop) pop.remove()
+    return
+  }
+  if (!pop) {
+    pop = document.createElement("div")
+    pop.className = "arch-pop"
+    pop.setAttribute("role", "dialog")
+    pop.setAttribute("aria-label", "归档")
+    hostEl.append(pop)
+  }
+  const fin = candidates.finished.length
+  const stale = candidates.stale.length
+  const all = fin + (staleIncluded ? stale : 0)
+  pop.innerHTML =
+    `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` +
+    `<span>已完成 ${fin} · 超期 ${stale}</span></div>` +
+    `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` +
+    `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` +
+    `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` +
+    `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` +
+    `<div class="ap-hint">未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` +
+    `<div class="ap-hr"></div>` +
+    `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` +
+    `<span class="ap-l">自动归档已完成</span></label>` +
+    `<div class="ap-row ap-days"><span>超过</span>` +
+    `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` +
+    `<span>天</span></div>` +
+    `<div class="ap-hr"></div>` +
+    `<div class="ap-actions">` +
+    `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>仅归档已完成 ${fin}</button>` +
+    (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn pri">全部归档 ${all}</button>` : "") +
+    `</div>`
+
+  const staleBox = pop.querySelector("#apStale")
+  if (staleBox) {
+    staleBox.addEventListener("change", () => {
+      staleIncluded = staleBox.checked
+      renderArchivePopover()
+    })
+  }
+  const autoBox = pop.querySelector("#apAuto")
+  if (autoBox) {
+    autoBox.addEventListener("change", () => {
+      prefs.auto = autoBox.checked
+      void savePrefs()
+      lastKey = ""
+      void refresh()
+    })
+  }
+  const daysInput = pop.querySelector("#apDays")
+  if (daysInput) {
+    daysInput.addEventListener("change", () => {
+      const next = clampDays(daysInput.value, prefs.days)
+      daysInput.value = String(next)
+      if (next === prefs.days) return
+      prefs.days = next
+      void savePrefs()
+      lastKey = ""
+      void refresh()
+    })
+  }
+  const finishedButton = pop.querySelector("#apFinished")
+  if (finishedButton) finishedButton.addEventListener("click", () => { void archiveChosen(idsOf(candidates.finished)) })
+  const allButton = pop.querySelector("#apAll")
+  if (allButton) allButton.addEventListener("click", () => {
+    void archiveChosen([...idsOf(candidates.finished), ...idsOf(candidates.stale)])
+  })
 }
 
 async function restoreAllArchived() {
@@ -769,8 +1114,16 @@ function updateSessionOptions() {
 
 function updatePhaseOptions() {
   if (!controls.phase) return
-  const options = [{ id: "all", label: "全部阶段" }, ...globalPhases.map((phase) => ({ id: phase, label: phase }))]
-  controls.phase.update({ options })
+  const { byPhase } = workspaceCounts()
+  const { rows } = buildRows(byPhase, { aliases: taxonomy.aliases, familyMap: taxonomy.familyMap, showEmpty: false })
+  // The count belongs in the label: with 150 names the list was unreadable, and
+  // sorting by count is the only order a reader can act on.
+  const options = [{ id: "all", label: "全部阶段" }]
+  for (const row of rows) options.push({ id: row.key, label: `${row.label} (${row.count})` })
+  if (filter.phase !== "all" && !rows.some((row) => row.key === filter.phase)) {
+    options.push({ id: filter.phase, label: filter.phase })
+  }
+  controls.phase.update({ options, value: filter.phase })
 }
 
 function mountToolbar() {
@@ -813,25 +1166,42 @@ function mountToolbar() {
       paint()
     },
   })
+  // One control for both the sweep and the bulk run: the count is the button's
+  // label, and the settings live behind it, so the toolbar keeps a single row.
   controls.archive = mountButton(el("archiveHost"), {
-    label: "批量归档已完成",
+    label: "归档候选 0",
     variant: "secondary",
     size: "sm",
-    onClick: () => { void archiveFinished() },
-  })
-  controls.auto = mountCheckbox(el("autoArchiveHost"), {
-    label: "自动归档已完成",
-    checked: prefs.auto,
-    onChange: (checked) => {
-      prefs.auto = checked
-      controls.auto.update({ checked })
-      void savePrefs()
-      lastKey = ""
-      void refresh()
-    },
+    onClick: () => { toggleArchivePopover() },
   })
 
   el("sessions").addEventListener("scroll", onSessionsScroll, { passive: true })
+  el("summary").addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null
+    if (!target) return
+    const chip = target.closest("[data-phase]")
+    if (chip) { togglePhaseFilter(chip.dataset.phase); return }
+    const family = target.closest("[data-family]")
+    if (family) {
+      phaseView.openFamily = phaseView.openFamily === family.dataset.family ? "" : family.dataset.family
+      paintSummary()
+      return
+    }
+    const sort = target.closest("[data-sort]")
+    if (sort) { phaseView.sort = sort.dataset.sort; paintSummary(); return }
+    if (target.closest("[data-show-empty]")) { phaseView.showEmpty = !phaseView.showEmpty; paintSummary(); return }
+    if (target.closest("[data-expand]")) { phaseView.expanded = true; paintSummary(); return }
+    if (target.closest("[data-collapse]")) { phaseView.expanded = false; paintSummary(); return }
+    if (target.closest("[data-classify]")) { runClassifyNow(); return }
+    if (target.closest("[data-manage]")) { manageOpen = !manageOpen; paintSummary(); return }
+    if (target.closest("[data-undo-classify]")) { void undoClassification(); return }
+  })
+  el("summary").addEventListener("change", (event) => {
+    const target = event.target instanceof Element ? event.target : null
+    const box = target ? target.closest("[data-pin]") : null
+    if (!box) return
+    togglePin(box.dataset.pin, box.checked)
+  })
   el("sessions").addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null
     if (!target) return
@@ -883,6 +1253,8 @@ async function readIndexMetas() {
 
 async function refresh() {
   if (!host) return
+  // Read once per page: the learned taxonomy changes only when this page writes it.
+  if (!taxonomyLoaded) await loadTaxonomy()
   let metas
   try {
     metas = await readIndexMetas()
@@ -916,20 +1288,18 @@ async function refresh() {
   // Preferences: a host that refuses or lacks them keeps the in-memory default.
   try {
     const stored = parsePrefs(await host.storage.get(PREFS_KEY))
-    if (stored.auto !== prefs.auto) {
-      prefs = stored
-      if (controls.auto) controls.auto.update({ checked: prefs.auto })
-    }
+    if (stored.auto !== prefs.auto || stored.days !== prefs.days) prefs = stored
   } catch {
     /* keep the current preference */
   }
 
-  // Silent auto sweep: set finished sessions aside on their own, with no toast and
-  // no undo. Skipped when storage could not be read, when the preference is off, or
-  // after a failed write. The open session and the filtered one are left in view.
+  // Silent auto sweep: set finished sessions past the age threshold aside on their
+  // own, with no toast and no undo. Open work is never swept — the stale list is
+  // only counted. Skipped when storage could not be read, when the preference is
+  // off, or after a failed write. The open and filtered sessions are left in view.
   if (prefs.auto && readOk && !sweepPaused) {
     const now = Date.now()
-    const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk })
+    const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk, days: prefs.days })
     if (ids.length) {
       const merged = await sweepArchive(ids, now)
       if (merged) nextArchive = merged
@@ -942,11 +1312,17 @@ async function refresh() {
     for (const phase of (meta.phases || [])) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
     for (const phase of Object.keys(meta.byPhase || {})) if (phase && !seen.has(phase)) { seen.add(phase); phases.push(phase) }
   }
-  const key = JSON.stringify([metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount, prefs.auto, hold])
+  // Recomputed here, not in the paint: the button's count must track the index.
+  // The two counts join the dirty key so a session crossing the threshold — or a
+  // change in the days setting — repaints, while a quiet poll still does nothing.
+  candidates = archiveCandidates(metas, nextArchive, { keep: keepIDs(), hold, now: Date.now(), days: prefs.days })
+  const key = JSON.stringify([
+    metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount,
+    prefs.auto, prefs.days, hold, candidates.finished.length, candidates.stale.length,
+  ])
   if (key === lastKey) return
   lastKey = key
 
-  const phasesChanged = JSON.stringify(phases) !== JSON.stringify(globalPhases)
   allMetas = metas
   archive = nextArchive
   const split = partition(metas, archive, currentID)
@@ -960,11 +1336,10 @@ async function refresh() {
     if (!chosen || (isArchived(archive, chosen) && chosen.sessionID !== currentID)) filter.session = "all"
   }
   updateSessionOptions()
-  if (phasesChanged) updatePhaseOptions()
-  el("legend").innerHTML = globalPhases
-    .map((phase, index) => `<span class="lg"><i style="background:${phaseColor(index)}"></i>${esc(phase)}</span>`)
-    .join("")
+  // Rebuilt whenever the counts move, not just the names: the label carries the count.
+  updatePhaseOptions()
   paintSummary()
+  paintArchiveControl()
   await renderBoard()
 }
 
@@ -981,6 +1356,9 @@ async function tick() {
   timer = null
   try {
     await refresh()
+    // Outside `refresh`: a quiet poll returns early on an unchanged key, and the
+    // automatic pass still has to get a chance once the idle window has passed.
+    maybeClassify()
   } finally {
     arm()
   }
@@ -1004,6 +1382,7 @@ document.addEventListener("visibilitychange", () => {
     return
   }
   if (!polling) return
+  aiArmedAt = Date.now()
   void refresh()
   arm()
 })

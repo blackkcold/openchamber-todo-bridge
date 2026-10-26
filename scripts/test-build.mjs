@@ -20,7 +20,7 @@ const check = (name, pass, detail = "") => {
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`)
 }
 
-const expected = "0.9.9"
+const expected = "1.0.0"
 check("root package version is current", root.version === expected, root.version)
 check("plugin package version matches root", plugin.version === root.version, `${plugin.version} vs ${root.version}`)
 check("status build embeds the current manifest version", status.includes(`"version": "${expected}"`))
