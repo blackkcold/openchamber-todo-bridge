@@ -24,7 +24,46 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.8` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v0.9.9` to the URL.
+
+### v0.9.9 — a ghost with a shape
+
+A row that finishes in the task tree is cloned and flown to the finished toggle.
+The clone was built from a row that no longer carried its `tree`, so it was drawn
+as a flat row and went looking for the checkbox mark tree rows do not have. The
+throw landed in the middle of the reconcile: the new rows were already inserted,
+the old ones were not yet removed, and the change key had already been recorded.
+The list kept a tail of rows from the previous write until something forced a
+repaint — which the finished toggle did, and that is why opening and closing it
+put the order back.
+
+The paint now remembers the shape each node was drawn with and hands it to the
+flight. A missing mark is skipped instead of thrown, one bad row can no longer
+strand the rows queued behind it, and the change key is recorded only after a
+paint that finished. A row that is already collapsing is never reused, so its
+exit animation cannot take a live task with it.
+
+Rows are identified by the task's stable `id` when it has one. Editing the wording,
+or pruning one of two tasks that share a title, no longer hands a row — and with it
+that row's depth, gutter and completion animation — to a different task. A tree row
+also redraws its gutter when the tree around it moves, not only when its own status
+or colour changes: a sibling added after the last child used to leave the old last
+child's connector ending in mid-air.
+
+Polling is two clocks now: 600 ms while the turn is in flight, 3 s once it is idle,
+and nothing at all while the page is hidden. The board checks `_index.json`'s stat
+before reading it, so a quiet poll never ships or parses the whole workspace index.
+The plugin skips a `todowrite` whose list is byte-identical to the one already
+written — no storage write, no mirror rename, no index rebuild, and the session does
+not jump to the top of the board for a change nobody made. A failed mirror is still
+retried by the next write, identical or not.
+
+Measured in the section: 1 read per 4.5 s idle, 6 per 3.2 s while busy, 0 while
+hidden and 1 on return; the board's index read stayed at 1 across a quiet 6 s while
+its stat calls moved. The completion path is covered by a deterministic tree case
+(a partial completion leaves 2 rows and no console error) and 10 randomised tree
+lists (0 differences across an open/close of the finished fold). `bun run build`,
+`bun run validate` and `bun run test` all pass.
 
 ### v0.9.8 — a progressive frost
 

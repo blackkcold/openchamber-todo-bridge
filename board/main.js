@@ -2401,7 +2401,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   }
 
   // src/board.js
-  var POLL_MS = 4000;
+  var BUSY_POLL_MS = 1500;
+  var IDLE_POLL_MS = 5000;
   var REQUEST_TIMEOUT_MS = 8000;
   var TODOS_DIR = "~/.config/openchamber/todos";
   var UNGROUPED2 = "未分组";
@@ -2417,7 +2418,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var host = null;
   var mounted = false;
   var timer = null;
+  var polling = false;
+  var sessionBusy = false;
   var lastKey = "";
+  var indexStamp = "";
+  var indexMetas = null;
   var allMetas = [];
   var agenda = [];
   var archived = [];
@@ -3075,15 +3080,29 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       paint();
     });
   }
+  async function readIndexMetas() {
+    const path = `${TODOS_DIR}/_index.json`;
+    let stamp = "";
+    if (typeof host.stat === "function") {
+      const info = await host.stat(path);
+      stamp = `${info.kind}:${info.size}:${info.mtime}`;
+      if (indexMetas !== null && stamp === indexStamp)
+        return indexMetas;
+    }
+    const { content } = await host.readFile(path);
+    const metas = parseIndex(content);
+    if (metas === null)
+      throw new Error("BAD_INDEX");
+    indexStamp = stamp;
+    indexMetas = metas;
+    return metas;
+  }
   async function refresh() {
     if (!host)
       return;
     let metas;
     try {
-      const { content } = await host.readFile(`${TODOS_DIR}/_index.json`);
-      metas = parseIndex(content);
-      if (metas === null)
-        throw new Error("BAD_INDEX");
+      metas = await readIndexMetas();
     } catch (error) {
       const code = error && error.code;
       const message = String(error && error.message || "");
@@ -3153,6 +3172,43 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     paintSummary();
     await renderBoard();
   }
+  var pollDelay = () => sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS;
+  function arm() {
+    if (!polling || document.hidden)
+      return;
+    clearTimeout(timer);
+    timer = setTimeout(tick, pollDelay());
+  }
+  async function tick() {
+    timer = null;
+    try {
+      await refresh();
+    } finally {
+      arm();
+    }
+  }
+  function start() {
+    polling = true;
+    if (timer !== null)
+      return;
+    arm();
+  }
+  function reschedule() {
+    if (!polling)
+      return;
+    arm();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    if (!polling)
+      return;
+    refresh();
+    arm();
+  });
   function insideHostFrame() {
     try {
       return window.parent !== window;
@@ -3188,12 +3244,13 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       currentID = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null;
       mountToolbar();
       refresh();
-      if (timer === null)
-        timer = setInterval(() => {
-          refresh();
-        }, POLL_MS);
+      start();
     });
-    host.onSession((session) => setCurrent(session));
+    host.onSession((session) => {
+      sessionBusy = Boolean(session && session.busy === true);
+      setCurrent(session);
+      reschedule();
+    });
   }
   boot();
 })();

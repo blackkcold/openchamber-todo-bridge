@@ -17,7 +17,12 @@ import { buildTree, finishedCount, INDENT, phaseColor, pruneFinished } from "./g
 import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { parseDoc } from "./doc.js"
 
-const POLL_MS = 2000
+/**
+ * Two clocks, as in the Work Status section: follow a running turn closely,
+ * read an idle session rarely, and read nothing while the page is hidden.
+ */
+const BUSY_POLL_MS = 600
+const IDLE_POLL_MS = 3000
 const REQUEST_TIMEOUT_MS = 3000
 const BOOT_WATCHDOG_MS = 1600
 const TODOS_DIR = "~/.config/openchamber/todos"
@@ -39,6 +44,10 @@ let openFinished = false
 /** The last painted document, so the toggle can re-render without a file read. */
 let lastDoc = null
 let timer = null
+/** The loop is enabled; a missing grant turns it off. */
+let polling = false
+/** Whether the session's turn is in flight, as last reported by the host. */
+let sessionBusy = false
 let lastKey = ""
 
 /** A task-derived label, since the mirror carries no session title. */
@@ -171,6 +180,7 @@ async function refresh() {
   } catch (error) {
     const code = error && error.code
     paintMessage(code === "NOT_GRANTED" ? "未获授权读取任务文件。" : "本会话暂无任务。")
+    if (code === "NOT_GRANTED") stop()
     return
   }
   const doc = parseDoc(content)
@@ -184,10 +194,52 @@ async function refresh() {
   render(doc)
 }
 
-function start() {
-  if (timer !== null) return
-  timer = setInterval(() => { void refresh() }, POLL_MS)
+const pollDelay = () => (sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS)
+
+/** Arm the next read, unless the loop is off or the page is hidden. */
+function arm() {
+  if (!polling || document.hidden) return
+  clearTimeout(timer)
+  timer = setTimeout(tick, pollDelay())
 }
+
+async function tick() {
+  timer = null
+  try {
+    await refresh()
+  } finally {
+    arm()
+  }
+}
+
+function start() {
+  polling = true
+  if (timer !== null) return
+  arm()
+}
+
+function reschedule() {
+  if (!polling) return
+  arm()
+}
+
+function stop() {
+  polling = false
+  if (timer === null) return
+  clearTimeout(timer)
+  timer = null
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(timer)
+    timer = null
+    return
+  }
+  if (!polling) return
+  void refresh()
+  arm()
+})
 
 function insideHostFrame() {
   try {
@@ -224,6 +276,7 @@ function boot() {
       mounted = true
       mountJump()
     }
+    sessionBusy = Boolean(ctx && ctx.session && ctx.session.busy === true)
     const next = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     if (next !== sessionID) {
       sessionID = next
@@ -236,12 +289,14 @@ function boot() {
 
   host.onSession((session) => {
     const next = session && typeof session.id === "string" ? session.id : null
+    sessionBusy = Boolean(session && session.busy === true)
     if (next !== sessionID) {
       sessionID = next
       openFinished = false
     }
     lastKey = ""
     void refresh()
+    reschedule()
   })
 }
 

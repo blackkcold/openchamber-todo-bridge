@@ -12,7 +12,7 @@
 
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin, { createCoalescingQueue } from "../opencode-plugin/index.js"
@@ -129,6 +129,36 @@ console.log("\ncross-session writes — both sessions survive one index write")
     const ids = new Set(index.sessions.map((session) => session.sessionID))
     check("both sessions are in the index", ids.has("ses_cross_a") && ids.has("ses_cross_b"), `${[...ids].join(",")}`)
     check("the index is valid JSON with a sessions array", Array.isArray(index.sessions) && index.sessions.length === 2)
+  } finally {
+    await h.dispose()
+    await rm(h.dir, { recursive: true, force: true })
+  }
+}
+
+console.log("\nidentical writes — nothing is rewritten")
+{
+  const h = await harness()
+  try {
+    const tool = h.tools.get("todowrite")
+    await tool.execute({ todos: [{ content: "same", status: "pending" }], phases: [] }, { sessionID: "ses_same" })
+    const mirrorBefore = await stat(join(h.dir, "ses_same.json"))
+    const indexBefore = await stat(join(h.dir, "_index.json"))
+    const setsBefore = h.storage.sets
+
+    await delay(15)
+    const again = await tool.execute({ todos: [{ content: "same", status: "pending" }], phases: [] }, { sessionID: "ses_same" })
+    const mirrorAfter = await stat(join(h.dir, "ses_same.json"))
+    const indexAfter = await stat(join(h.dir, "_index.json"))
+
+    check("no durable write", h.storage.sets === setsBefore, `sets ${h.storage.sets}`)
+    check("the mirror is not rewritten", mirrorAfter.ino === mirrorBefore.ino && mirrorAfter.mtimeMs === mirrorBefore.mtimeMs)
+    check("the index is not rewritten", indexAfter.ino === indexBefore.ino && indexAfter.mtimeMs === indexBefore.mtimeMs)
+    check("the tool still reports the list", typeof again.content === "string" && again.content.length > 0)
+
+    await tool.execute({ todos: [{ content: "same", status: "completed" }], phases: [] }, { sessionID: "ses_same" })
+    check("a changed list writes again", h.storage.sets === setsBefore + 1)
+    const doc = JSON.parse(await readFile(join(h.dir, "ses_same.json"), "utf8"))
+    check("the changed list reached the mirror", doc.todos[0].status === "completed")
   } finally {
     await h.dispose()
     await rm(h.dir, { recursive: true, force: true })

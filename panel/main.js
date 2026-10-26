@@ -1721,7 +1721,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   }
 
   // src/panel.js
-  var POLL_MS = 2000;
+  var BUSY_POLL_MS = 600;
+  var IDLE_POLL_MS = 3000;
   var REQUEST_TIMEOUT_MS = 3000;
   var BOOT_WATCHDOG_MS = 1600;
   var TODOS_DIR = "~/.config/openchamber/todos";
@@ -1736,6 +1737,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var openFinished = false;
   var lastDoc = null;
   var timer = null;
+  var polling = false;
+  var sessionBusy = false;
   var lastKey = "";
   function titleFor(doc) {
     const active2 = doc.todos.find((todo) => todo.status === "in_progress");
@@ -1834,6 +1837,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     } catch (error) {
       const code = error && error.code;
       paintMessage(code === "NOT_GRANTED" ? "未获授权读取任务文件。" : "本会话暂无任务。");
+      if (code === "NOT_GRANTED")
+        stop();
       return;
     }
     const doc = parseDoc(content);
@@ -1847,13 +1852,50 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     lastKey = key;
     render(doc);
   }
+  var pollDelay = () => sessionBusy ? BUSY_POLL_MS : IDLE_POLL_MS;
+  function arm() {
+    if (!polling || document.hidden)
+      return;
+    clearTimeout(timer);
+    timer = setTimeout(tick, pollDelay());
+  }
+  async function tick() {
+    timer = null;
+    try {
+      await refresh();
+    } finally {
+      arm();
+    }
+  }
   function start() {
+    polling = true;
     if (timer !== null)
       return;
-    timer = setInterval(() => {
-      refresh();
-    }, POLL_MS);
+    arm();
   }
+  function reschedule() {
+    if (!polling)
+      return;
+    arm();
+  }
+  function stop() {
+    polling = false;
+    if (timer === null)
+      return;
+    clearTimeout(timer);
+    timer = null;
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    if (!polling)
+      return;
+    refresh();
+    arm();
+  });
   function insideHostFrame() {
     try {
       return window.parent !== window;
@@ -1887,6 +1929,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         mounted = true;
         mountJump();
       }
+      sessionBusy = Boolean(ctx && ctx.session && ctx.session.busy === true);
       const next = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null;
       if (next !== sessionID) {
         sessionID = next;
@@ -1898,12 +1941,14 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     });
     host.onSession((session) => {
       const next = session && typeof session.id === "string" ? session.id : null;
+      sessionBusy = Boolean(session && session.busy === true);
       if (next !== sessionID) {
         sessionID = next;
         openFinished = false;
       }
       lastKey = "";
       refresh();
+      reschedule();
     });
   }
   boot();
