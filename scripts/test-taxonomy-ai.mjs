@@ -12,6 +12,7 @@ import {
   MAX_PER_DAY,
   TAXONOMY_KEY,
   buildPrompt,
+  describeGenerateError,
   emptyStore,
   extractJson,
   failStore,
@@ -163,6 +164,18 @@ console.log("\nmergeStore — frozen, reversible")
   check("rollback clears the hash so the batch can retry", rolled.lastHash === "")
   check("rollback clears the snapshot", rolled.previous === null)
   check("rollback without a snapshot is a no-op", rollbackStore(before, now).aliases["微博登录"] === undefined)
+}
+
+console.log("\ndescribeGenerateError — one line a reader can act on")
+{
+  check("a missing model names the setting", describeGenerateError("NO_MODEL").includes("Small Model"))
+  check("a missing permission says to re-approve", describeGenerateError("PERMISSION_DENIED").includes("权限"))
+  check("UNSUPPORTED reads as a permission problem", describeGenerateError("UNSUPPORTED").includes("权限"))
+  check("a timeout is named", describeGenerateError("HOST_TIMEOUT").includes("超时"))
+  check("a model failure points at the model", describeGenerateError("MODEL_FAILED").includes("模型"))
+  check("an unknown code is shown, not swallowed", describeGenerateError("SOMETHING").includes("SOMETHING"))
+  check("no code falls back to a generic line", describeGenerateError(undefined).includes("未知"))
+  check("a non-string code does not throw", typeof describeGenerateError({}) === "string")
 }
 
 if (failed > 0) {

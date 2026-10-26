@@ -25,7 +25,22 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.0` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.1` to the URL.
+
+### v1.0.1 — a switch to test the switch
+
+The classification path had no way to be checked by hand: either it silently worked,
+or the board fell back to the rules and said nothing useful. The board now carries an
+explicit probe — 阶段分布 → **管理** → **Small Model · 测试连接** — which sends one
+minimal request and prints what came back, including the error code in words
+(`NO_MODEL`, `PERMISSION_DENIED`, `HOST_TIMEOUT`, …). It writes nothing, spends no
+classification budget, and changes no gate.
+
+That probe found a real limit: the page connected to the host with an 8-second request
+timeout, and the SDK applies that timeout to every call — including `generate`, whose
+own ceiling is 90 seconds. A slow Small Model could therefore never have answered.
+The override is gone, so ordinary calls keep the SDK's 20 seconds and generation gets
+its full 90.
 
 ### v1.0.0 — everything in its place
 
