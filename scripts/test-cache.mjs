@@ -27,6 +27,8 @@ const check = (name, pass, detail = "") => {
   console.log(`  ${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`)
 }
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
+/** A hash of model-visible text, so an accidental wording change is a test failure. */
+const textDigest = (value) => createHash("sha256").update(value).digest("hex")
 
 const task = (index, status = "pending", extra = {}) => ({
   content: `Task ${index}: a descriptive task title used to measure cache context`,
@@ -67,6 +69,25 @@ const LONG_200 = Array.from({ length: 200 }, (_, index) => task(index + 1, index
   id: `l${index + 1}`,
   phase: index % 5 === 0 ? "调研" : "实现",
 }))
+
+/** A finished list: the tool result renders the whole list, so it is prompt-visible history. */
+const FINISHED_TWO = [
+  task(1, "completed", { id: "t1", phase: "调研" }),
+  task(2, "cancelled", { id: "t2", phase: "实现" }),
+]
+
+/**
+ * Model-visible text is frozen. These hashes are computed from the current
+ * production wording; a failure means the prompt surface changed and the cache
+ * cost must be a deliberate, measured decision — not an accident.
+ *
+ * `TOOL_PREFIX_HASH` (below) covers the tools prefix. These cover the two
+ * transient/history surfaces the plugin writes per request.
+ */
+const REMINDER_HASH_NO_PHASES = "3cc7829133b8051fe626fab388b5c7678729a9df5a854d931171009b06817826"
+const REMINDER_HASH_WITH_PHASES = "7fa9585cd64fff543c28942c1ee0dbf91d129c10c72e789d65a8db4d07ee14b8"
+const RESULT_OPEN_HASH = "2c57290332ab05bf176c20b40359e1b71bd49207223e1a980f89bc5eb14500b6"
+const RESULT_FINISHED_HASH = "68fdc9ed8c8db4a9946403f314e6b261fd1e05938eadcc91f7d71a997382243a"
 
 /**
  * A minimal V2 plugin context: real plugin setup, real tools, real mirror/index
@@ -172,6 +193,18 @@ console.log("\ncache prefix — system/tools/history stay stable")
     await rm(h.dir, { recursive: true, force: true })
   }
 }
+
+// ---- frozen prompt surfaces -------------------------------------------------
+
+console.log("\ncache safety — model-visible text is frozen")
+check(
+  "reminder without declared phases is unchanged",
+  textDigest(buildReminder(THREE_OPEN, [])) === REMINDER_HASH_NO_PHASES,
+)
+check(
+  "reminder with declared phases is unchanged",
+  textDigest(buildReminder(THREE_OPEN, ["调研", "实现"])) === REMINDER_HASH_WITH_PHASES,
+)
 
 // ---- session cache ----------------------------------------------------------
 
@@ -358,6 +391,27 @@ check(
     const read = await h.tools.get("todoread").execute({}, { sessionID: "ses_cache_tool" })
     check("todoread stays under 30000 chars for 50 items", read.content.length <= 30000)
     console.log(`  size  todowrite result ${result.content.length} chars vs input ${inputSize}; todoread ${read.content.length}`)
+  } finally {
+    await h.dispose()
+    await rm(h.dir, { recursive: true, force: true })
+  }
+}
+
+console.log("\ncache safety — tool result text is frozen")
+{
+  const h = await harness([])
+  try {
+    const tool = h.tools.get("todowrite")
+    const open = await tool.execute(
+      { todos: THREE_OPEN, phases: ["调研", "实现"] },
+      { sessionID: "ses_cache_hash_open" },
+    )
+    check("open-list result is unchanged", textDigest(open.content) === RESULT_OPEN_HASH)
+    const finished = await tool.execute(
+      { todos: FINISHED_TWO, phases: ["调研", "实现"] },
+      { sessionID: "ses_cache_hash_fin" },
+    )
+    check("finished-list result is unchanged", textDigest(finished.content) === RESULT_FINISHED_HASH)
   } finally {
     await h.dispose()
     await rm(h.dir, { recursive: true, force: true })

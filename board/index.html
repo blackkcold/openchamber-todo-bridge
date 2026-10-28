@@ -30,6 +30,7 @@
       #viewHost { min-width: 120px; }
       #statusHost, #phaseHost { min-width: 130px; }
       #finishedHost { flex: 0 0 auto; }
+      #archiveFinishedHost { flex: 0 0 auto; }
       #archiveHost { flex: 0 0 auto; position: relative; }
       /* the archive control: one button whose label is the candidate count, and a
          popover holding the sweep switch, its age threshold and the bulk runs */
@@ -63,7 +64,7 @@
         border: 1px solid var(--b-border); border-radius: 5px;
         background: var(--oc-bg, transparent); color: var(--b-fg);
       }
-      .arch-pop .ap-actions { display: flex; gap: 6px; justify-content: flex-end; }
+      .arch-pop .ap-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
       .arch-pop .ap-btn {
         font: inherit; font-size: 11px; padding: 3px 10px; cursor: pointer;
         border: 1px solid var(--b-border); border-radius: 6px;
@@ -238,6 +239,7 @@
         <div id="statusHost"></div>
         <div id="phaseHost"></div>
         <div id="finishedHost"></div>
+        <div id="archiveFinishedHost"></div>
         <div id="archiveHost"></div>
       </div>
       <div id="summary"></div>

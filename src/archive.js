@@ -130,32 +130,26 @@ export function isFullyFinished(meta) {
 }
 
 /**
- * The sessions an "archive everything finished" run should set aside: every meta
- * that is not already archived, is not the session in view, and has no open work.
- * No age gate: this is the reader asking for it explicitly.
- */
-export function finishedSessionIDs(metas, entry, keepActiveID) {
-  const ids = []
-  for (const meta of Array.isArray(metas) ? metas : []) {
-    if (meta.sessionID === keepActiveID) continue
-    if (isArchived(entry, meta)) continue
-    if (isFullyFinished(meta)) ids.push(meta.sessionID)
-  }
-  return ids
-}
-
-/**
- * The two candidate lists the board shows and the sweep acts on.
+ * The three lists the board shows: the reader's explicit bulk run, and the two
+ * lists the automatic sweep reasons about.
  *
+ * - `manual` — every session with no open work that the reader may file **now**:
+ *   no age gate and no `blocked` gate. This is the restored "archive all
+ *   finished" action; the reader is asking for it explicitly. The same guards as
+ *   the sweep still apply (`keep`, `hold`, already-archived, a future stamp).
  * - `finished` — no open work and older than `days`: the only list the silent
  *   sweep may write. `days: 0` means "no age gate", which is what v1 did.
  * - `stale` — still has open work but has not moved for `days`: **counted and
  *   listed, never archived automatically.** Hiding open work would lose it.
  *
+ * `manual` is built before the age/blocked filters, so a finished session that
+ * is blocked (or is inside the threshold) is still offered to the reader. The
+ * sweep never consumes it: `autoArchiveIDs()` keeps reading `finished`.
+ *
  * Guards shared with the sweep: the sessions in `keep` (the open one and the one
  * being filtered), `hold` (restored or undone, until they move again), a clock
  * that went backwards, and anything with a blocked task — a blocked session wants
- * attention, not filing.
+ * attention, not filing. The `blocked` guard applies to the sweep lists only.
  *
  * Pure, index-only: `meta.updatedAt` and `meta.blocked` already carry everything
  * this needs, so a poll never opens a mirror to decide.
@@ -163,6 +157,7 @@ export function finishedSessionIDs(metas, entry, keepActiveID) {
 export function archiveCandidates(metas, entry, opts = {}) {
   const finished = []
   const stale = []
+  const manual = []
   const keep = new Set(Array.isArray(opts.keep) ? opts.keep : [])
   const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {}
   const now = Number.isFinite(opts.now) ? opts.now : Date.now()
@@ -176,13 +171,16 @@ export function archiveCandidates(metas, entry, opts = {}) {
     const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity
     if (updated <= restored) continue
     const age = (now - updated) / DAY_MS
+    const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) }
+    const done = isFullyFinished(meta)
+    // The reader's explicit action: finished now, regardless of age or blocked.
+    if (done) manual.push(item)
     if (age < days) continue
     if ((meta.blocked || 0) > 0) continue
-    const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) }
-    if (isFullyFinished(meta)) finished.push(item)
+    if (done) finished.push(item)
     else stale.push(item)
   }
-  return { finished, stale }
+  return { finished, stale, manual }
 }
 
 /**

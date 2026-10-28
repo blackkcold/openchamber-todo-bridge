@@ -2062,7 +2062,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         isLast,
         ancestorLast,
         synthetic: node.synthetic === true,
-        blocked: node.dependsOn.some((dep) => {
+        blocked: (node.status === "pending" || node.status === "in_progress") && node.dependsOn.some((dep) => {
           const target = byId.get(dep);
           return Boolean(target) && target.status !== "completed";
         })
@@ -2170,7 +2170,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
           if (target !== undefined)
             link(target, node.index, "depends");
         }
-        node.blocked = todo.dependsOn.some((dep) => {
+        node.blocked = (todo.status === "pending" || todo.status === "in_progress") && todo.dependsOn.some((dep) => {
           const target = idToIndex.get(dep);
           return target !== undefined && statusByIndex[target] !== "completed";
         });
@@ -2721,6 +2721,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   function archiveCandidates(metas, entry, opts = {}) {
     const finished = [];
     const stale = [];
+    const manual = [];
     const keep = new Set(Array.isArray(opts.keep) ? opts.keep : []);
     const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {};
     const now = Number.isFinite(opts.now) ? opts.now : Date.now();
@@ -2739,17 +2740,20 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       if (updated <= restored)
         continue;
       const age = (now - updated) / DAY_MS;
+      const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) };
+      const done = isFullyFinished(meta);
+      if (done)
+        manual.push(item);
       if (age < days)
         continue;
       if ((meta.blocked || 0) > 0)
         continue;
-      const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) };
-      if (isFullyFinished(meta))
+      if (done)
         finished.push(item);
       else
         stale.push(item);
     }
-    return { finished, stale };
+    return { finished, stale, manual };
   }
   function autoArchiveIDs(metas, entry, opts = {}) {
     if (!opts.readOk)
@@ -2774,6 +2778,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   // src/board.js
   var BUSY_POLL_MS = 1500;
   var IDLE_POLL_MS = 5000;
+  var ARCHIVE_READ_TTL_MS = 1e4;
+  var PREFS_READ_TTL_MS = 30000;
   var TODOS_DIR = "~/.config/openchamber/todos";
   var UNGROUPED2 = "未分组";
   var CHIP_W = DAG_COL - 34;
@@ -2815,8 +2821,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var prefs = emptyPrefs();
   var hold = {};
   var readOk = false;
+  var archiveReadAt = 0;
+  var archiveReady = false;
+  var prefsReadAt = 0;
   var sweepPaused = false;
-  var candidates = { finished: [], stale: [] };
+  var candidates = { finished: [], stale: [], manual: [] };
   var staleIncluded = false;
   var archiveOpen = false;
   var phaseView = { sort: "count", showEmpty: false, expanded: false, openFamily: "" };
@@ -2918,7 +2927,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return `<div class="note" style="padding:4px 6px">${hidden} 项已完成，已隐藏（勾选「显示已完成」查看）。</div>`;
   }
   function treeRowsHtml(session) {
-    const list = filter.showFinished ? session.todos : pruneFinished(session.todos);
+    const list = filter.showFinished || filter.status === "completed" || filter.status === "cancelled" ? session.todos : pruneFinished(session.todos);
     if (!list.length)
       return hiddenNote(session);
     const original = new Map(session.todos.map((todo, index) => [todo, index]));
@@ -2939,7 +2948,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }).join("");
   }
   function swimlaneSvg(session) {
-    const list = filter.showFinished ? session.todos : pruneFinished(session.todos);
+    const list = filter.showFinished || filter.status === "completed" || filter.status === "cancelled" ? session.todos : pruneFinished(session.todos);
     if (!list.length)
       return hiddenNote(session);
     const { nodes, edges, lanes, width, height } = dagLayout(list, globalPhases);
@@ -3135,7 +3144,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
           doing += 1;
         else if (todo.status === "pending")
           pending += 1;
-        if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed"))
+        if ((todo.status === "pending" || todo.status === "in_progress") && Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed"))
           blocked += 1;
         const phase = todo.phase || "";
         byPhase[phase] = (byPhase[phase] || 0) + 1;
@@ -3363,25 +3372,55 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const after = next && next.sessions || {};
     return Object.keys(before).filter((id) => !(id in after));
   }
+  function addedIDs(previous, next) {
+    const before = previous && previous.sessions || {};
+    const after = next && next.sessions || {};
+    return Object.keys(after).filter((id) => !(id in before));
+  }
+  function mergeArchiveDelta(stored, previous, entry) {
+    const before = previous && previous.sessions || {};
+    const after = entry && entry.sessions || {};
+    const sessions = { ...stored && stored.sessions ? stored.sessions : {} };
+    for (const id of addedIDs(previous, entry)) {
+      const at = after[id];
+      if (Number.isFinite(at))
+        sessions[id] = at;
+    }
+    for (const id of removedIDs(previous, entry))
+      delete sessions[id];
+    return { version: ARCHIVE_VERSION, sessions };
+  }
+  var archiveTail = Promise.resolve();
+  function withArchiveLock(task) {
+    const run = archiveTail.catch(() => {}).then(task);
+    archiveTail = run.catch(() => {});
+    return run;
+  }
   async function sweepArchive(ids, now) {
-    let base = archive;
-    try {
-      base = parseArchive(await host.storage.get(ARCHIVE_KEY));
-    } catch {
-      return null;
-    }
-    const next = withArchived(base, ids, now);
-    try {
-      await host.storage.set(ARCHIVE_KEY, next);
-    } catch {
-      sweepPaused = true;
-      return null;
-    }
-    return next;
+    return withArchiveLock(async () => {
+      let base = archive;
+      try {
+        base = parseArchive(await host.storage.get(ARCHIVE_KEY));
+      } catch {
+        return null;
+      }
+      const next = withArchived(base, ids, now);
+      try {
+        await host.storage.set(ARCHIVE_KEY, next);
+      } catch {
+        sweepPaused = true;
+        return null;
+      }
+      archive = next;
+      archiveReady = true;
+      archiveReadAt = Date.now();
+      return next;
+    });
   }
   async function savePrefs() {
     try {
       await host.storage.set(PREFS_KEY, prefs);
+      prefsReadAt = Date.now();
     } catch (error) {
       host.toast({ kind: "error", message: `偏好未能保存：${error && error.code || error}` });
     }
@@ -3408,9 +3447,17 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     holdIDs(removedIDs(previous, entry));
     armUndo(label, previous);
     try {
-      await host.storage.set(ARCHIVE_KEY, archive);
+      await withArchiveLock(async () => {
+        const stored = parseArchive(await host.storage.get(ARCHIVE_KEY));
+        const next = mergeArchiveDelta(stored, previous, entry);
+        await host.storage.set(ARCHIVE_KEY, next);
+        archive = next;
+      });
+      archiveReady = true;
+      archiveReadAt = Date.now();
     } catch (error) {
       archive = previous;
+      archiveReady = false;
       clearUndo();
       host.toast({ kind: "error", message: `归档未能保存：${error && error.code || error}` });
       lastKey = "";
@@ -3442,7 +3489,14 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   function paintArchiveControl() {
     const total = candidates.finished.length + candidates.stale.length;
     if (controls.archive)
-      controls.archive.update({ label: total ? `归档候选 ${total}` : "归档候选 0" });
+      controls.archive.update({ label: `归档候选 ${total}` });
+    if (controls.archiveFinished) {
+      const manual = candidates.manual.length;
+      controls.archiveFinished.update({
+        label: manual ? `归档已完成 ${manual}` : "归档已完成 0",
+        disabled: manual === 0
+      });
+    }
     if (archiveOpen)
       renderArchivePopover();
   }
@@ -3488,8 +3542,9 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     const fin = candidates.finished.length;
     const stale = candidates.stale.length;
-    const all = fin + (staleIncluded ? stale : 0);
-    pop.innerHTML = `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` + `<span>已完成 ${fin} · 超期 ${stale}</span></div>` + `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` + `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` + `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` + `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` + `<div class="ap-hint">未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` + `<div class="ap-hr"></div>` + `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` + `<span class="ap-l">自动归档已完成</span></label>` + `<div class="ap-row ap-days"><span>超过</span>` + `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` + `<span>天</span></div>` + `<div class="ap-hr"></div>` + `<div class="ap-actions">` + `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>仅归档已完成 ${fin}</button>` + (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn pri">全部归档 ${all}</button>` : "") + `</div>`;
+    const man = candidates.manual.length;
+    const all = man + (staleIncluded ? stale : 0);
+    pop.innerHTML = `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` + `<span>手动 ${man} · 自动 ${fin} · 超期 ${stale}</span></div>` + `<div class="ap-row"><span class="ap-l">全部已完成 · 手动</span>` + `<b class="ap-n">${man}</b><span class="ap-tag manual">手动</span></div>` + `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` + `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` + `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` + `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` + `<div class="ap-hint">「全部已完成」不看年龄；「超期」只给自动 sweep 计数。未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` + `<div class="ap-hr"></div>` + `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` + `<span class="ap-l">自动归档已完成</span></label>` + `<div class="ap-row ap-days"><span>超过</span>` + `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` + `<span>天</span></div>` + `<div class="ap-hr"></div>` + `<div class="ap-actions">` + `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>归档全部已完成 ${man}</button>` + `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>归档超期已完成 ${fin}</button>` + (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部归档 ${all}</button>` : "") + `</div>`;
     const staleBox = pop.querySelector("#apStale");
     if (staleBox) {
       staleBox.addEventListener("change", () => {
@@ -3519,6 +3574,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         refresh();
       });
     }
+    const manualButton = pop.querySelector("#apManual");
+    if (manualButton)
+      manualButton.addEventListener("click", () => {
+        archiveChosen(idsOf(candidates.manual));
+      });
     const finishedButton = pop.querySelector("#apFinished");
     if (finishedButton)
       finishedButton.addEventListener("click", () => {
@@ -3527,7 +3587,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const allButton = pop.querySelector("#apAll");
     if (allButton)
       allButton.addEventListener("click", () => {
-        archiveChosen([...idsOf(candidates.finished), ...idsOf(candidates.stale)]);
+        archiveChosen([...idsOf(candidates.manual), ...idsOf(candidates.stale)]);
       });
   }
   async function restoreAllArchived() {
@@ -3541,12 +3601,22 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     if (!undo)
       return;
     const target = undo.entry;
+    const previous = archive;
     clearUndo();
-    holdIDs(removedIDs(archive, target));
     archive = target;
     try {
-      await host.storage.set(ARCHIVE_KEY, archive);
+      await withArchiveLock(async () => {
+        const stored = parseArchive(await host.storage.get(ARCHIVE_KEY));
+        const next = mergeArchiveDelta(stored, previous, target);
+        await host.storage.set(ARCHIVE_KEY, next);
+        archive = next;
+      });
+      holdIDs(removedIDs(previous, target));
+      archiveReady = true;
+      archiveReadAt = Date.now();
     } catch (error) {
+      archive = previous;
+      archiveReady = false;
       host.toast({ kind: "error", message: `撤销未能保存：${error && error.code || error}` });
     }
     lastKey = "";
@@ -3637,6 +3707,16 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         filter.showFinished = checked;
         controls.finished.update({ checked });
         paint();
+      }
+    });
+    controls.archiveFinished = mountButton(el2("archiveFinishedHost"), {
+      label: "归档已完成 0",
+      variant: "secondary",
+      size: "sm",
+      disabled: true,
+      onClick: () => {
+        if (candidates.manual.length)
+          archiveChosen(idsOf(candidates.manual));
       }
     });
     controls.archive = mountButton(el2("archiveHost"), {
@@ -3761,7 +3841,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       const info = await host.stat(path);
       stamp = `${info.kind}:${info.size}:${info.mtime}`;
       if (indexMetas !== null && stamp === indexStamp)
-        return indexMetas;
+        return { metas: indexMetas, moved: false };
     }
     const { content } = await host.readFile(path);
     const metas = parseIndex(content);
@@ -3769,7 +3849,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       throw new Error("BAD_INDEX");
     indexStamp = stamp;
     indexMetas = metas;
-    return metas;
+    return { metas, moved: true };
   }
   async function refresh() {
     if (!host)
@@ -3777,28 +3857,44 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     if (!taxonomyLoaded)
       await loadTaxonomy();
     let metas;
+    let indexMoved = true;
     try {
-      metas = await readIndexMetas();
+      const read = await readIndexMetas();
+      metas = read.metas;
+      indexMoved = read.moved;
     } catch (error) {
       const code = error && error.code;
       const message = String(error && error.message || "");
       el2("sessions").innerHTML = `<div class="note">${message === "BAD_INDEX" ? "任务索引损坏。" : code === "NOT_FOUND" ? "任务索引尚未生成：在任一会话里触发一次任务更新（todowrite）即可。" : `读取失败：${esc(code || message || String(error))}`}</div>`;
       return;
     }
+    const nowForReads = Date.now();
+    const archiveStale = !archiveReady || indexMoved || nowForReads - archiveReadAt > ARCHIVE_READ_TTL_MS;
     let rawArchive;
-    try {
-      rawArchive = await host.storage.get(ARCHIVE_KEY);
+    if (archiveStale) {
+      try {
+        rawArchive = await host.storage.get(ARCHIVE_KEY);
+        readOk = true;
+        archiveReady = true;
+        archiveReadAt = Date.now();
+      } catch {
+        rawArchive = undefined;
+        readOk = false;
+        archiveReady = false;
+      }
+    } else {
+      rawArchive = archive;
       readOk = true;
-    } catch {
-      rawArchive = undefined;
-      readOk = false;
     }
     let nextArchive = parseArchive(rawArchive);
-    try {
-      const stored = parsePrefs(await host.storage.get(PREFS_KEY));
-      if (stored.auto !== prefs.auto || stored.days !== prefs.days)
-        prefs = stored;
-    } catch {}
+    if (prefsReadAt === 0 || nowForReads - prefsReadAt > PREFS_READ_TTL_MS) {
+      try {
+        const stored = parsePrefs(await host.storage.get(PREFS_KEY));
+        if (stored.auto !== prefs.auto || stored.days !== prefs.days)
+          prefs = stored;
+        prefsReadAt = Date.now();
+      } catch {}
+    }
     if (prefs.auto && readOk && !sweepPaused) {
       const now = Date.now();
       const ids = autoArchiveIDs(metas, nextArchive, { keep: keepIDs(), hold, now, readOk, days: prefs.days });
@@ -3835,7 +3931,8 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       prefs.days,
       hold,
       candidates.finished.length,
-      candidates.stale.length
+      candidates.stale.length,
+      candidates.manual.length
     ]);
     if (key === lastKey)
       return;

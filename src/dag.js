@@ -88,7 +88,7 @@ export function dagLayout(todos, declared = []) {
         const target = idToIndex.get(dep)
         if (target !== undefined) link(target, node.index, "depends")
       }
-      node.blocked = todo.dependsOn.some((dep) => {
+      node.blocked = (todo.status === "pending" || todo.status === "in_progress") && todo.dependsOn.some((dep) => {
         const target = idToIndex.get(dep)
         return target !== undefined && statusByIndex[target] !== "completed"
       })

@@ -86,9 +86,11 @@ const laneOf = (nodes, content) => nodes.find((n) => n.content === content).lane
     T("doing", { id: "b", status: "in_progress" }),
     T("dep-ok", { id: "c", dependsOn: ["a"] }),
     T("dep-blocked", { id: "d", dependsOn: ["b"] }),
+    T("done-dep", { id: "e", status: "completed", dependsOn: ["b"] }),
   ])
   eq("blocked: dep done -> false", nodes.find((n) => n.content === "dep-ok").blocked, false)
   eq("blocked: dep doing -> true", nodes.find((n) => n.content === "dep-blocked").blocked, true)
+  eq("blocked: a completed task is never blocked", nodes.find((n) => n.content === "done-dep").blocked, false)
 }
 
 // --- two nodes in the same lane+column stack (different y) ---------------------

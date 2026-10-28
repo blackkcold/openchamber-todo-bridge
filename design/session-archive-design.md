@@ -12,6 +12,8 @@
 - 在**会话卡片级**提供「归档」：一点，整张卡片移出「最近会话」，收进列表末尾的「🗄 已归档」折叠区。
 - 提供一个**批量归档**按钮，默认作用域 = **所有"任务已全部完成"的会话**（无未完成工作）。归档后同样
   默认不显示在 list 中。
+- 手动批量与自动收拢是**两套口径**：手动批量不看年龄门槛（也不看 `blocked`），自动收拢才看；两者共用
+  同一套 keep / hold / 已归档 / 未来时间戳守卫。
 - 归档是**可逆**的：卡片有「恢复」，折叠区有「全部恢复」，动作后有「撤销」条。
 - 归档会话**默认不加载镜像、不渲染**（性能）；**若该会话继续并产生新的 `todowrite`，自动回到列表**。
 
@@ -82,6 +84,9 @@ value = { version: 1, auto: <布尔：自动收拢开/关> }
 - 动作写入 `host.storage` 后本地 `refresh`，并弹 toast；同时出现 8 秒「撤销」条（`host.toast` 不支持
   回调按钮，故撤销走看板内的条）。
 - 会话下拉过滤到某会话而该会话被归档时，`filter.session` 复位为 `all`；但**当前会话除外**——单看当前会话时即使它被归档也保持视图，不踢回全部。
+- **手动批量**：`archiveCandidates().manual` 收集所有 `isFullyFinished`、未归档、未被 keep / hold 的会话，
+  **不看 `days`、不看 `blocked`**；点击后走同一个 `commitArchive`，有 toast 与 9 秒撤销。工具栏按钮的
+  计数就是 `manual.length`，与「归档候选」（自动 sweep 的超期计数）分开显示。
 - **自动收拢**：`refresh()` 每轮（4s）读 `archive:prefs`；若 `auto` 为真且本轮 `archive` 读成功（`readOk`），用纯函数 `autoArchiveIDs(metas, archive, { keep, hold, now, readOk })` 取应归档 id；非空则**再读一次** `archive` 合并（免覆盖在途的手动写）后 `set` 一次，**无 toast、不记撤销**。`keep` = 当前会话 + 下拉过滤目标；`hold` = 刚被恢复/撤销的 id（其 `updatedAt` 越过记录时刻前不收）；`updatedAt > now`（时钟回拨）跳过。写失败后置 `sweepPaused` 停收，避免每 4s 静默重试。
 - 工具栏新增 `#autoArchiveHost` 复选框「自动归档已完成」，默认开；改动写 `archive:prefs`，失败 toast。
 

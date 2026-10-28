@@ -15,7 +15,6 @@ import {
   isArchived,
   partition,
   isFullyFinished,
-  finishedSessionIDs,
   autoArchiveIDs,
   withArchived,
   withoutArchived,
@@ -67,7 +66,7 @@ check("a pending task is not", isFullyFinished({ sessionID: "a", total: 3, done:
 check("an empty session is not finished", isFullyFinished({ sessionID: "a", total: 0, done: 0, doing: 0, pending: 0 }) === false)
 check("a summary-less entry is not finished", isFullyFinished({ sessionID: "a", updatedAt: 1 }) === false)
 
-console.log("\nfinishedSessionIDs — the bulk run")
+console.log("\narchiveCandidates.manual — the bulk run")
 {
   const entry = { version: 1, sessions: { done: 999 } }
   const metas = [
@@ -75,9 +74,11 @@ console.log("\nfinishedSessionIDs — the bulk run")
     meta("done", 10, { total: 2, done: 2, doing: 0, pending: 0 }),
     meta("fresh", 10, { total: 1, done: 0, doing: 0, pending: 1 }),
   ]
-  check("an already-archived finished session is skipped", finishedSessionIDs(metas, entry).join(",") === "")
-  check("a finished, unarchived session is picked up", finishedSessionIDs(metas, emptyArchive()).join(",") === "done")
-  check("the session in view is skipped", finishedSessionIDs(metas, emptyArchive(), "done").join(",") === "")
+  const manual = (entry, keep = []) =>
+    archiveCandidates(metas, entry, { keep, now: 10, days: 0 }).manual.map((item) => item.sessionID).join(",")
+  check("an already-archived finished session is skipped", manual(entry) === "")
+  check("a finished, unarchived session is picked up", manual(emptyArchive()) === "done")
+  check("the session in view is skipped", manual(emptyArchive(), ["done"]) === "")
 }
 
 console.log("\nparsePrefs — the auto-archive preference")
@@ -117,7 +118,7 @@ console.log("\nautoArchiveIDs — the silent sweep")
   check("the sweep does not mutate its inputs", Object.keys(before.sessions).length === 0)
 }
 
-console.log("\narchiveCandidates — the two lists the board shows")
+console.log("\narchiveCandidates — the three lists the board shows")
 {
   const DAY = 86400000
   const now = 10 * DAY
@@ -145,6 +146,14 @@ console.log("\narchiveCandidates — the two lists the board shows")
   check("an already-archived session is skipped", archiveCandidates(metas, { version: 1, sessions: { "old-fin": now } }, { now, days: 7 }).finished.length === 0)
   check("a future stamp is skipped", archiveCandidates([finished("future", -1)], emptyArchive(), { now, days: 7 }).finished.length === 0)
   check("a candidate list is never built without a threshold default", archiveCandidates([finished("x", 3)], emptyArchive(), { now }).finished.length === 1)
+  check("manual includes every finished session, inside or outside the threshold", names(run().manual) === "old-fin,new-fin")
+  check("manual excludes sessions with open work", !names(run().manual).includes("old-open") && !names(run().manual).includes("new-open"))
+  check("manual includes a blocked finished session", names(archiveCandidates([finished("blk", 30, { blocked: 2 })], emptyArchive(), { now, days: 7 }).manual) === "blk")
+  check("manual is unaffected by the age threshold", names(run({ days: 365 }).manual) === "old-fin,new-fin")
+  check("manual skips a held session", !names(run({ hold: { "old-fin": now - DAY } }).manual).includes("old-fin"))
+  check("manual skips kept sessions", names(run({ keep: ["old-fin", "new-fin"] }).manual) === "")
+  check("manual skips an already-archived session", names(archiveCandidates(metas, { version: 1, sessions: { "old-fin": now } }, { now, days: 7 }).manual) === "new-fin")
+  check("manual skips a future stamp", archiveCandidates([finished("future", -1)], emptyArchive(), { now, days: 7 }).manual.length === 0)
 }
 
 console.log("\nwithArchived / withoutArchived — pure edits")

@@ -1560,7 +1560,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         isLast,
         ancestorLast,
         synthetic: node.synthetic === true,
-        blocked: node.dependsOn.some((dep) => {
+        blocked: (node.status === "pending" || node.status === "in_progress") && node.dependsOn.some((dep) => {
           const target = byId.get(dep);
           return Boolean(target) && target.status !== "completed";
         })
@@ -1834,6 +1834,16 @@ const sessionCache = new Map()
  * storage record and the index already say exactly this.
  */
 const sessionSignatures = new Map()
+/** Bound the signature cache like the session cache; a long-lived process sees many sessions. */
+const SESSION_SIGNATURE_MAX = 1024
+function rememberSignature(sessionID, signature) {
+  sessionSignatures.delete(sessionID)
+  sessionSignatures.set(sessionID, signature)
+  while (sessionSignatures.size > SESSION_SIGNATURE_MAX) {
+    const oldest = sessionSignatures.keys().next().value
+    sessionSignatures.delete(oldest)
+  }
+}
 
 const signatureOf = (todos, phases) => JSON.stringify([todos, phases])
 
@@ -1874,9 +1884,11 @@ async function readRecord(ctx, sessionID, { fresh = false } = {}) {
       updatedAt: value && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
     }
     // A fresh read is how a write from another process (or an older plugin
-    // generation) becomes visible; remember it so a later identical write is
-    // recognised as a no-op rather than overwriting it blind.
-    sessionSignatures.set(sessionID, signatureOf(record.todos, record.phases))
+    // generation) becomes visible. Do NOT seed \`sessionSignatures\` here: that
+    // map means "this mirror was written by this generation". Seeding it from a
+    // read would make the next identical \`todowrite\` skip a mirror that may be
+    // missing, which is exactly the recovery path (\`todowrite\` re-checks the
+    // mirror before trusting the signature).
     cacheRecord(sessionID, record, now)
     return record
   } catch (error) {
@@ -1999,6 +2011,22 @@ async function mirror(sessionID, todos, phases, updatedAt = Date.now()) {
 }
 
 /**
+ * Whether the mirror file exists and is non-empty. \`sessionSignatures\` only
+ * records a successful mirror write in this process; it cannot know that the
+ * file was deleted, the profile moved, or a previous write failed before a
+ * restart. A cheap stat before trusting the signature is what makes the guard
+ * self-healing without writing on every identical call.
+ */
+async function mirrorPresent(sessionID) {
+  try {
+    const info = await stat(join(mirrorDir(), \`\${sessionID}.json\`))
+    return info.isFile() && info.size > 0
+  } catch {
+    return false
+  }
+}
+
+/**
  * The per-session summary the board reads from the index.
  *
  * The board used to \`readFile\` every session mirror just to draw its summary
@@ -2017,11 +2045,14 @@ export function summarize(todos, phases = []) {
   const byPhase = {}
   for (const todo of list) {
     if (todo === null || typeof todo !== "object") continue
+    const open = todo.status === "pending" || todo.status === "in_progress"
     if (todo.status === "completed") done += 1
     else if (todo.status === "in_progress") doing += 1
     else if (todo.status === "pending") pending += 1
     else if (todo.status === "cancelled") cancelled += 1
-    if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
+    // Only open work can be blocked: a completed task with a cancelled dependency
+    // must not keep a finished session out of every archive list.
+    if (open && Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
     const key = typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : ""
     byPhase[key] = (byPhase[key] || 0) + 1
   }
@@ -2320,16 +2351,47 @@ export default {
             // order, so that path needs a fresh read. When the caller supplies
             // phases, no read is needed; a storage read fault must not fail a
             // write that already carries all the metadata it needs.
-            const previous = hasPhases
+            let previous = hasPhases
               ? sessionCache.get(context.sessionID)?.record || null
               : await readRecord(ctx, context.sessionID, { fresh: true })
             const phases = (hasPhases ? normalized.phases : previous.phases) || []
             const signature = signatureOf(todos, phases)
-            if (sessionSignatures.get(context.sessionID) === signature) {
-              // Storage, the mirror and the index already say exactly this. A
-              // rewrite would touch three files and re-order the board for a
-              // change nobody made.
-              return { content: resultContent(todos, phases) }
+            // Two ways to know the stored list already equals this one: this
+            // generation mirrored it, or the fresh read just returned it. The
+            // second is what makes a restart behave like the old in-memory guard
+            // without seeding the signature from a read (which hid a missing
+            // mirror). Both paths check the file before trusting the claim.
+            const storedSignature = previous ? signatureOf(previous.todos, previous.phases) : ""
+            if (sessionSignatures.get(context.sessionID) === signature || storedSignature === signature) {
+              // The signature says this generation mirrored this exact list. Trust
+              // it only while the mirror is still on disk: a wiped profile, a
+              // deleted file, or a failed write before a restart must not leave
+              // the board blind forever.
+              if (await mirrorPresent(context.sessionID)) {
+                return { content: resultContent(todos, phases) }
+              }
+              // Repair only the mirror. A fresh read is the source of truth: the
+              // storage record may have moved on since our last cached copy.
+              let stored = previous
+              try {
+                stored = await readRecord(ctx, context.sessionID, { fresh: true })
+              } catch {
+                /* fall through to the normal write, which reports storage faults */
+              }
+              if (stored && signatureOf(stored.todos, stored.phases) === signature) {
+                try {
+                  // Keep the original updatedAt: a repair is not activity. Bumping
+                  // it would reorder the board and could resurface an archived
+                  // session for a change nobody made.
+                  await mirror(context.sessionID, stored.todos, stored.phases, stored.updatedAt)
+                  rememberSignature(context.sessionID, signature)
+                } catch (error) {
+                  logMirrorError(error)
+                }
+                return { content: resultContent(todos, phases) }
+              }
+              // Storage moved past our signature; write the incoming list below.
+              previous = stored || previous
             }
             const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
             const record = { todos, phases, updatedAt }
@@ -2344,7 +2406,7 @@ export default {
               logMirrorError(error)
             }
             // A failed mirror is retried by the next write, even an identical one.
-            if (mirrored) sessionSignatures.set(context.sessionID, signature)
+            if (mirrored) rememberSignature(context.sessionID, signature)
             return { content: resultContent(todos, phases) }
           })
         },
@@ -2403,7 +2465,7 @@ export default {
 `;
   var MANIFEST = `{
   "name": "openchamber-todo-bridge-plugin",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "description": "OpenCode plugin half of openchamber-todo-bridge: restores todowrite/todoread and mirrors the list to a file an OpenChamber extension can read.",
@@ -3477,4 +3539,4 @@ export default {
   boot();
 })();
 
-// plugin-source-sha256: 72501435a337ca2ef9f96d2b58afd5b59a9b19521ebaf0c859d07b3d81647b6b
+// plugin-source-sha256: 1701a6041c57b51da12693c9514bdf949448f15152f7b2b09d294fc66ccf9d56
