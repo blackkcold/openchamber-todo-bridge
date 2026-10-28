@@ -1615,7 +1615,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         isLast,
         ancestorLast,
         synthetic: node.synthetic === true,
-        blocked: node.dependsOn.some((dep) => {
+        blocked: (node.status === "pending" || node.status === "in_progress") && node.dependsOn.some((dep) => {
           const target = byId.get(dep);
           return Boolean(target) && target.status !== "completed";
         })

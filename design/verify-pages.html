@@ -288,9 +288,9 @@
       }, 3800)
 
       // Archive: reset the session filter to "all" (an earlier probe narrows it to
-      // one session, where there is no fold), then bulk-archive the finished
-      // sessions, open the fold, and restore one. The stub answers `storage`, so
-      // the whole round trip runs without OpenChamber.
+      // one session, where there is no fold), open the archive popover, run the
+      // manual bulk action, open the fold, and restore one. The stub answers
+      // `storage`, so the whole round trip runs without OpenChamber.
       setTimeout(() => {
         const doc = document.getElementById("board").contentDocument
         const note = (m) => say("archive: " + m)
@@ -313,50 +313,42 @@
               setTimeout(() => {
                 try {
                   note("selects: " + selects())
-                  const button = doc.querySelector("#archiveHost button")
-                  note("bulk button: " + (button ? button.textContent : "missing"))
-                  if (!button) return
-                  button.click()
+                  const trigger = doc.querySelector("#archiveHost button")
+                  note("popover trigger: " + (trigger ? trigger.textContent : "missing"))
+                  if (!trigger) return
+                  trigger.click()
                   setTimeout(() => {
-                    try {
-                      note(`after bulk → fold="${foldText()}" archivedCards=${archCards()} undoBar=${doc.getElementById("undoBtn") ? "yes" : "no"}`)
-                      const toggle = doc.getElementById("archiveToggle")
-                      if (!toggle) { note("no fold to open"); return }
-                      toggle.click()
-                      setTimeout(() => {
-                        try {
-                          const t2 = doc.getElementById("archiveToggle")
-                          note(`after expand → aria=${t2 ? t2.getAttribute("aria-expanded") : "no-toggle"} archivedCards=${archCards()} restoreBtn=${restoreBtn() ? "yes" : "no"}`)
-                          const restore = restoreBtn()
-                          if (!restore) { note("no restore button to click"); return }
-                          restore.click()
-                          setTimeout(() => {
-                            try {
-                              note(`after restore → fold=${doc.getElementById("archiveToggle") ? "present" : "gone"} archivedCards=${archCards()}`)
-                              // Leave the fold open, so a person (or a screenshot) sees the
-                              // set-aside card and its restore button as the final state.
-                              const again = doc.querySelector("#archiveHost button")
-                              if (again) again.click()
-                              setTimeout(() => {
-                                try {
-                                  const toggle2 = doc.getElementById("archiveToggle")
-                                  if (toggle2 && toggle2.getAttribute("aria-expanded") !== "true") toggle2.click()
-                                  setTimeout(() => {
-                                    try {
-                                      const t3 = doc.getElementById("archiveToggle")
-                                      const boardList = doc.getElementById("sessions")
-                                      if (boardList) boardList.scrollTop = boardList.scrollHeight
-                                      note(`left open → aria=${t3 ? t3.getAttribute("aria-expanded") : "no-toggle"} archivedCards=${archCards()} restoreBtn=${restoreBtn() ? "yes" : "no"}`)
-                                    } catch (error) { say("archive leave-open error: " + error) }
-                                  }, 800)
-                                } catch (error) { say("archive re-archive error: " + error) }
-                              }, 800)
-                            } catch (error) { say("archive restore probe error: " + error) }
-                          }, 800)
-                        } catch (error) { say("archive expand probe error: " + error) }
-                      }, 800)
-                    } catch (error) { say("archive bulk probe error: " + error) }
-                  }, 800)
+                    const manual = doc.getElementById("apManual")
+                    note("manual button: " + (manual ? manual.textContent : "missing"))
+                    if (!manual) return
+                    manual.click()
+                    setTimeout(() => {
+                      try {
+                        note(`after manual → fold="${foldText()}" archivedCards=${archCards()} undoBar=${doc.getElementById("undoBtn") ? "yes" : "no"}`)
+                        const toggle = doc.getElementById("archiveToggle")
+                        if (!toggle) { note("no fold to open"); return }
+                        toggle.click()
+                        setTimeout(() => {
+                          try {
+                            const t2 = doc.getElementById("archiveToggle")
+                            note(`after expand → aria=${t2 ? t2.getAttribute("aria-expanded") : "no-toggle"} archivedCards=${archCards()} restoreBtn=${restoreBtn() ? "yes" : "no"}`)
+                            const restore = restoreBtn()
+                            if (!restore) { note("no restore button to click"); return }
+                            restore.click()
+                            setTimeout(() => {
+                              try {
+                                note(`after restore → fold=${doc.getElementById("archiveToggle") ? "present" : "gone"} archivedCards=${archCards()}`)
+                                // Leave the restored card at the end of the list, so a
+                                // person (or a screenshot) sees it back in "recent".
+                                const boardList = doc.getElementById("sessions")
+                                if (boardList) boardList.scrollTop = boardList.scrollHeight
+                              } catch (error) { say("archive restore probe error: " + error) }
+                            }, 800)
+                          } catch (error) { say("archive expand probe error: " + error) }
+                        }, 800)
+                      } catch (error) { say("archive bulk probe error: " + error) }
+                    }, 800)
+                  }, 300)
                 } catch (error) { say("archive click probe error: " + error) }
               }, 500)
             } catch (error) { say("archive all-pick error: " + error) }
@@ -374,6 +366,9 @@
         const note = (m) => say("auto-sweep: " + m)
         try {
           STORE.clear()
+          // The sweep's default is now a 7-day age gate. The fixture sessions are
+          // recent, so pin "no age gate" to keep this probe about the sweep itself.
+          STORE.set("archive:prefs", { version: 2, auto: true, days: 0 })
           const frame = document.getElementById("board")
           frame.src = "/board/index.html"
           registry.set(frame.contentWindow, { iframe: frame, surface: "page", sessionID: "ses_phased" })
@@ -388,14 +383,17 @@
                   const stored = STORE.get("archive")
                   note(`on load → fold="${toggle ? toggle.textContent.replace(/\s+/g, " ").trim() : "(none)"}"` +
                     ` archived=[${ids.join(",")}] stored=[${stored ? Object.keys(stored.sessions || {}).join(",") : ""}]`)
-                  const box = doc.getElementById("autoArchiveHost")
-                  const cb = box && box.querySelector('button[role="checkbox"]')
-                  if (!cb) { note("no auto checkbox: " + (box ? box.innerHTML : "no host")); return }
-                  cb.click()
+                  const trigger = doc.querySelector("#archiveHost button")
+                  if (trigger) trigger.click()
                   setTimeout(() => {
-                    const pref = STORE.get("archive:prefs")
-                    note(`after toggle off → pref.auto=${pref ? pref.auto : "(unset)"}`)
-                  }, 700)
+                    const cb = doc.getElementById("apAuto")
+                    if (!cb) { note("no auto checkbox"); return }
+                    cb.click()
+                    setTimeout(() => {
+                      const pref = STORE.get("archive:prefs")
+                      note(`after toggle off → pref.auto=${pref ? pref.auto : "(unset)"}`)
+                    }, 700)
+                  }, 250)
                 } catch (error) { say("auto-sweep expand error: " + error) }
               }, 900)
             } catch (error) { say("auto-sweep reload error: " + error) }

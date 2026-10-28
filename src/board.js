@@ -42,6 +42,7 @@ import {
 } from "./taxonomy-ai.js"
 import {
   ARCHIVE_KEY,
+  ARCHIVE_VERSION,
   PREFS_KEY,
   archiveCandidates,
   autoArchiveIDs,
@@ -63,6 +64,9 @@ import {
  */
 const BUSY_POLL_MS = 1500
 const IDLE_POLL_MS = 5000
+/** A quiet poll reuses the in-memory archive/prefs instead of two storage reads. */
+const ARCHIVE_READ_TTL_MS = 10_000
+const PREFS_READ_TTL_MS = 30_000
 const TODOS_DIR = "~/.config/openchamber/todos"
 const UNGROUPED = "未分组"
 const CHIP_W = DAG_COL - 34
@@ -131,15 +135,21 @@ let prefs = emptyPrefs()
 const hold = {}
 /** Whether the stored archive could be read on the last refresh — the sweep gate. */
 let readOk = false
+/** When the stored archive was last read successfully, and whether we have one. */
+let archiveReadAt = 0
+let archiveReady = false
+/** When the archive preferences were last read successfully. */
+let prefsReadAt = 0
 /** Set after a failed auto write (e.g. the document is over the size cap): stop the
  *  silent retry every poll, so a full archive is not written against every 4s. */
 let sweepPaused = false
 /**
- * The two candidate lists, recomputed from the index on every refresh — never a
- * mirror read. `finished` is what the sweep may write; `stale` (open work, old) is
- * only ever counted and listed, and archived only when the reader ticks it.
+ * The three candidate lists, recomputed from the index on every refresh — never a
+ * mirror read. `manual` is the reader's explicit bulk run (all finished, no age
+ * gate); `finished` is what the sweep may write; `stale` (open work, old) is only
+ * ever counted and listed, and archived only when the reader ticks it.
  */
-let candidates = { finished: [], stale: [] }
+let candidates = { finished: [], stale: [], manual: [] }
 /** Whether the reader ticked "include the still-open ones" in the popover. */
 let staleIncluded = false
 /** The archive popover is open. */
@@ -291,7 +301,9 @@ function hiddenNote(session) {
 }
 
 function treeRowsHtml(session) {
-  const list = filter.showFinished ? session.todos : pruneFinished(session.todos)
+  const list = (filter.showFinished || filter.status === "completed" || filter.status === "cancelled")
+    ? session.todos
+    : pruneFinished(session.todos)
   if (!list.length) return hiddenNote(session)
   // `data-index` must name the original list, the one the detail panel reads.
   const original = new Map(session.todos.map((todo, index) => [todo, index]))
@@ -324,7 +336,9 @@ function treeRowsHtml(session) {
 
 /** The phase-swimlane graph for one session: lanes, edges, chips. */
 function swimlaneSvg(session) {
-  const list = filter.showFinished ? session.todos : pruneFinished(session.todos)
+  const list = (filter.showFinished || filter.status === "completed" || filter.status === "cancelled")
+    ? session.todos
+    : pruneFinished(session.todos)
   if (!list.length) return hiddenNote(session)
   const { nodes, edges, lanes, width, height } = dagLayout(list, globalPhases)
   const parts = []
@@ -559,7 +573,7 @@ function workspaceCounts() {
       if (todo.status === "completed") done += 1
       else if (todo.status === "in_progress") doing += 1
       else if (todo.status === "pending") pending += 1
-      if (Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
+      if ((todo.status === "pending" || todo.status === "in_progress") && Array.isArray(todo.dependsOn) && todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed")) blocked += 1
       const phase = todo.phase || ""
       byPhase[phase] = (byPhase[phase] || 0) + 1
     }
@@ -910,6 +924,44 @@ function removedIDs(previous, next) {
   return Object.keys(before).filter((id) => !(id in after))
 }
 
+/** The ids an archive edit added: the ones it newly stamped. */
+function addedIDs(previous, next) {
+  const before = (previous && previous.sessions) || {}
+  const after = (next && next.sessions) || {}
+  return Object.keys(after).filter((id) => !(id in before))
+}
+
+/**
+ * Apply the delta between `previous` and `entry` to the latest stored document.
+ *
+ * A manual edit must not replace the whole document: a poll's sweep may have
+ * stamped another session while this click was in flight. Only the ids this edit
+ * adds or removes are touched, so both edits survive. Pure.
+ */
+function mergeArchiveDelta(stored, previous, entry) {
+  const before = (previous && previous.sessions) || {}
+  const after = (entry && entry.sessions) || {}
+  const sessions = { ...(stored && stored.sessions ? stored.sessions : {}) }
+  for (const id of addedIDs(previous, entry)) {
+    const at = after[id]
+    if (Number.isFinite(at)) sessions[id] = at
+  }
+  for (const id of removedIDs(previous, entry)) delete sessions[id]
+  return { version: ARCHIVE_VERSION, sessions }
+}
+
+/**
+ * Serialize archive read/write pairs. The board is single-threaded, but a poll's
+ * sweep and a manual click can interleave at an `await`; the queue keeps each
+ * read-modify-write atomic relative to the other.
+ */
+let archiveTail = Promise.resolve()
+function withArchiveLock(task) {
+  const run = archiveTail.catch(() => {}).then(task)
+  archiveTail = run.catch(() => {})
+  return run
+}
+
 /**
  * One auto sweep: re-read the archive first, so a manual change made while this
  * poll's own read was in flight is merged rather than silently overwritten, then
@@ -917,26 +969,32 @@ function removedIDs(previous, next) {
  * cannot be confirmed is retried next poll; a failed write pauses the sweep).
  */
 async function sweepArchive(ids, now) {
-  let base = archive
-  try {
-    base = parseArchive(await host.storage.get(ARCHIVE_KEY))
-  } catch {
-    return null
-  }
-  const next = withArchived(base, ids, now)
-  try {
-    await host.storage.set(ARCHIVE_KEY, next)
-  } catch {
-    sweepPaused = true
-    return null
-  }
-  return next
+  return withArchiveLock(async () => {
+    let base = archive
+    try {
+      base = parseArchive(await host.storage.get(ARCHIVE_KEY))
+    } catch {
+      return null
+    }
+    const next = withArchived(base, ids, now)
+    try {
+      await host.storage.set(ARCHIVE_KEY, next)
+    } catch {
+      sweepPaused = true
+      return null
+    }
+    archive = next
+    archiveReady = true
+    archiveReadAt = Date.now()
+    return next
+  })
 }
 
 /** Persist the archive preferences; a refusal keeps them in memory for this page. */
 async function savePrefs() {
   try {
     await host.storage.set(PREFS_KEY, prefs)
+    prefsReadAt = Date.now()
   } catch (error) {
     host.toast({ kind: "error", message: `偏好未能保存：${(error && error.code) || error}` })
   }
@@ -973,9 +1031,17 @@ async function commitArchive(entry, previous, label, successMessage) {
   holdIDs(removedIDs(previous, entry))
   armUndo(label, previous)
   try {
-    await host.storage.set(ARCHIVE_KEY, archive)
+    await withArchiveLock(async () => {
+      const stored = parseArchive(await host.storage.get(ARCHIVE_KEY))
+      const next = mergeArchiveDelta(stored, previous, entry)
+      await host.storage.set(ARCHIVE_KEY, next)
+      archive = next
+    })
+    archiveReady = true
+    archiveReadAt = Date.now()
   } catch (error) {
     archive = previous
+    archiveReady = false
     clearUndo()
     host.toast({ kind: "error", message: `归档未能保存：${(error && error.code) || error}` })
     lastKey = ""
@@ -1019,10 +1085,17 @@ async function archiveChosen(ids) {
 
 const idsOf = (list) => list.map((item) => item.sessionID)
 
-/** The button's label is the candidate count; it is the only thing a poll touches. */
+/** Both archive buttons carry their own count; a poll touches only these labels. */
 function paintArchiveControl() {
   const total = candidates.finished.length + candidates.stale.length
-  if (controls.archive) controls.archive.update({ label: total ? `归档候选 ${total}` : "归档候选 0" })
+  if (controls.archive) controls.archive.update({ label: `归档候选 ${total}` })
+  if (controls.archiveFinished) {
+    const manual = candidates.manual.length
+    controls.archiveFinished.update({
+      label: manual ? `归档已完成 ${manual}` : "归档已完成 0",
+      disabled: manual === 0,
+    })
+  }
   if (archiveOpen) renderArchivePopover()
 }
 
@@ -1072,15 +1145,18 @@ function renderArchivePopover() {
   }
   const fin = candidates.finished.length
   const stale = candidates.stale.length
-  const all = fin + (staleIncluded ? stale : 0)
+  const man = candidates.manual.length
+  const all = man + (staleIncluded ? stale : 0)
   pop.innerHTML =
     `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` +
-    `<span>已完成 ${fin} · 超期 ${stale}</span></div>` +
+    `<span>手动 ${man} · 自动 ${fin} · 超期 ${stale}</span></div>` +
+    `<div class="ap-row"><span class="ap-l">全部已完成 · 手动</span>` +
+    `<b class="ap-n">${man}</b><span class="ap-tag manual">手动</span></div>` +
     `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` +
     `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` +
     `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` +
     `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` +
-    `<div class="ap-hint">未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` +
+    `<div class="ap-hint">「全部已完成」不看年龄；「超期」只给自动 sweep 计数。未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` +
     `<div class="ap-hr"></div>` +
     `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` +
     `<span class="ap-l">自动归档已完成</span></label>` +
@@ -1089,8 +1165,9 @@ function renderArchivePopover() {
     `<span>天</span></div>` +
     `<div class="ap-hr"></div>` +
     `<div class="ap-actions">` +
-    `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>仅归档已完成 ${fin}</button>` +
-    (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn pri">全部归档 ${all}</button>` : "") +
+    `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>归档全部已完成 ${man}</button>` +
+    `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>归档超期已完成 ${fin}</button>` +
+    (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部归档 ${all}</button>` : "") +
     `</div>`
 
   const staleBox = pop.querySelector("#apStale")
@@ -1121,11 +1198,13 @@ function renderArchivePopover() {
       void refresh()
     })
   }
+  const manualButton = pop.querySelector("#apManual")
+  if (manualButton) manualButton.addEventListener("click", () => { void archiveChosen(idsOf(candidates.manual)) })
   const finishedButton = pop.querySelector("#apFinished")
   if (finishedButton) finishedButton.addEventListener("click", () => { void archiveChosen(idsOf(candidates.finished)) })
   const allButton = pop.querySelector("#apAll")
   if (allButton) allButton.addEventListener("click", () => {
-    void archiveChosen([...idsOf(candidates.finished), ...idsOf(candidates.stale)])
+    void archiveChosen([...idsOf(candidates.manual), ...idsOf(candidates.stale)])
   })
 }
 
@@ -1139,12 +1218,22 @@ async function restoreAllArchived() {
 async function performUndo() {
   if (!undo) return
   const target = undo.entry
+  const previous = archive
   clearUndo()
-  holdIDs(removedIDs(archive, target))
   archive = target
   try {
-    await host.storage.set(ARCHIVE_KEY, archive)
+    await withArchiveLock(async () => {
+      const stored = parseArchive(await host.storage.get(ARCHIVE_KEY))
+      const next = mergeArchiveDelta(stored, previous, target)
+      await host.storage.set(ARCHIVE_KEY, next)
+      archive = next
+    })
+    holdIDs(removedIDs(previous, target))
+    archiveReady = true
+    archiveReadAt = Date.now()
   } catch (error) {
+    archive = previous
+    archiveReady = false
     host.toast({ kind: "error", message: `撤销未能保存：${(error && error.code) || error}` })
   }
   lastKey = ""
@@ -1213,8 +1302,18 @@ function mountToolbar() {
       paint()
     },
   })
-  // One control for both the sweep and the bulk run: the count is the button's
-  // label, and the settings live behind it, so the toolbar keeps a single row.
+  // Two controls: the direct manual run (all finished, no age gate), and the
+  // sweep's settings popover. Keeping them apart is what stops the automatic
+  // threshold from hiding the reader's explicit action.
+  controls.archiveFinished = mountButton(el("archiveFinishedHost"), {
+    label: "归档已完成 0",
+    variant: "secondary",
+    size: "sm",
+    disabled: true,
+    onClick: () => {
+      if (candidates.manual.length) void archiveChosen(idsOf(candidates.manual))
+    },
+  })
   controls.archive = mountButton(el("archiveHost"), {
     label: "归档候选 0",
     variant: "secondary",
@@ -1282,6 +1381,9 @@ function mountToolbar() {
  * The stamp is the cheap half of the pair: the host still answers with one
  * round trip, but a quiet poll never ships or parses the workspace index.
  * `host.stat` is absent on older hosts, which simply falls back to reading.
+ *
+ * Returns `{ metas, moved }`: `moved` says the index was re-read, so the caller
+ * can refresh the archive at the same time instead of on every poll.
  */
 async function readIndexMetas() {
   const path = `${TODOS_DIR}/_index.json`
@@ -1289,14 +1391,14 @@ async function readIndexMetas() {
   if (typeof host.stat === "function") {
     const info = await host.stat(path)
     stamp = `${info.kind}:${info.size}:${info.mtime}`
-    if (indexMetas !== null && stamp === indexStamp) return indexMetas
+    if (indexMetas !== null && stamp === indexStamp) return { metas: indexMetas, moved: false }
   }
   const { content } = await host.readFile(path)
   const metas = parseIndex(content)
   if (metas === null) throw new Error("BAD_INDEX")
   indexStamp = stamp
   indexMetas = metas
-  return metas
+  return { metas, moved: true }
 }
 
 async function refresh() {
@@ -1304,8 +1406,11 @@ async function refresh() {
   // Read once per page: the learned taxonomy changes only when this page writes it.
   if (!taxonomyLoaded) await loadTaxonomy()
   let metas
+  let indexMoved = true
   try {
-    metas = await readIndexMetas()
+    const read = await readIndexMetas()
+    metas = read.metas
+    indexMoved = read.moved
   } catch (error) {
     const code = error && error.code
     const message = String((error && error.message) || "")
@@ -1323,22 +1428,42 @@ async function refresh() {
   // does not answer, simply means "nothing is set aside" — the board still works.
   // `readOk` remembers that this read succeeded: the auto sweep is skipped when it
   // did not, so an unreadable archive is never replaced with a blind empty set.
+  //
+  // A quiet poll does not need to read it again: the in-memory document is current
+  // within `ARCHIVE_READ_TTL_MS`, and an index move or an archive edit forces a
+  // fresh read. This keeps idle polling to the index stat instead of two storage
+  // round trips every five seconds.
+  const nowForReads = Date.now()
+  const archiveStale = !archiveReady || indexMoved || nowForReads - archiveReadAt > ARCHIVE_READ_TTL_MS
   let rawArchive
-  try {
-    rawArchive = await host.storage.get(ARCHIVE_KEY)
+  if (archiveStale) {
+    try {
+      rawArchive = await host.storage.get(ARCHIVE_KEY)
+      readOk = true
+      archiveReady = true
+      archiveReadAt = Date.now()
+    } catch {
+      rawArchive = undefined
+      readOk = false
+      archiveReady = false
+    }
+  } else {
+    rawArchive = archive
     readOk = true
-  } catch {
-    rawArchive = undefined
-    readOk = false
   }
   let nextArchive = parseArchive(rawArchive)
 
   // Preferences: a host that refuses or lacks them keeps the in-memory default.
-  try {
-    const stored = parsePrefs(await host.storage.get(PREFS_KEY))
-    if (stored.auto !== prefs.auto || stored.days !== prefs.days) prefs = stored
-  } catch {
-    /* keep the current preference */
+  // The TTL is longer than the archive's: a preference changes only when a reader
+  // opens this popover, so a 30-second lag is invisible next to the saved round trips.
+  if (prefsReadAt === 0 || nowForReads - prefsReadAt > PREFS_READ_TTL_MS) {
+    try {
+      const stored = parsePrefs(await host.storage.get(PREFS_KEY))
+      if (stored.auto !== prefs.auto || stored.days !== prefs.days) prefs = stored
+      prefsReadAt = Date.now()
+    } catch {
+      /* keep the current preference; retry next poll */
+    }
   }
 
   // Silent auto sweep: set finished sessions past the age threshold aside on their
@@ -1367,6 +1492,7 @@ async function refresh() {
   const key = JSON.stringify([
     metas, loadedCount, filter, currentID, nextArchive, showArchived, archivedLoadedCount,
     prefs.auto, prefs.days, hold, candidates.finished.length, candidates.stale.length,
+    candidates.manual.length,
   ])
   if (key === lastKey) return
   lastKey = key

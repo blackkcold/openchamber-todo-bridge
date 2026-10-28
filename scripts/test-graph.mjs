@@ -163,12 +163,14 @@ const names = (rows) => rows.map((r) => r.content)
     T("dep-blocked", { id: "d", dependsOn: ["b"] }),
     T("dep-unknown", { id: "e", dependsOn: ["nope"] }),
     T("plain", { id: "f" }),
+    T("done-dep", { id: "g", status: "completed", dependsOn: ["b"] }),
   ])
   const blocked = (name) => rows.find((r) => r.content === name).blocked
   eq("blocked: dep on completed -> false", blocked("dep-ok"), false)
   eq("blocked: dep on in_progress -> true", blocked("dep-blocked"), true)
   eq("blocked: unknown dep ignored", blocked("dep-unknown"), false)
   eq("blocked: no deps -> false", blocked("plain"), false)
+  eq("blocked: a completed task is never blocked", blocked("done-dep"), false)
 }
 
 // --- pruneFinished: hide finished work, keep the path to what is left -------

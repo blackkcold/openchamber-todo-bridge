@@ -100,6 +100,13 @@ check("counts doing", sum.doing === 1)
 check("counts cancelled", sum.cancelled === 1)
 check("counts pending", sum.pending === 2)
 check("counts blocked (an open dependency)", sum.blocked === 1)
+check(
+  "a completed task with a cancelled dependency is not blocked",
+  summarize([
+    { content: "a", status: "completed", id: "a", dependsOn: ["b"] },
+    { content: "b", status: "cancelled", id: "b" },
+  ]).blocked === 0,
+)
 check("buckets by phase", sum.byPhase["调研"] === 1 && sum.byPhase["实现"] === 1 && sum.byPhase[""] === 3)
 check("keeps the declared phases", Array.isArray(sum.phases) && sum.phases.length === 2)
 check(

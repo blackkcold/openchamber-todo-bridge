@@ -204,6 +204,76 @@ console.log("\nindex freshness — same mtime, changed size must refresh the sum
   }
 }
 
+console.log("\nmirror recovery — an identical write rebuilds a missing mirror")
+{
+  const h = await harness()
+  try {
+    const tool = h.tools.get("todowrite")
+    const todos = [{ content: "kept", status: "pending", id: "k1" }]
+    const first = await tool.execute({ todos, phases: ["调研"] }, { sessionID: "ses_repair" })
+    const updatedAt = h.storage.record.updatedAt
+    const setsBefore = h.storage.sets
+    await rm(join(h.dir, "ses_repair.json"), { force: true })
+
+    const second = await tool.execute({ todos }, { sessionID: "ses_repair" })
+    const mirror = JSON.parse(await readFile(join(h.dir, "ses_repair.json"), "utf8"))
+    check("the mirror is rebuilt", mirror.todos[0].content === "kept")
+    check("the repair keeps the stored updatedAt", mirror.updatedAt === updatedAt)
+    check("the repair does not write storage", h.storage.sets === setsBefore, `sets ${h.storage.sets}`)
+    check("the repair returns the same tool result", second.content === first.content)
+    const index = JSON.parse(await readFile(join(h.dir, "_index.json"), "utf8"))
+    const meta = index.sessions.find((session) => session.sessionID === "ses_repair")
+    check("the repaired session stays in the index", Boolean(meta) && meta.updatedAt === updatedAt)
+  } finally {
+    await h.dispose()
+    await rm(h.dir, { recursive: true, force: true })
+  }
+}
+
+console.log("\nmirror recovery — a new generation rebuilds a missing mirror")
+{
+  const h = await harness()
+  let dispose = null
+  try {
+    const todos = [{ content: "kept", status: "pending", id: "k1" }]
+    await h.tools.get("todowrite").execute({ todos }, { sessionID: "ses_restart" })
+    const updatedAt = h.storage.record.updatedAt
+    await h.dispose()
+    await rm(join(h.dir, "ses_restart.json"), { force: true })
+
+    // A new plugin generation: its signature map starts empty. The fresh read
+    // must still prevent a duplicate write, and the missing mirror must be rebuilt
+    // without bumping updatedAt.
+    const tools = new Map()
+    process.env.TODO_BRIDGE_DIR = h.dir
+    dispose = await plugin.setup({
+      storage: {
+        get: async () => h.storage.record,
+        set: async (_key, value) => {
+          h.storage.sets += 1
+          h.storage.record = value
+        },
+      },
+      tool: {
+        transform: async (fn) => {
+          fn({ add: (tool) => tools.set(tool.name, tool) })
+          return { dispose: async () => {} }
+        },
+      },
+      session: { hook: async () => ({ dispose: async () => {} }) },
+    })
+    const setsBefore = h.storage.sets
+    await tools.get("todowrite").execute({ todos }, { sessionID: "ses_restart" })
+    const mirror = JSON.parse(await readFile(join(h.dir, "ses_restart.json"), "utf8"))
+    check("a new generation rebuilds the mirror", mirror.todos[0].content === "kept")
+    check("the restart repair keeps updatedAt", mirror.updatedAt === updatedAt && h.storage.record.updatedAt === updatedAt)
+    check("the restart repair does not write storage", h.storage.sets === setsBefore, `sets ${h.storage.sets}`)
+  } finally {
+    if (dispose) await dispose()
+    await rm(h.dir, { recursive: true, force: true })
+  }
+}
+
 if (failed > 0) {
   console.error(`\n${failed} index-state check(s) failed`)
   process.exit(1)

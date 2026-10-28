@@ -14,7 +14,7 @@ Visualize OpenCode todos in OpenChamber: a live task tree for the current sessio
 
 - Restores `todowrite` / `todoread` for OpenCode v2 and displays session todos in OpenChamber.
 - Groups nested tasks into a tree; `phase` adds colour-coded stages, and unfinished dependencies are marked blocked.
-- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — manual, and optionally automatic once a finished session passes an age threshold (7 days by default; configurable, 0–365).
+- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — one-click manual bulk archive of every finished session, and optionally automatic once a finished session passes an age threshold (7 days by default; configurable, 0–365).
 - Keeps the board readable as phase names accumulate: cosmetic folding, rule-based families (优先级 / 批次 / 质量 / 发版 / 界面 / 实现), count-sorted and collapsible chips, pinning, and a one-shot Small Model pass that groups the long tail — the model only ever sees a list of words, never a session.
 
 ## Install
@@ -25,7 +25,28 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.1` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.2` to the URL.
+
+### v1.0.2 — the bulk action comes back
+
+v1.0.0 folded the manual bulk archive into the candidate popover and put the
+same age threshold in front of it, so a session finished that morning was
+neither counted nor offered: the toolbar said `归档候选 0` and the only bulk
+button was disabled. The toolbar now carries `归档已完成 N` again — every session
+with no open work, no age gate, one click, the same nine-second undo — while the
+popover keeps the automatic sweep's own count and threshold. The two lists no
+longer share a gate.
+
+`blocked` now counts only open work. A completed task whose dependency was
+cancelled used to keep a finished session out of every archive list and draw a
+「受阻」pill on work that was already done; it no longer does. The index summary,
+the task tree and the swimlane view agree again.
+
+The plugin's mirror guard no longer trusts an in-memory signature after a
+restart. A wiped mirror is rebuilt by the next identical `todowrite`, with the
+original `updatedAt`, so the board stays populated without reordering the list
+or resurfacing an archived session. The tool description, schema, reminder and
+tool-result text are unchanged; the cache guards pin them with hashes.
 
 ### v1.0.1 — a switch to test the switch
 
