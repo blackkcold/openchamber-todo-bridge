@@ -120,6 +120,9 @@
         }
       }
       FILES._index = { version: 2, sessions: ORDERED.map((id, index) => ({ sessionID: id, updatedAt: Date.now() - index * 500, ...summaryOf(FILES[id]) })) }
+      // A query parameter makes one mirror unreadable, so the board's failure
+      // card and retry path are checkable; `window.__broken = null` heals it.
+      window.__broken = new URLSearchParams(location.search).get("broken")
 
       const LIGHT = {
         background: "#fffcf0", elevated: "#fffcf0", foreground: "#100f0f", muted: "#6f6e69",
@@ -131,8 +134,18 @@
         font: "ui-sans-serif, -apple-system, system-ui, sans-serif", mono: "ui-monospace, monospace",
         radius: "9px",
       }
+      const DARK = {
+        background: "#171614", elevated: "#1f1e1c", foreground: "#e6e4d9", muted: "#a8a69f",
+        subtle: "#24231f", border: "#3a3833", hover: "rgba(255,255,255,.06)", selection: "rgba(79,156,240,.24)",
+        focus: "#4f9cf0", primary: "#4f9cf0", mutedSurface: "#24231f", elevatedForeground: "#e6e4d9",
+        active: "rgba(255,255,255,.08)", selectionForeground: "inherit", primaryForeground: "#0b0b0a",
+        primaryText: "#7cb7ff", successText: "#9fbf4a", warningText: "#e0a35a", errorText: "#f07a75",
+        infoText: "#78b6ff", success: "#8faa3a", warning: "#d18b45", error: "#e06c67", info: "#4f9cf0",
+        font: LIGHT.font, mono: LIGHT.mono, radius: LIGHT.radius,
+      }
+      const THEME = new URLSearchParams(location.search).has("dark") ? DARK : LIGHT
       const ready = (surface, sessionID) => ({
-        theme: { mode: "light", tokens: LIGHT },
+        theme: { mode: THEME === DARK ? "dark" : "light", tokens: THEME },
         locale: "zh", directory: null,
         session: sessionID ? { id: sessionID, title: "demo", busy: false } : null,
         surface, item: null, connection: { connected: false }, settings: {},
@@ -156,9 +169,32 @@
         const ok = (payload) => answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: true, payload })
 
         if (msg.type === "hello") { answer({ channel: CHANNEL, v: V, type: "ready", payload: ready(entry.surface, entry.sessionID) }); return }
+        // The board asks the host for real chat titles once per page. Answer with
+        // deterministic labels so the fallback and the overlay are both checkable.
+        if (msg.type === "workspace-read") {
+          const query = msg.payload || {}
+          if (query.kind === "projects") {
+            ok({ kind: "projects", state: "ready", projects: [{ id: "p1", name: "Demo", directory: "/demo" }] })
+            return
+          }
+          if (query.kind === "sessions") {
+            const sessions = ORDERED.map((id, index) => ({
+              id, title: `真实会话 ${index + 1}`, projectId: query.projectId, directory: "/demo",
+              parentId: null, createdAt: 0, updatedAt: Date.now() - index * 500, archivedAt: null,
+              worktree: null, activity: "idle", outcome: null, items: [],
+            }))
+            ok({ kind: "sessions", projectId: query.projectId, state: "ready", coverage: [{ directory: "/demo", state: "ready" }], sessions })
+            return
+          }
+        }
         if (msg.type === "file-read") {
           const path = (msg.payload && msg.payload.path) || ""
           const id = path.split("/").pop().replace(/\.json$/, "")
+          if (window.__broken === id) {
+            say(`file-read ${id} (broken)`)
+            ok({ content: "{broken" })
+            return
+          }
           const data = FILES[id]
           if (!data) { answer({ channel: CHANNEL, v: V, type: "result", id: msg.id, ok: false, code: "NOT_FOUND", error: "stub: no such file" }); return }
           say(`file-read ${id}`)
@@ -230,8 +266,8 @@
       }, 2800)
 
       // From inside the harness (the iframes are same-origin) drive the real
-      // pages: dump the summary, click a row for the detail, then switch the
-      // board to the swimlane view and focus one session via its own SDK selects.
+      // pages: dump the summary, click a row for the detail, then focus one
+      // session via the board's own session select.
       setTimeout(() => {
         try {
           const doc = document.getElementById("board").contentDocument
@@ -259,10 +295,10 @@
                 setTimeout(then, 300)
               }, 250)
             }
-            pick(1, "泳道图", () => pick(0, "分批迁移", () => {
+            pick(0, "分批迁移", () => {
               say("sessions shown: " + doc.querySelectorAll(".sess").length + " | swimlane svg: " + doc.querySelectorAll(".swim svg").length)
-              pick(1, "任务树", () => say("tree view ready for ses_phased"))
-            }))
+              say("scope tabs: " + Array.from(doc.querySelectorAll("#scopeHost [role=tab]")).map((t) => t.textContent).join(" / "))
+            })
           }, 400)
         } catch (error) {
           say("peek error: " + error)

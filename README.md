@@ -8,13 +8,14 @@ Visualize OpenCode todos in OpenChamber: a live task tree for the current sessio
 
 | Work Status | Rail panel | Task board |
 | --- | --- | --- |
-| <img src="docs/screenshots/work-status.png" alt="Todo checklist in Work Status" width="280"> | <img src="docs/screenshots/rail-panel.png" alt="Hierarchical todo tree in the rail panel" width="280"> | <img src="docs/screenshots/task-board.png" alt="Cross-session todo board with swimlanes and task details" width="280"> |
+| <img src="docs/screenshots/work-status.png" alt="Todo checklist in Work Status" width="280"> | <img src="docs/screenshots/rail-panel.png" alt="Hierarchical todo tree in the rail panel" width="280"> | <img src="docs/screenshots/task-board.png" alt="Cross-session work queue with task details" width="280"> |
 
 ## Features
 
 - Restores `todowrite` / `todoread` for OpenCode v2 and displays session todos in OpenChamber.
 - Groups nested tasks into a tree; `phase` adds colour-coded stages, and unfinished dependencies are marked blocked.
-- Browse tasks across sessions in tree or swimlane view, with search, filters, and session archiving — one-click manual bulk archive of every finished session, and optionally automatic once a finished session passes an age threshold (7 days by default; configurable, 0–365).
+- Browse tasks across sessions as a work queue: sessions with open work first, blocked before in progress, then the rest; search, status/phase filters, and session archiving — one-click manual bulk archive of every finished session, and optionally automatic once a finished session passes an age threshold (7 days by default; configurable, 0–365).
+- Session cards use the host's real chat title and show how long ago their task list moved; a card draws its first three open tasks (the current session stays expanded), and task details open in a drawer. Status and phase filters are answered from the index summary first, so they reach every session, not just the loaded window.
 - Keeps the board readable as phase names accumulate: cosmetic folding, rule-based families (优先级 / 批次 / 质量 / 发版 / 界面 / 实现), count-sorted and collapsible chips, pinning, and a one-shot Small Model pass that groups the long tail — the model only ever sees a list of words, never a session.
 
 ## Install
@@ -25,7 +26,18 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.0.2` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.1.0` to the URL.
+
+### v1.1.0 — a work queue, not an archive
+
+The board now opens on unfinished work instead of the newest sessions. `待办` is the default scope; sessions are ordered blocked → in progress → most recently updated, while `全部` and `已完成` remain one click away. The pinned card is reserved for the open session, and a finished session is no longer mislabelled as current.
+
+- Filters are real: only matching rows and the ancestors that lead to them are drawn, with a match count; the old dim-everything-else pass is gone. Status and phase filters are answered from the index summary first, so they reach every session rather than only the loaded window; text search states its loaded range.
+- A session card uses the host's real chat title and task-update age, draws its first three open tasks (the current session stays expanded), and opens task details in a drawer. The summary stats are buttons, including a blocked filter and a clear button.
+- The phase cloud lives in a filter panel anchored to the summary; the toolbar is one 47px row. The archive menu is a single `⋯` button. Rows are 28px, keyboard-navigable, and a broken mirror shows a retry card instead of an endless "loading".
+- Dark-theme token contrast was audited; the pin tag now uses the host's `--oc-primary-fg` token.
+
+Verification: `bun run build`, `bun run validate` and `bun run test` (15 suites) pass; the cache and context guards remain green. No prompt, tool-schema, reminder or index-write path changed.
 
 ### v1.0.2 — the bulk action comes back
 

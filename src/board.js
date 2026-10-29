@@ -2,8 +2,13 @@
  * Todos — the task board.
  *
  * A full-screen page: every session's tasks in one place, with a cross-session
- * summary, filters, a view switch (task tree / phase-swimlane graph), a session
- * selector, and a node detail. Opened from OpenChamber's Extension pages menu.
+ * summary, filters, a session selector, and a node detail. Opened from
+ * OpenChamber's Extension pages menu.
+ *
+ * The default view is the work queue, not the archive: sessions with open work,
+ * blocked first and newest first inside a band. "全部" and "已完成" are scopes on
+ * the same list; a filter renders only matching rows (plus the ancestors that
+ * lead to them), never the old dim-everything-else version.
  *
  * Windowed. The board used to read every mirror each poll and render every one
  * of them, which stalls once a machine accumulates a few hundred sessions. Now
@@ -19,12 +24,12 @@
  * and the section reads.
  */
 import { connectHost } from "@openchamber/sdk"
-import { applyHostReady, mountButton, mountCheckbox, mountSearchField, mountSelect } from "@openchamber/sdk/ui"
+import { applyHostReady, mountButton, mountSearchField, mountSelect, mountTabs } from "@openchamber/sdk/ui"
 
 import { buildTree, INDENT, phaseColor, pruneFinished } from "./graph.js"
-import { DAG_COL, dagLayout } from "./dag.js"
 import { GUT_NODE, ensureGutStyle, gutterSvg } from "./gutter.js"
 import { parseDoc, parseIndex } from "./doc.js"
+import { filterList, hasOpenWork, inScope, isBlocked, relativeTime, scopeMetas } from "./queue.js"
 import { TOP_N, buildRows, familyIndex, groupFamilies, normalizePhase, splitTop } from "./taxonomy.js"
 import {
   TAXONOMY_KEY,
@@ -69,10 +74,10 @@ const ARCHIVE_READ_TTL_MS = 10_000
 const PREFS_READ_TTL_MS = 30_000
 const TODOS_DIR = "~/.config/openchamber/todos"
 const UNGROUPED = "未分组"
-const CHIP_W = DAG_COL - 34
-const CHIP_H = 26
 /** Sessions drawn before the first scroll; the sentinel loads the next batch. */
 const BATCH = 15
+/** Open rows a card draws before folding; the rest sit behind "还有 N 项". */
+const CARD_TOP = 3
 
 ensureGutStyle(document)
 
@@ -103,6 +108,15 @@ let indexStamp = ""
 let indexMetas = null
 /** Every session, newest first, from the index alone — no mirror is opened for this. */
 let allMetas = []
+/**
+ * sessionID -> { title, updatedAt, directory } from the host's own session list.
+ * The index carries a task-derived label; the host knows the real chat title.
+ * Read once per page, best effort: a host that refuses or lacks it leaves the
+ * index label in place.
+ */
+let sessionInfo = new Map()
+let sessionInfoLoaded = false
+let sessionInfoLoading = false
 /** The sessions to show: `allMetas` minus the ones the reader has set aside. */
 let agenda = []
 /** The sessions set aside, newest first — not loaded, not rendered until the fold opens. */
@@ -116,12 +130,16 @@ let archivedLoadedCount = BATCH
 let globalPhases = []
 /** sessionID -> { updatedAt, todos, phases }: the tree needs this; the index does not. */
 const docCache = new Map()
+/** sessionID -> the `updatedAt` whose mirror could not be read; retried when it moves. */
+const docFailures = new Map()
 let loadedCount = BATCH
 let currentID = null
 let renderSeq = 0
 let loadingMore = false
-const filter = { query: "", status: "all", phase: "all", view: "tree", session: "all", showFinished: false }
+const filter = { query: "", status: "all", phase: "all", scope: "open", session: "all" }
 let selected = null
+/** Session cards the reader expanded past the top three open rows. */
+const expandedSessions = new Set()
 const controls = {}
 let detailHandles = []
 /** IntersectionObservers for the load-more sentinels, one per open list. */
@@ -171,6 +189,8 @@ let classifying = false
 let aiToastShown = false
 /** The management panel is open. */
 let manageOpen = false
+/** The phase filter panel is open. */
+let filterOpen = false
 /** The explicit Small Model probe: idle / running / ok / fail, with its message. */
 let aiTest = { state: "idle", text: "" }
 /** When the page became visible; the automatic pass waits out a short idle first. */
@@ -191,8 +211,14 @@ function docOf(meta) {
   return cached && cached.updatedAt === meta.updatedAt ? cached : null
 }
 
-/** A task-derived label, from the index summary or, failing that, the mirror. */
+/**
+ * The session label. The host's own title wins; the index summary is the
+ * fallback, and a task-derived label is the last resort. A page that never got
+ * the host list (no permission, older host) still reads exactly as before.
+ */
 function titleOf(meta, doc) {
+  const info = meta ? sessionInfo.get(meta.sessionID) : null
+  if (info && info.title) return info.title
   if (meta && meta.title) return meta.title
   const todos = doc ? doc.todos : []
   const active = todos.find((todo) => todo.status === "in_progress")
@@ -200,30 +226,126 @@ function titleOf(meta, doc) {
   return (active || root || {}).content || (meta ? meta.sessionID : "")
 }
 
+/** The directory a session belongs to, when the host list supplied it. */
+function directoryOf(meta) {
+  const info = meta ? sessionInfo.get(meta.sessionID) : null
+  return info && info.directory ? info.directory : ""
+}
+
 function filtering() {
   return filter.query !== "" || filter.status !== "all" || filter.phase !== "all"
 }
 
-function matches(todo) {
+function matches(todo, statusById) {
+  if (filter.status === "blocked") {
+    if (!isBlocked(todo, statusById)) return false
+  } else if (filter.status !== "all" && todo.status !== filter.status) return false
   if (filter.query && !todo.content.toLowerCase().includes(filter.query.toLowerCase())) return false
-  if (filter.status !== "all" && todo.status !== filter.status) return false
   // The cloud merges names that fold together, so the filter compares the folded
   // form too — otherwise a chip that says "P0 止血" would match nothing.
   if (filter.phase !== "all" && normalizePhase(todo.phase || "") !== filter.phase) return false
   return true
 }
 
-/** The session pinned to the top: the open session if indexable, else the newest. */
-function pinnedMeta() {
-  const byCurrent = currentID ? metaOf(currentID) : null
-  return byCurrent || agenda[0] || null
+/** What a card draws, before and after a filter. */
+function rowsFor(session) {
+  // Finished work is hidden inside a session that still has open work. A
+  // finished session shows its list, and an explicit status filter always wins.
+  const open = session.todos.some((todo) => !isDone(todo.status))
+  const wantsFinished = filter.status === "completed" || filter.status === "cancelled" || !open
+  const base = wantsFinished ? session.todos : pruneFinished(session.todos)
+  // `blocked` is a derived status, so the predicate needs the whole session's
+  // status map even when the rows themselves are filtered.
+  const statusById = new Map()
+  for (const todo of session.todos) if (todo.id) statusById.set(todo.id, todo.status)
+  if (!filtering()) {
+    const openTodos = base.filter((todo) => !isDone(todo.status))
+    const fold = openTodos.length > CARD_TOP &&
+      session.sessionID !== currentID &&
+      filter.session !== session.sessionID &&
+      !expandedSessions.has(session.sessionID)
+    if (!fold) return { todos: base, matches: 0, folded: 0, statusById }
+    const first = new Set(openTodos.slice(0, CARD_TOP))
+    const { todos } = filterList(base, (todo) => first.has(todo))
+    return { todos, matches: 0, folded: openTodos.length - CARD_TOP, statusById }
+  }
+  const { todos, count } = filterList(base, (todo) => matches(todo, statusById))
+  return { todos, matches: count, folded: 0, statusById }
 }
 
-/** Every session below the pinned card, newest first. */
+/** Whether a loaded session has any row the active filter would draw. */
+function hasMatch(meta) {
+  const doc = docOf(meta)
+  // A mirror that failed to load is shown with its retry card even under a
+  // filter: silently dropping it would hide the only sign that work is missing.
+  if (!doc) return docFailures.get(meta.sessionID) === meta.updatedAt
+  return rowsFor(materialize(meta)).matches > 0
+}
+
+function scopeLabel() {
+  if (filter.scope === "done") return "已完成会话"
+  if (filter.scope === "all") return "全部会话"
+  return "待办会话"
+}
+
+function scopeEmptyNote() {
+  if (filter.scope === "done") return "还没有已完成的会话。"
+  if (filter.scope === "open") return "没有待办会话。所有任务都已完成。"
+  return archived.length
+    ? "当前没有进行中的会话；下面是被收起的。"
+    : "还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。"
+}
+
+/** The session pinned to the top: the open session, when it belongs to the scope. */
+function pinnedMeta() {
+  const byCurrent = currentID ? metaOf(currentID) : null
+  return byCurrent && inScope(byCurrent, filter.scope) ? byCurrent : null
+}
+
+/**
+ * The session-level half of a filter, answered from the index summary. A
+ * session whose summary already says "no blocked task" never has to open its
+ * mirror for a blocked filter. An older index without a summary stays in the
+ * candidate list and is decided after its mirror loads.
+ */
+function metaMatchesStatus(meta) {
+  if (filter.status === "all") return true
+  if (!meta || !Number.isFinite(meta.total)) return true
+  if (filter.status === "blocked") return (meta.blocked || 0) > 0
+  if (filter.status === "in_progress") return (meta.doing || 0) > 0
+  if (filter.status === "pending") return (meta.pending || 0) > 0
+  if (filter.status === "completed") return (meta.done || 0) > 0
+  if (filter.status === "cancelled") return (meta.cancelled || 0) > 0
+  return true
+}
+
+/** Phase names fold cosmetically, so compare the folded form to the chip key. */
+function metaMatchesPhase(meta) {
+  if (filter.phase === "all") return true
+  if (!meta || !Number.isFinite(meta.total)) return true
+  for (const [name, count] of Object.entries(meta.byPhase || {})) {
+    if ((count || 0) > 0 && normalizePhase(name) === filter.phase) return true
+  }
+  return false
+}
+
+/**
+ * The sessions the current scope and filter may draw, before any mirror is
+ * opened. Status and phase are index questions; the text query still needs the
+ * mirror, so it is applied card by card after this prefilter.
+ */
+function candidateMetas() {
+  let list = scopeMetas(agenda, filter.scope)
+  if (filter.status !== "all") list = list.filter(metaMatchesStatus)
+  if (filter.phase !== "all") list = list.filter(metaMatchesPhase)
+  return list
+}
+
+/** Every session below the pinned card, in the current scope's order. */
 function listMetas() {
   const pinned = pinnedMeta()
   const pinnedID = pinned ? pinned.sessionID : null
-  return agenda.filter((meta) => meta.sessionID !== pinnedID)
+  return candidateMetas().filter((meta) => meta.sessionID !== pinnedID)
 }
 
 /** The metas whose mirrors the current view actually needs. */
@@ -244,15 +366,21 @@ function windowMetas() {
 
 /** Read the mirrors the window needs that are not cached at their current mtime. */
 async function ensureDocs(metas) {
-  const need = metas.filter((meta) => !docOf(meta))
+  const need = metas.filter((meta) => !docOf(meta) && docFailures.get(meta.sessionID) !== meta.updatedAt)
   if (!need.length) return
   await Promise.all(need.map(async (meta) => {
     try {
       const { content } = await host.readFile(`${TODOS_DIR}/${meta.sessionID}.json`)
       const doc = parseDoc(content)
-      if (doc) docCache.set(meta.sessionID, { updatedAt: meta.updatedAt, todos: doc.todos, phases: doc.phases })
+      if (doc) {
+        docCache.set(meta.sessionID, { updatedAt: meta.updatedAt, todos: doc.todos, phases: doc.phases })
+        docFailures.delete(meta.sessionID)
+      } else {
+        docFailures.set(meta.sessionID, meta.updatedAt)
+      }
     } catch {
-      /* a partial or unreadable file is skipped, not fatal */
+      // A missing or unreadable mirror is a card state, not a fatal board error.
+      docFailures.set(meta.sessionID, meta.updatedAt)
     }
   }))
 }
@@ -270,7 +398,7 @@ function materialize(meta) {
 }
 
 /** Header counts: from the index summary when present, else from the mirror. */
-function sessionHeader(meta, opts = {}) {
+function sessionHeader(meta, opts = {}, matchCount = 0) {
   const doc = docOf(meta)
   let done, total
   if (Number.isFinite(meta.total)) {
@@ -283,13 +411,17 @@ function sessionHeader(meta, opts = {}) {
   }
   const pct = total ? Math.round((done / total) * 100) : 0
   const action = opts.archive
-    ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="把这个会话收进已归档">归档</button>`
+    ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="收起这个会话，放到「已收起」">收起</button>`
     : opts.restore
       ? `<button type="button" class="sess-act" data-restore="${esc(meta.sessionID)}" title="把这个会话移回最近会话">恢复</button>`
       : ""
+  const counts = `${done}/${total}${matchCount ? ` · ${matchCount} 项匹配` : ""}`
+  const title = titleOf(meta, doc)
+  const directory = directoryOf(meta)
   return (
-    `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` +
-    `<span class="cnt">${done}/${total}</span>${action}</div>` +
+    `<div class="sess-head"><h3${directory ? ` title="${esc(directory)}"` : ""}>${esc(title)}</h3>` +
+    `<span class="time">${relativeTime(meta.updatedAt)}</span>` +
+    `<span class="cnt">${counts}</span>${action}</div>` +
     `<div class="prog"><i style="width:${pct}%"></i></div>`
   )
 }
@@ -297,105 +429,101 @@ function sessionHeader(meta, opts = {}) {
 /** Finished work is hidden by default; this note stands in for a hidden tree. */
 function hiddenNote(session) {
   const hidden = session.todos.length - pruneFinished(session.todos).length
-  return `<div class="note" style="padding:4px 6px">${hidden} 项已完成，已隐藏（勾选「显示已完成」查看）。</div>`
+  return `<div class="note" style="padding:4px 6px">${hidden} 项已完成，已隐藏（状态筛选「已完成」查看）。</div>`
 }
 
-function treeRowsHtml(session) {
-  const list = (filter.showFinished || filter.status === "completed" || filter.status === "cancelled")
-    ? session.todos
-    : pruneFinished(session.todos)
+/** Draw only the rows the filter kept; ancestors stay as context, not matches. */
+function treeRowsHtml(session, visible) {
+  const list = visible.todos
   if (!list.length) return hiddenNote(session)
   // `data-index` must name the original list, the one the detail panel reads.
   const original = new Map(session.todos.map((todo, index) => [todo, index]))
   const { rows } = buildTree(list, globalPhases)
-  const active = filtering()
-  return rows
+  const html = rows
     .map((row) => {
       const width = row.depth * INDENT + GUT_NODE
       if (row.synthetic) {
         return (
           `<div class="row group" data-session="${esc(session.sessionID)}">` +
           `<span class="gut" style="width:${width}px">${gutterSvg(row, "")}</span>` +
-          `<span class="txt group-label" style="color:${phaseColor(row.colorIndex)}">${esc(row.content)}</span></div>`
+          `<span class="txt group-label">${esc(row.content)}</span></div>`
         )
       }
       const todo = list[row.index]
       const index = original.get(todo)
-      const dim = active && !matches(todo) ? " dim" : ""
       const sel = selected && selected.sessionID === session.sessionID && selected.index === index ? " sel" : ""
-      const blocked = row.blocked ? `<span class="pill blocked">受阻</span>` : ""
+      const blocked = isBlocked(todo, visible.statusById) ? `<span class="pill blocked">受阻</span>` : ""
       const phase = todo.phase ? `<span class="pill">${esc(todo.phase)}</span>` : ""
       return (
-        `<div class="row ${esc(todo.status)}${dim}${sel}" data-session="${esc(session.sessionID)}" data-index="${index}">` +
+        `<div class="row ${esc(todo.status)}${sel}" data-session="${esc(session.sessionID)}" data-index="${index}"` +
+        ` role="button" tabindex="-1" aria-pressed="${sel ? "true" : "false"}">` +
         `<span class="gut" style="width:${width}px">${gutterSvg(row, todo.status)}</span>` +
         `<span class="txt">${esc(todo.content)}</span>${blocked}${phase}</div>`
       )
     })
     .join("")
-}
-
-/** The phase-swimlane graph for one session: lanes, edges, chips. */
-function swimlaneSvg(session) {
-  const list = (filter.showFinished || filter.status === "completed" || filter.status === "cancelled")
-    ? session.todos
-    : pruneFinished(session.todos)
-  if (!list.length) return hiddenNote(session)
-  const { nodes, edges, lanes, width, height } = dagLayout(list, globalPhases)
-  const parts = []
-  for (const lane of lanes) {
-    const color = colorAt(lane.colorIndex)
-    parts.push(`<rect x="0" y="${lane.y}" width="${width}" height="${lane.height}" fill="${color}" opacity="0.05"/>`)
-    parts.push(`<text x="6" y="${lane.y + 16}" font-size="11" font-weight="600" fill="${color}">${esc(lane.name)}</text>`)
-  }
-  for (const edge of edges) {
-    const a = nodes[edge.from]
-    const b = nodes[edge.to]
-    const dx = Math.max(18, Math.abs(b.x - a.x) * 0.45)
-    const d = `M${a.x} ${a.y} C${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`
-    const depends = edge.kind === "depends"
-    parts.push(
-      `<path d="${d}" fill="none" stroke="${depends ? "var(--oc-error, #af3029)" : "var(--oc-muted, #b9b7ad)"}"` +
-      ` stroke-width="1.5" opacity="${depends ? 0.9 : 0.7}"${depends ? ' stroke-dasharray="3 3"' : ""}/>`,
-    )
-  }
-  for (const node of nodes) {
-    const x = node.x - CHIP_W / 2
-    const y = node.y - CHIP_H / 2
-    const phase = colorAt(node.colorIndex)
-    const text = esc(truncate(node.content, 15))
-    if (isDone(node.status) || node.status === "in_progress") {
-      const fill = isDone(node.status) ? "var(--oc-success, #66800b)" : "var(--oc-primary, #205ea6)"
-      parts.push(`<rect x="${x}" y="${y}" width="${CHIP_W}" height="${CHIP_H}" rx="7" fill="${fill}"/>`)
-      if (node.status === "in_progress") {
-        parts.push(`<rect x="${x - 3}" y="${y - 3}" width="${CHIP_W + 6}" height="${CHIP_H + 6}" rx="9" fill="none" stroke="${fill}" stroke-width="1.6" opacity="0.5"/>`)
-      }
-      parts.push(`<text x="${node.x}" y="${node.y + 4}" font-size="10" fill="#fff" text-anchor="middle">${text}${isDone(node.status) ? " ✓" : " ◐"}</text>`)
-    } else {
-      const stroke = node.blocked ? "var(--oc-error, #af3029)" : phase
-      parts.push(
-        `<rect x="${x}" y="${y}" width="${CHIP_W}" height="${CHIP_H}" rx="7" fill="none" stroke="${stroke}" stroke-width="1.6"${node.blocked ? ' stroke-dasharray="4 3"' : ""}/>`,
-      )
-      parts.push(`<text x="${node.x}" y="${node.y + 4}" font-size="10" fill="var(--oc-fg, #100f0f)" text-anchor="middle">${text}${node.blocked ? " ⛓" : " ○"}</text>`)
-    }
-  }
-  return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleOf({ sessionID: session.sessionID }))}">${parts.join("")}</svg></div>`
+  const more = visible.folded
+    ? `<button type="button" class="row-more" data-expand-session="${esc(session.sessionID)}">还有 ${visible.folded} 项未完成</button>`
+    : ""
+  return html + more
 }
 
 function sessionCard(meta, current, archivedCard = false) {
   const doc = docOf(meta)
-  const body = doc
-    ? (filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)))
-    : `<div class="note">加载中…</div>`
+  let body = `<div class="note">加载中…</div>`
+  let matchCount = 0
+  if (doc) {
+    const session = materialize(meta)
+    const visible = rowsFor(session)
+    matchCount = visible.matches
+    body = treeRowsHtml(session, visible)
+  } else if (docFailures.get(meta.sessionID) === meta.updatedAt) {
+    body = `<div class="note">任务镜像读取失败。` +
+      `<button type="button" class="link" data-retry-session="${esc(meta.sessionID)}">重试</button></div>`
+  }
   const tag = current ? `<div class="pin-tag">当前会话</div>` : ""
   const opts = archivedCard ? { restore: true } : { archive: true }
   const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`
-  return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`
+  return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts, matchCount)}${body}</section>`
 }
 
-/** Whether a loaded session holds a task matching the active filter. */
-function hasMatch(meta) {
-  const doc = docOf(meta)
-  return Boolean(doc && doc.todos.some(matches))
+/**
+ * Ensure exactly one task row is a tab stop: the selected one, or the first.
+ * Roving tabindex keeps 50 rows from becoming 50 Tab presses.
+ */
+function ensureRowTabStop() {
+  const box = el("sessions")
+  if (!box) return
+  const rows = box.querySelectorAll(".row[data-index]")
+  if (!rows.length) return
+  const target = box.querySelector(".row.sel[data-index]") || rows[0]
+  for (const row of rows) row.tabIndex = -1
+  target.tabIndex = 0
+}
+
+/** Select a row and repaint; `focus` carries keyboard focus through the repaint. */
+function selectRow(row, focus = false) {
+  if (!row || row.dataset.index === undefined) return
+  selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) }
+  paint()
+  if (!focus) return
+  const next = el("sessions").querySelector(".row.sel[data-index]")
+  if (next) next.focus()
+}
+
+/** Move the roving tab stop one row up or down, and take focus with it. */
+function moveRowFocus(row, step) {
+  const box = el("sessions")
+  if (!box) return
+  const rows = [...box.querySelectorAll(".row[data-index]")]
+  const at = rows.indexOf(row)
+  if (at < 0) return
+  const next = rows[Math.max(0, Math.min(rows.length - 1, at + step))]
+  if (!next || next === row) return
+  for (const item of rows) item.tabIndex = -1
+  next.tabIndex = 0
+  next.focus()
+  next.scrollIntoView({ block: "nearest" })
 }
 
 function sentinelHtml(list, considered) {
@@ -403,9 +531,9 @@ function sentinelHtml(list, considered) {
   let html = more
     ? `<div id="sentinel" class="sentinel">↓ 滚动到底加载下一批（还有 ${list.length - considered.length} 个会话）</div>`
     : `<div class="endnote">已到末尾 · 共 ${list.length} 个会话</div>`
-  if (filtering() && more) {
-    html += `<div class="endnote">筛选只作用于已加载的 ${considered.length} 个会话 · ` +
-      `<button type="button" id="loadAll" class="link">加载全部以筛选</button></div>`
+  if (filter.query && more) {
+    html += `<div class="endnote">文本搜索只作用于已加载的 ${considered.length} 个会话 · ` +
+      `<button type="button" id="loadAll" class="link">加载全部以搜索</button></div>`
   }
   return html
 }
@@ -419,6 +547,7 @@ function paint() {
       ? sessionCard(meta, meta.sessionID === currentID, isArchived(archive, meta))
       : `<div class="note">该会话已不存在。</div>`)
     paintDetails()
+    ensureRowTabStop()
     observeSentinel()
     return
   }
@@ -428,17 +557,18 @@ function paint() {
   const considered = list.slice(0, loadedCount)
   const shown = filtering() ? considered.filter(hasMatch) : considered
   const cards = shown.map((meta) => sessionCard(meta, false)).join("")
-  const countNote = filtering() ? ` · 命中 ${shown.length}` : ""
-  const main = pinned
-    ? sessionCard(pinned, true, isArchived(archive, pinned)) +
-      `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` +
+  const countNote = filtering() ? ` · 命中 ${shown.length} 个会话` : ""
+  // A search shows matches, not the pinned session's header with no rows under it.
+  const showPinned = Boolean(pinned) && (!filtering() || hasMatch(pinned))
+  const pinnedCard = showPinned ? sessionCard(pinned, pinned.sessionID === currentID, isArchived(archive, pinned)) : ""
+  const listBlock = list.length
+    ? `<div class="divider">${scopeLabel()} · 已显示 ${considered.length} / ${list.length}${countNote}</div>` +
       (cards || `<div class="note">没有匹配的任务。</div>`) +
       sentinelHtml(list, considered)
-    : (archived.length
-        ? `<div class="note">当前没有进行中的会话；下面是已归档的。</div>`
-        : `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`)
-  box.innerHTML = undoBarHtml() + main + archivedSectionHtml()
+    : (showPinned ? "" : `<div class="note">${scopeEmptyNote()}</div>`)
+  box.innerHTML = undoBarHtml() + pinnedCard + listBlock + archivedSectionHtml()
   paintDetails()
+  ensureRowTabStop()
   observeSentinel()
 }
 
@@ -451,13 +581,13 @@ function archivedSectionHtml() {
   const items = archived.reduce((n, meta) => n + (Number.isFinite(meta.total) ? meta.total : 0), 0)
   const head =
     `<button type="button" class="arch-fold" id="archiveToggle" aria-expanded="${showArchived}">` +
-    `<span>🗄 已归档 ${archived.length} 个会话</span>` +
+    `<span>已收起 ${archived.length} 个会话</span>` +
     `<span class="n">${items} 项 · ${showArchived ? "收起" : "展开"}</span></button>`
   if (!showArchived) return `<div class="archive">${head}</div>`
   const shown = archivedLoadedCount >= archived.length ? archived : archived.slice(0, archivedLoadedCount)
   const more = archivedLoadedCount < archived.length
-    ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已归档（还有 ${archived.length - archivedLoadedCount} 个）</div>`
-    : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已归档会话</div>`
+    ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已收起（还有 ${archived.length - archivedLoadedCount} 个）</div>`
+    : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已收起会话</div>`
   const restoreAll = archived.length > 1
     ? `<div class="endnote"><button type="button" class="link" id="restoreAll">全部恢复</button></div>`
     : ""
@@ -548,9 +678,10 @@ async function renderBoard() {
  * counts. Index summaries carry both, so this never opens a mirror.
  */
 function workspaceCounts() {
-  let doing = 0, pending = 0, done = 0, blocked = 0, total = 0
+  let doing = 0, pending = 0, done = 0, blocked = 0, total = 0, openSessions = 0
   const byPhase = {}
   for (const meta of agenda) {
+    if (hasOpenWork(meta)) openSessions += 1
     if (Number.isFinite(meta.total)) {
       total += meta.total
       done += meta.done || 0
@@ -578,7 +709,7 @@ function workspaceCounts() {
       byPhase[phase] = (byPhase[phase] || 0) + 1
     }
   }
-  return { byPhase, stats: { doing, pending, done, blocked, total } }
+  return { byPhase, stats: { doing, pending, done, blocked, total, openSessions } }
 }
 
 function phaseChipHtml(row) {
@@ -625,10 +756,21 @@ function paintSummary() {
   const ungroupedChip = ungrouped
     ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED)}</span><b>${ungrouped}</b></span>`
     : ""
+  const stat = (kind, label, cls = "") =>
+    `<button type="button" class="stat${cls}" data-stat="${kind}">${label}</button>`
+  const activeFilters = (filter.query ? 1 : 0) + (filter.status !== "all" ? 1 : 0) + (filter.phase !== "all" ? 1 : 0)
   el("summary").innerHTML =
-    `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` +
-    `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` +
-    `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` +
+    `<div class="stats">${stat("open", `<b title="有未完成任务的会话">${stats.openSessions} 个会话有未完成</b>`)}` +
+    stat("doing", `${stats.doing} 个进行中`) +
+    stat("pending", `${stats.pending} 个待办`) +
+    stat("blocked", `${stats.blocked} 个受阻`, " blocked") +
+    stat("done", `${stats.done} 个已完成`) +
+    stat("total", `共 ${stats.total} 项`) +
+    `<button type="button" class="stat filter" data-filter aria-expanded="${filterOpen}">` +
+    `${filterOpen ? "收起筛选" : "筛选"}${activeFilters ? ` · ${activeFilters}` : ""}</button>` +
+    (filtering() ? `<button type="button" class="stat clear" data-clear>清除筛选</button>` : "") +
+    `</div>` +
+    `<div class="phase-panel"${filterOpen ? "" : " hidden"}>` +
     `<div class="phases"><span class="ph-label">阶段分布</span>` +
     `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` +
     `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` +
@@ -638,6 +780,7 @@ function paintSummary() {
         `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>`
       : "") +
     `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` +
+    `<button type="button" class="ph-close" data-filter-close aria-label="关闭筛选">×</button>` +
     `</div>` +
     `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` +
     (groups.length
@@ -672,16 +815,108 @@ function paintSummary() {
         `</div>` +
         `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` +
         `</div>`
-      : "")
+      : "") +
+    `</div>`
+}
+
+/** Close the phase panel without repainting; callers paint once when ready. */
+function closeFilterPanel() {
+  if (!filterOpen) return
+  filterOpen = false
+  document.removeEventListener("pointerdown", onFilterOutside, true)
+  document.removeEventListener("keydown", onFilterKey, true)
+}
+
+function onFilterOutside(event) {
+  if (!filterOpen) return
+  const summary = el("summary")
+  if (summary && event.target instanceof Node && summary.contains(event.target)) return
+  closeFilterPanel()
+  paintSummary()
+}
+
+function onFilterKey(event) {
+  if (!filterOpen || event.key !== "Escape") return
+  event.preventDefault()
+  closeFilterPanel()
+  paintSummary()
+  const button = el("summary") ? el("summary").querySelector("[data-filter]") : null
+  if (button) button.focus()
+}
+
+/** Open or close the phase panel, moving focus with it. */
+function setFilterOpen(open) {
+  const next = Boolean(open)
+  if (next === filterOpen) {
+    if (next) paintSummary()
+    return
+  }
+  if (!next) {
+    closeFilterPanel()
+    paintSummary()
+    const button = el("summary") ? el("summary").querySelector("[data-filter]") : null
+    if (button) button.focus()
+    return
+  }
+  filterOpen = true
+  paintSummary()
+  document.addEventListener("pointerdown", onFilterOutside, true)
+  document.addEventListener("keydown", onFilterKey, true)
+  const first = el("summary") ? el("summary").querySelector(".phase-panel button, .phase-panel input") : null
+  if (first) first.focus()
 }
 
 /** Clicking a chip is a filter, not a stat: same phase again clears it. */
 function togglePhaseFilter(key) {
   filter.phase = filter.phase === key ? "all" : key
-  if (controls.phase) controls.phase.update({ value: filter.phase })
+  loadedCount = BATCH
   lastKey = ""
   paintSummary()
-  paint()
+  void renderBoard()
+}
+
+/** A click on the summary is a filter: sessions / tasks / one status. */
+function applyStatFilter(kind) {
+  if (kind === "open") {
+    filter.scope = "open"
+    filter.status = "all"
+  } else if (kind === "done") {
+    filter.scope = "all"
+    filter.status = "completed"
+  } else if (kind === "total") {
+    filter.scope = "all"
+    filter.status = "all"
+  } else {
+    filter.scope = "open"
+    filter.status = kind
+  }
+  loadedCount = BATCH
+  lastKey = ""
+  if (controls.status) controls.status.update({ value: filter.status })
+  updateScopeControl()
+  closeFilterPanel()
+  paintSummary()
+  const box = el("sessions")
+  if (box) box.scrollTop = 0
+  void renderBoard()
+}
+
+/** Drop every task filter and return to the default queue. */
+function clearFilters() {
+  filter.query = ""
+  filter.status = "all"
+  filter.phase = "all"
+  filter.scope = "open"
+  loadedCount = BATCH
+  lastKey = ""
+  if (controls.search) controls.search.update({ value: "" })
+  if (controls.status) controls.status.update({ value: "all" })
+  updateScopeControl()
+  closeFilterPanel()
+  paintSummary()
+  const box = el("sessions")
+  if (box) box.scrollTop = 0
+  void renderBoard()
 }
 
 // ---- learned taxonomy --------------------------------------------------------
@@ -700,6 +935,52 @@ async function loadTaxonomy() {
     applyStore(parseStore(await host.storage.get(TAXONOMY_KEY)))
   } catch {
     applyStore(emptyStore())
+  }
+}
+
+/**
+ * Fill the session labels from the host's own list, once per page.
+ *
+ * The index carries a task-derived label because the plugin never sees the chat
+ * title. The host does. This is best effort: an older host, a refused
+ * capability, or an empty project list simply leaves the index label in place.
+ * The board paints from the index first and repaints when the labels arrive.
+ */
+async function loadSessionInfo() {
+  if (sessionInfoLoaded || sessionInfoLoading || !host) return
+  if (typeof host.listProjects !== "function" || typeof host.listSessions !== "function") {
+    sessionInfoLoaded = true
+    return
+  }
+  sessionInfoLoading = true
+  try {
+    const projects = await host.listProjects()
+    const list = projects && Array.isArray(projects.projects) ? projects.projects : []
+    const snapshots = await Promise.all(list.map((project) => host.listSessions(project.id).catch(() => null)))
+    const next = new Map()
+    for (const snapshot of snapshots) {
+      const sessions = snapshot && Array.isArray(snapshot.sessions) ? snapshot.sessions : []
+      for (const session of sessions) {
+        if (!session || typeof session.id !== "string" || session.id === "") continue
+        next.set(session.id, {
+          title: typeof session.title === "string" ? session.title : "",
+          updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
+          directory: typeof session.directory === "string" ? session.directory : "",
+        })
+      }
+    }
+    if (next.size) {
+      sessionInfo = next
+      sessionInfoLoaded = true
+      lastKey = ""
+      void refresh()
+    } else {
+      sessionInfoLoaded = true
+    }
+  } catch {
+    sessionInfoLoaded = true
+  } finally {
+    sessionInfoLoading = false
   }
 }
 
@@ -820,6 +1101,11 @@ async function testSmallModel() {
   paintSummary()
 }
 
+const STATUS_LABELS = { pending: "待办", in_progress: "进行中", completed: "已完成", cancelled: "已取消" }
+const PRIORITY_LABELS = { high: "高", medium: "中", low: "低" }
+const statusLabel = (status) => STATUS_LABELS[status] || status || "—"
+const priorityLabel = (priority) => PRIORITY_LABELS[priority] || priority || "—"
+
 function paintDetails() {
   for (const handle of detailHandles) handle.dispose()
   detailHandles = []
@@ -827,8 +1113,12 @@ function paintDetails() {
   const meta = selected ? metaOf(selected.sessionID) : null
   const doc = meta ? docOf(meta) : null
   const todo = doc && selected ? doc.todos[selected.index] : null
+  // The detail is a drawer: absent until a row is chosen, and closed by its own
+  // button. An empty 280px rail used to sit beside every board.
+  box.classList.toggle("open", Boolean(todo))
+  box.setAttribute("aria-hidden", todo ? "false" : "true")
   if (!todo) {
-    box.innerHTML = `<h3>任务详情</h3><div class="kv">点击左侧任务查看详情。</div>`
+    box.innerHTML = ""
     return
   }
   const todos = doc.todos
@@ -842,23 +1132,36 @@ function paintDetails() {
       }).join("<br>")
     : "—"
   box.innerHTML =
-    `<h3>任务详情</h3>` +
+    `<div class="detail-head"><h3>任务详情</h3>` +
+    `<button type="button" class="detail-close" id="detailClose" aria-label="关闭详情">×</button></div>` +
     `<div class="content">${esc(todo.content)}</div>` +
-    `<div class="kv">状态：${esc(todo.status)}</div>` +
+    `<div class="kv">状态：${esc(statusLabel(todo.status))}</div>` +
     `<div class="kv">阶段：${esc(todo.phase || "—")}</div>` +
-    `<div class="kv">优先级：${esc(todo.priority || "—")}</div>` +
+    `<div class="kv">优先级：${esc(priorityLabel(todo.priority))}</div>` +
     `<div class="kv">依赖：<br>${depHtml}</div>` +
-    `<div class="kv">会话：${esc(meta.sessionID)}</div>` +
+    `<div class="kv">会话：<span title="${esc(meta.sessionID)}">${esc(titleOf(meta, doc))}</span></div>` +
+    (meta.sessionID === currentID ? "" : `<div class="kv">「交给 AI」只作用于当前会话。</div>`) +
     `<div class="actions" id="detailActions"></div>`
   const actions = el("detailActions")
-  const hand = document.createElement("div")
-  const copy = document.createElement("div")
   const open = document.createElement("div")
-  actions.append(hand, copy, open)
+  actions.append(open)
   detailHandles.push(
-    mountButton(hand, { label: "交给 AI 处理", size: "sm", onClick: () => handOff(todo) }),
-    mountButton(copy, { label: "复制", variant: "secondary", size: "sm", onClick: () => copyTodo(todo) }),
-    mountButton(open, { label: "打开会话", variant: "ghost", size: "sm", onClick: () => openSession(meta.sessionID) }),
+    mountButton(open, { label: "打开会话", size: "sm", onClick: () => openSession(meta.sessionID) }),
+  )
+  // Compose has no session target: it writes into the chat box of the session
+  // this page sits beside. Offering it for another session would silently aim the
+  // instruction at the wrong conversation, so only the current one gets it.
+  if (meta.sessionID === currentID) {
+    const hand = document.createElement("div")
+    actions.append(hand)
+    detailHandles.push(
+      mountButton(hand, { label: "交给 AI 处理", variant: "secondary", size: "sm", onClick: () => handOff(todo) }),
+    )
+  }
+  const copy = document.createElement("div")
+  actions.append(copy)
+  detailHandles.push(
+    mountButton(copy, { label: "复制", variant: "ghost", size: "sm", onClick: () => copyTodo(todo) }),
   )
 }
 
@@ -1043,7 +1346,7 @@ async function commitArchive(entry, previous, label, successMessage) {
     archive = previous
     archiveReady = false
     clearUndo()
-    host.toast({ kind: "error", message: `归档未能保存：${(error && error.code) || error}` })
+    host.toast({ kind: "error", message: `收起未能保存：${(error && error.code) || error}` })
     lastKey = ""
     await refresh()
     return
@@ -1058,8 +1361,8 @@ async function archiveSession(sessionID) {
   await commitArchive(
     withArchived(archive, [sessionID], Date.now()),
     previous,
-    "已归档 1 个会话",
-    "已归档 1 个会话，可在「已归档」里恢复。",
+    "已收起 1 个会话",
+    "已收起 1 个会话，可在「已收起」里恢复。",
   )
 }
 
@@ -1071,30 +1374,26 @@ async function restoreSession(sessionID) {
 /** Archive every candidate in `ids` as one undoable edit, then close the popover. */
 async function archiveChosen(ids) {
   if (!ids.length) return
-  archiveOpen = false
   staleIncluded = false
-  renderArchivePopover()
+  closeArchivePopover()
   const previous = archive
   await commitArchive(
     withArchived(archive, ids, Date.now()),
     previous,
-    `已归档 ${ids.length} 个会话`,
-    `已归档 ${ids.length} 个会话，可在「已归档」里恢复。`,
+    `已收起 ${ids.length} 个会话`,
+    `已收起 ${ids.length} 个会话，可在「已收起」里恢复。`,
   )
 }
 
 const idsOf = (list) => list.map((item) => item.sessionID)
 
-/** Both archive buttons carry their own count; a poll touches only these labels. */
+/** One archive menu: the popover carries the executable counts and the actions. */
 function paintArchiveControl() {
-  const total = candidates.finished.length + candidates.stale.length
-  if (controls.archive) controls.archive.update({ label: `归档候选 ${total}` })
-  if (controls.archiveFinished) {
-    const manual = candidates.manual.length
-    controls.archiveFinished.update({
-      label: manual ? `归档已完成 ${manual}` : "归档已完成 0",
-      disabled: manual === 0,
-    })
+  if (controls.archive) controls.archive.update({ label: "⋯" })
+  const button = el("archiveHost") ? el("archiveHost").querySelector("button") : null
+  if (button) {
+    button.title = "收起与会话设置"
+    button.setAttribute("aria-label", "收起与会话设置")
   }
   if (archiveOpen) renderArchivePopover()
 }
@@ -1111,6 +1410,34 @@ function closeArchivePopover() {
   const pop = hostEl ? hostEl.querySelector(".arch-pop") : null
   if (pop) pop.remove()
   document.removeEventListener("pointerdown", onOutsidePointer, true)
+  document.removeEventListener("keydown", onArchiveKey, true)
+}
+
+/** Escape closes the popover; Tab stays inside it while it is open. */
+function onArchiveKey(event) {
+  if (!archiveOpen) return
+  if (event.key === "Escape") {
+    event.preventDefault()
+    closeArchivePopover()
+    const button = el("archiveHost") ? el("archiveHost").querySelector("button") : null
+    if (button) button.focus()
+    return
+  }
+  if (event.key !== "Tab") return
+  const pop = el("archiveHost") ? el("archiveHost").querySelector(".arch-pop") : null
+  if (!pop) return
+  const items = [...pop.querySelectorAll("button:not(:disabled), input:not(:disabled)")]
+    .filter((node) => node instanceof HTMLElement && node.offsetParent !== null)
+  if (!items.length) return
+  const first = items[0]
+  const last = items[items.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus()
+  }
 }
 
 function toggleArchivePopover() {
@@ -1121,6 +1448,11 @@ function toggleArchivePopover() {
   archiveOpen = true
   renderArchivePopover()
   document.addEventListener("pointerdown", onOutsidePointer, true)
+  document.addEventListener("keydown", onArchiveKey, true)
+  const pop = el("archiveHost") ? el("archiveHost").querySelector(".arch-pop") : null
+  if (!pop) return
+  const focusable = pop.querySelector("button:not(:disabled), input:not(:disabled)")
+  ;(focusable || pop).focus()
 }
 
 /**
@@ -1140,7 +1472,8 @@ function renderArchivePopover() {
     pop = document.createElement("div")
     pop.className = "arch-pop"
     pop.setAttribute("role", "dialog")
-    pop.setAttribute("aria-label", "归档")
+    pop.setAttribute("aria-label", "收起")
+    pop.tabIndex = -1
     hostEl.append(pop)
   }
   const fin = candidates.finished.length
@@ -1148,26 +1481,26 @@ function renderArchivePopover() {
   const man = candidates.manual.length
   const all = man + (staleIncluded ? stale : 0)
   pop.innerHTML =
-    `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` +
-    `<span>手动 ${man} · 自动 ${fin} · 超期 ${stale}</span></div>` +
+    `<div class="ap-head"><b>可收起 ${man} 个已完成会话</b>` +
+    `<span>超期 ${fin} · 久未更新 ${stale}</span></div>` +
     `<div class="ap-row"><span class="ap-l">全部已完成 · 手动</span>` +
-    `<b class="ap-n">${man}</b><span class="ap-tag manual">手动</span></div>` +
+    `<b class="ap-n">${man}</b><span class="ap-tag manual">可执行</span></div>` +
     `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` +
     `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` +
     `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` +
-    `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` +
-    `<div class="ap-hint">「全部已完成」不看年龄；「超期」只给自动 sweep 计数。未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` +
+    `<span class="ap-l">久未更新 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">可选</span></label>` +
+    `<div class="ap-hint">按钮只显示可以立即收起的数。久未更新仍是开放工作，只做提示；勾选后才随本次一并收起，仍可撤销。</div>` +
     `<div class="ap-hr"></div>` +
     `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` +
-    `<span class="ap-l">自动归档已完成</span></label>` +
+    `<span class="ap-l">自动收起已完成</span></label>` +
     `<div class="ap-row ap-days"><span>超过</span>` +
     `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` +
     `<span>天</span></div>` +
     `<div class="ap-hr"></div>` +
     `<div class="ap-actions">` +
-    `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>归档全部已完成 ${man}</button>` +
-    `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>归档超期已完成 ${fin}</button>` +
-    (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部归档 ${all}</button>` : "") +
+    `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>收起全部已完成 ${man}</button>` +
+    `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>收起超期已完成 ${fin}</button>` +
+    (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部收起 ${all}</button>` : "") +
     `</div>`
 
   const staleBox = pop.querySelector("#apStale")
@@ -1244,28 +1577,48 @@ async function performUndo() {
 
 function updateSessionOptions() {
   if (!controls.session) return
-  const options = [{ id: "all", label: "全部会话" }, ...agenda.map((meta) => ({ id: meta.sessionID, label: truncate(meta.title || meta.sessionID, 28) }))]
+  const options = [{ id: "all", label: "全部会话" }, ...agenda.map((meta) => ({ id: meta.sessionID, label: truncate(titleOf(meta, docOf(meta)), 28) }))]
   controls.session.update({ options })
 }
 
-function updatePhaseOptions() {
-  if (!controls.phase) return
-  const { byPhase } = workspaceCounts()
-  const { rows } = buildRows(byPhase, { aliases: taxonomy.aliases, familyMap: taxonomy.familyMap, showEmpty: false })
-  // The count belongs in the label: with 150 names the list was unreadable, and
-  // sorting by count is the only order a reader can act on.
-  const options = [{ id: "all", label: "全部阶段" }]
-  for (const row of rows) options.push({ id: row.key, label: `${row.label} (${row.count})` })
-  if (filter.phase !== "all" && !rows.some((row) => row.key === filter.phase)) {
-    options.push({ id: filter.phase, label: filter.phase })
+/** The scope tabs, with a count from the index summary alone. */
+function updateScopeControl() {
+  if (!controls.scope) return
+  let open = 0
+  let done = 0
+  for (const meta of agenda) {
+    if (hasOpenWork(meta)) open += 1
+    else if (inScope(meta, "done")) done += 1
   }
-  controls.phase.update({ options, value: filter.phase })
+  controls.scope.update({
+    items: [
+      { id: "open", label: "待办", count: open },
+      { id: "all", label: "全部", count: agenda.length },
+      { id: "done", label: "已完成", count: done },
+    ],
+    activeId: filter.scope,
+  })
 }
 
 function mountToolbar() {
   controls.search = mountSearchField(el("searchHost"), {
     value: "", placeholder: "搜索任务…", label: "搜索任务",
-    onChange: (value) => { filter.query = value; controls.search.update({ value }); paint() },
+    onChange: (value) => { filter.query = value; controls.search.update({ value }); paintSummary(); paint() },
+  })
+  controls.scope = mountTabs(el("scopeHost"), {
+    items: [
+      { id: "open", label: "待办" },
+      { id: "all", label: "全部" },
+      { id: "done", label: "已完成" },
+    ],
+    activeId: filter.scope,
+    onChange: (id) => {
+      filter.scope = id
+      loadedCount = BATCH
+      lastKey = ""
+      updateScopeControl()
+      void renderBoard()
+    },
   })
   controls.session = mountSelect(el("sessionHost"), {
     label: "会话", value: "all", options: [{ id: "all", label: "全部会话" }], searchable: true,
@@ -1276,46 +1629,24 @@ function mountToolbar() {
       void renderBoard()
     },
   })
-  controls.view = mountSelect(el("viewHost"), {
-    label: "视图", value: "tree",
-    options: [{ id: "tree", label: "任务树" }, { id: "swimlane", label: "泳道图" }],
-    onChange: (value) => { filter.view = value; controls.view.update({ value }); paint() },
-  })
   controls.status = mountSelect(el("statusHost"), {
     label: "状态", value: "all",
     options: [
       { id: "all", label: "全部状态" }, { id: "in_progress", label: "进行中" },
-      { id: "pending", label: "待办" }, { id: "completed", label: "已完成" }, { id: "cancelled", label: "已取消" },
+      { id: "pending", label: "待办" }, { id: "blocked", label: "受阻" },
+      { id: "completed", label: "已完成" }, { id: "cancelled", label: "已取消" },
     ],
-    onChange: (value) => { filter.status = value; controls.status.update({ value }); paint() },
-  })
-  controls.phase = mountSelect(el("phaseHost"), {
-    label: "阶段", value: "all", options: [{ id: "all", label: "全部阶段" }],
-    onChange: (value) => { filter.phase = value; controls.phase.update({ value }); paint() },
-  })
-  controls.finished = mountCheckbox(el("finishedHost"), {
-    label: "显示已完成",
-    checked: false,
-    onChange: (checked) => {
-      filter.showFinished = checked
-      controls.finished.update({ checked })
-      paint()
-    },
-  })
-  // Two controls: the direct manual run (all finished, no age gate), and the
-  // sweep's settings popover. Keeping them apart is what stops the automatic
-  // threshold from hiding the reader's explicit action.
-  controls.archiveFinished = mountButton(el("archiveFinishedHost"), {
-    label: "归档已完成 0",
-    variant: "secondary",
-    size: "sm",
-    disabled: true,
-    onClick: () => {
-      if (candidates.manual.length) void archiveChosen(idsOf(candidates.manual))
+    onChange: (value) => {
+      filter.status = value
+      loadedCount = BATCH
+      lastKey = ""
+      controls.status.update({ value })
+      paintSummary()
+      void renderBoard()
     },
   })
   controls.archive = mountButton(el("archiveHost"), {
-    label: "归档候选 0",
+    label: "⋯",
     variant: "secondary",
     size: "sm",
     onClick: () => { toggleArchivePopover() },
@@ -1325,6 +1656,11 @@ function mountToolbar() {
   el("summary").addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null
     if (!target) return
+    if (target.closest("[data-filter]")) { setFilterOpen(!filterOpen); return }
+    if (target.closest("[data-filter-close]")) { setFilterOpen(false); return }
+    const stat = target.closest("[data-stat]")
+    if (stat) { applyStatFilter(stat.dataset.stat); return }
+    if (target.closest("[data-clear]")) { clearFilters(); return }
     const chip = target.closest("[data-phase]")
     if (chip) { togglePhaseFilter(chip.dataset.phase); return }
     const family = target.closest("[data-family]")
@@ -1356,20 +1692,52 @@ function mountToolbar() {
     if (target.closest("#restoreAll")) { void restoreAllArchived(); return }
     if (target.closest("#undoBtn")) { void performUndo(); return }
     if (target.closest("#undoDismiss")) { clearUndo(); paint(); return }
+    const retry = target.closest("[data-retry-session]")
+    if (retry) {
+      docFailures.delete(retry.dataset.retrySession)
+      lastKey = ""
+      void renderBoard()
+      return
+    }
+    const expand = target.closest("[data-expand-session]")
+    if (expand) { expandedSessions.add(expand.dataset.expandSession); paint(); return }
     const archiveButton = target.closest("[data-archive]")
     if (archiveButton) { void archiveSession(archiveButton.dataset.archive); return }
     const restoreButton = target.closest("[data-restore]")
     if (restoreButton) { void restoreSession(restoreButton.dataset.restore); return }
     const row = target.closest(".row")
     if (!row || row.dataset.index === undefined) return
-    selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) }
-    paint()
+    selectRow(row)
+  })
+  el("sessions").addEventListener("keydown", (event) => {
+    const row = event.target instanceof Element ? event.target.closest(".row[data-index]") : null
+    if (!row) return
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault()
+      selectRow(row, true)
+      return
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault()
+      moveRowFocus(row, event.key === "ArrowDown" ? 1 : -1)
+    }
   })
   el("details").addEventListener("click", (event) => {
-    const link = event.target instanceof Element ? event.target.closest("[data-goto]") : null
+    const target = event.target instanceof Element ? event.target : null
+    if (!target) return
+    if (target.closest("#detailClose")) {
+      selected = null
+      paint()
+      const row = el("sessions").querySelector(".row[data-index]")
+      if (row) row.focus()
+      return
+    }
+    const link = target.closest("[data-goto]")
     if (!link || !selected) return
     selected = { sessionID: selected.sessionID, index: Number(link.dataset.goto) }
     paint()
+    const next = el("sessions").querySelector(".row.sel[data-index]")
+    if (next) next.focus()
   })
 }
 
@@ -1510,8 +1878,7 @@ async function refresh() {
     if (!chosen || (isArchived(archive, chosen) && chosen.sessionID !== currentID)) filter.session = "all"
   }
   updateSessionOptions()
-  // Rebuilt whenever the counts move, not just the names: the label carries the count.
-  updatePhaseOptions()
+  updateScopeControl()
   paintSummary()
   paintArchiveControl()
   await renderBoard()
@@ -1598,6 +1965,7 @@ function boot() {
     currentID = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null
     mountToolbar()
     void refresh()
+    void loadSessionInfo()
     start()
   })
   host.onSession((session) => {
