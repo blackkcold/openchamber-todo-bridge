@@ -84,7 +84,7 @@ const manifest = {
     engines: pkg.openchamber.engines,
     contributes: {
       panel: { id: "todo-bridge-test", name: "Todos (Test)", icon: "checkbox-circle", entry: "panel/index.html" },
-      page: { entry: "board/index.html", title: "任务图 (Test)" },
+      page: { entry: "board/index.html", title: "任务总览 (Test)" },
       capabilities: ["sessions"],
       statusSection: {
         entry: "status/index.html",

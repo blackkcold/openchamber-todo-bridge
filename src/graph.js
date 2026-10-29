@@ -228,8 +228,7 @@ export function buildTree(todos, declared = []) {
  *
  * A node is dropped only when it *and all its descendants* are finished, so a
  * surviving task never loses its parent — the pruned list stays a well-formed
- * tree (and a well-formed graph for the board's swimlane view). Expanding the
- * "finished" fold renders the original list instead.
+ * tree. Expanding the "finished" fold renders the original list instead.
  */
 export function pruneFinished(todos) {
   const list = Array.isArray(todos) ? todos : []

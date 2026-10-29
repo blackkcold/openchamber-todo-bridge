@@ -1790,35 +1790,53 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       }
     };
   };
-  // node_modules/@openchamber/sdk/dist/ui/checkbox.js
-  var mountToggle = (root, initial, role) => {
+  // node_modules/@openchamber/sdk/dist/ui/tabs.js
+  var mountTabs = (root, initial) => {
     ensureStyle(UI_CSS);
     let props = initial;
-    const node = button("oc-sdk oc-sdk-check");
-    node.setAttribute("role", role);
-    const control = el("span", role === "switch" ? "oc-sdk-check-thumb" : "oc-sdk-check-box");
-    if (role === "checkbox") {
-      control.append(icon("check", 12));
-    }
-    const text = el("span", "oc-sdk-check-text");
-    const label = el("span", "oc-sdk-check-label");
-    const description = el("span", "oc-sdk-check-desc");
-    text.append(label, description);
-    node.append(control, text);
-    root.append(node);
+    const track = el("div", "oc-sdk oc-sdk-tabs");
+    track.setAttribute("role", "tablist");
+    root.append(track);
     const paint = () => {
-      node.setAttribute("aria-checked", props.checked ? "true" : "false");
-      node.disabled = Boolean(props.disabled);
-      setText(label, props.label);
-      setText(description, props.description);
-      description.hidden = !props.description;
-    };
-    const onClick = () => {
-      if (!props.disabled) {
-        props.onChange(!props.checked);
+      clearNode(track);
+      track.dataset.track = props.trackBackground ? "true" : "false";
+      for (const item of props.items) {
+        const tab = button("oc-sdk-tab");
+        tab.setAttribute("role", "tab");
+        const active2 = item.id === props.activeId;
+        tab.setAttribute("aria-selected", active2 ? "true" : "false");
+        tab.tabIndex = active2 ? 0 : -1;
+        tab.dataset.id = item.id;
+        const label = el("span");
+        label.textContent = item.label;
+        tab.append(label);
+        if (item.count !== undefined) {
+          const count = el("span", "oc-sdk-tab-count");
+          count.textContent = String(item.count);
+          tab.append(count);
+        }
+        tab.addEventListener("click", () => {
+          if (item.id !== props.activeId)
+            props.onChange(item.id);
+        });
+        track.append(tab);
       }
     };
-    node.addEventListener("click", onClick);
+    const onKeyDown = (event) => {
+      const step = navigationKey(event, "horizontal");
+      if (!step) {
+        return;
+      }
+      const next = moveListSelection(props.items, props.activeId, step);
+      if (next && next !== props.activeId) {
+        event.preventDefault();
+        props.onChange(next);
+        const tab = track.querySelector(`[data-id="${CSS.escape(next)}"]`);
+        if (tab instanceof HTMLElement)
+          tab.focus();
+      }
+    };
+    track.addEventListener("keydown", onKeyDown);
     paint();
     return {
       update: (next) => {
@@ -1826,12 +1844,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         paint();
       },
       dispose: () => {
-        node.removeEventListener("click", onClick);
-        node.remove();
+        track.removeEventListener("keydown", onKeyDown);
+        track.remove();
       }
     };
   };
-  var mountCheckbox = (root, initial) => mountToggle(root, initial, "checkbox");
   // src/doc.js
   var STATUSES = new Set(["pending", "in_progress", "completed", "cancelled"]);
   var isFinished = (todo) => todo.status === "completed" || todo.status === "cancelled";
@@ -2103,129 +2120,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return list.filter((_, index) => keep.has(index));
   }
 
-  // src/dag.js
-  var DAG_COL = 150;
-  var DAG_ROW = 42;
-  var DAG_PAD = 26;
-  var UNGROUPED = "未分组";
-  function dagLayout(todos, declared = []) {
-    const list = Array.isArray(todos) ? todos : [];
-    const phases = phaseList(declared, list);
-    const hasUngrouped = list.some((todo) => !(typeof todo.phase === "string" && todo.phase !== ""));
-    const laneNames = hasUngrouped ? [...phases, UNGROUPED] : [...phases];
-    if (laneNames.length === 0)
-      laneNames.push(UNGROUPED);
-    const laneIndexOf = new Map(laneNames.map((name, index) => [name, index]));
-    const taken = new Set;
-    const nodes = list.map((todo, index) => {
-      const id = typeof todo.id === "string" ? todo.id : "";
-      let key = `#${index}`;
-      if (id !== "") {
-        key = taken.has(id) ? `${id}#${index}` : id;
-        taken.add(id);
-      }
-      const phase = typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : UNGROUPED;
-      return {
-        index,
-        key,
-        content: todo.content,
-        status: todo.status,
-        phase,
-        colorIndex: phase === UNGROUPED ? -1 : phaseColorIndex(todo.phase, phases),
-        lane: laneIndexOf.has(phase) ? laneIndexOf.get(phase) : laneNames.length - 1,
-        rank: 0,
-        slot: 0,
-        x: 0,
-        y: 0,
-        blocked: false
-      };
-    });
-    const idToIndex = new Map;
-    for (const node of nodes) {
-      const id = list[node.index].id;
-      if (typeof id === "string" && id !== "" && !idToIndex.has(id))
-        idToIndex.set(id, node.index);
-    }
-    const statusByIndex = nodes.map((node) => node.status);
-    const predSet = nodes.map(() => new Set);
-    const succSet = nodes.map(() => new Set);
-    const edges = [];
-    const link = (from, to, kind) => {
-      if (from === undefined || to === undefined || from === to)
-        return;
-      edges.push({ from, to, kind });
-      predSet[to].add(from);
-      succSet[from].add(to);
-    };
-    for (const node of nodes) {
-      const todo = list[node.index];
-      if (typeof todo.parentId === "string" && todo.parentId !== "") {
-        const parent = idToIndex.get(todo.parentId);
-        if (parent !== undefined)
-          link(parent, node.index, "parent");
-      }
-      if (Array.isArray(todo.dependsOn)) {
-        for (const dep of todo.dependsOn) {
-          const target = idToIndex.get(dep);
-          if (target !== undefined)
-            link(target, node.index, "depends");
-        }
-        node.blocked = (todo.status === "pending" || todo.status === "in_progress") && todo.dependsOn.some((dep) => {
-          const target = idToIndex.get(dep);
-          return target !== undefined && statusByIndex[target] !== "completed";
-        });
-      }
-    }
-    const indeg = predSet.map((set) => set.size);
-    const queue = [];
-    for (let i = 0;i < nodes.length; i += 1)
-      if (indeg[i] === 0)
-        queue.push(i);
-    for (let head = 0;head < queue.length; head += 1) {
-      const u = queue[head];
-      for (const v2 of succSet[u]) {
-        if (nodes[u].rank + 1 > nodes[v2].rank)
-          nodes[v2].rank = nodes[u].rank + 1;
-        indeg[v2] -= 1;
-        if (indeg[v2] === 0)
-          queue.push(v2);
-      }
-    }
-    const cellCount = new Map;
-    for (const node of nodes) {
-      const cell = `${node.lane}:${node.rank}`;
-      node.slot = cellCount.get(cell) || 0;
-      cellCount.set(cell, node.slot + 1);
-    }
-    const laneSlots = laneNames.map(() => 1);
-    for (const node of nodes) {
-      const used = cellCount.get(`${node.lane}:${node.rank}`);
-      if (used > laneSlots[node.lane])
-        laneSlots[node.lane] = used;
-    }
-    const laneTop = [];
-    let cursor = DAG_PAD;
-    for (let i = 0;i < laneNames.length; i += 1) {
-      laneTop.push(cursor);
-      cursor += laneSlots[i] * DAG_ROW + DAG_PAD;
-    }
-    const lanes = laneNames.map((name, index) => ({
-      name,
-      index,
-      y: laneTop[index],
-      height: laneSlots[index] * DAG_ROW + DAG_PAD,
-      colorIndex: name === UNGROUPED ? -1 : phaseColorIndex(name, phases)
-    }));
-    for (const node of nodes) {
-      node.x = DAG_PAD + node.rank * DAG_COL + DAG_COL / 2;
-      node.y = laneTop[node.lane] + DAG_PAD / 2 + node.slot * DAG_ROW + DAG_ROW / 2;
-    }
-    const columns = nodes.reduce((max, node) => Math.max(max, node.rank + 1), 1);
-    const width = DAG_PAD + columns * DAG_COL;
-    const height = laneTop[laneNames.length - 1] + laneSlots[laneNames.length - 1] * DAG_ROW + DAG_PAD;
-    return { nodes, edges, lanes, width, height, colWidth: DAG_COL, rowHeight: DAG_ROW };
-  }
-
   // src/gutter.js
   var GUT_NODE = 11;
   var NODE_Y = 11;
@@ -2285,6 +2179,235 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       }
     }
     return `<svg class="gut-svg" aria-hidden="true">${body}</svg>`;
+  }
+
+  // src/archive.js
+  var ARCHIVE_KEY = "archive";
+  var ARCHIVE_VERSION = 1;
+  var PREFS_KEY = "archive:prefs";
+  var PREFS_VERSION = 2;
+  var DEFAULT_DAYS = 7;
+  var MAX_DAYS = 365;
+  var DAY_MS = 86400000;
+  function emptyArchive() {
+    return { version: ARCHIVE_VERSION, sessions: {} };
+  }
+  function parseArchive(raw) {
+    const out = emptyArchive();
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+      return out;
+    const src = raw.sessions;
+    if (src === null || typeof src !== "object" || Array.isArray(src))
+      return out;
+    for (const [sessionID, at] of Object.entries(src)) {
+      if (typeof sessionID !== "string" || sessionID === "")
+        continue;
+      if (!Number.isFinite(at))
+        continue;
+      out.sessions[sessionID] = at;
+    }
+    return out;
+  }
+  function emptyPrefs() {
+    return { version: PREFS_VERSION, auto: true, days: DEFAULT_DAYS };
+  }
+  function clampDays(value, fallback = DEFAULT_DAYS) {
+    const n = Number(value);
+    if (!Number.isFinite(n))
+      return fallback;
+    return Math.min(MAX_DAYS, Math.max(0, Math.floor(n)));
+  }
+  function parsePrefs(raw) {
+    const out = emptyPrefs();
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+      return out;
+    if (typeof raw.auto === "boolean")
+      out.auto = raw.auto;
+    if (Number.isFinite(raw.days))
+      out.days = clampDays(raw.days);
+    else if (raw.version === 1)
+      out.days = 0;
+    return out;
+  }
+  function isArchived(entry, meta) {
+    if (!entry || !meta || typeof meta.sessionID !== "string")
+      return false;
+    const at = entry.sessions ? entry.sessions[meta.sessionID] : undefined;
+    if (!Number.isFinite(at))
+      return false;
+    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
+    return at >= updated;
+  }
+  function partition(metas, entry, keepActiveID) {
+    const active2 = [];
+    const archived = [];
+    for (const meta of Array.isArray(metas) ? metas : []) {
+      if (meta.sessionID === keepActiveID || !isArchived(entry, meta))
+        active2.push(meta);
+      else
+        archived.push(meta);
+    }
+    return { active: active2, archived };
+  }
+  function isFullyFinished(meta) {
+    if (!meta || !Number.isFinite(meta.total) || meta.total <= 0)
+      return false;
+    return (meta.doing || 0) === 0 && (meta.pending || 0) === 0;
+  }
+  function archiveCandidates(metas, entry, opts = {}) {
+    const finished = [];
+    const stale = [];
+    const manual = [];
+    const keep = new Set(Array.isArray(opts.keep) ? opts.keep : []);
+    const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {};
+    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+    const days = clampDays(opts.days, 0);
+    for (const meta of Array.isArray(metas) ? metas : []) {
+      if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "")
+        continue;
+      if (keep.has(meta.sessionID))
+        continue;
+      if (isArchived(entry, meta))
+        continue;
+      const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
+      if (updated > now)
+        continue;
+      const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity;
+      if (updated <= restored)
+        continue;
+      const age = (now - updated) / DAY_MS;
+      const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) };
+      const done = isFullyFinished(meta);
+      if (done)
+        manual.push(item);
+      if (age < days)
+        continue;
+      if ((meta.blocked || 0) > 0)
+        continue;
+      if (done)
+        finished.push(item);
+      else
+        stale.push(item);
+    }
+    return { finished, stale, manual };
+  }
+  function autoArchiveIDs(metas, entry, opts = {}) {
+    if (!opts.readOk)
+      return [];
+    return archiveCandidates(metas, entry, opts).finished.map((item) => item.sessionID);
+  }
+  function withArchived(entry, ids, now) {
+    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
+    for (const id of Array.isArray(ids) ? ids : []) {
+      if (typeof id === "string" && id !== "")
+        sessions[id] = now;
+    }
+    return { version: ARCHIVE_VERSION, sessions };
+  }
+  function withoutArchived(entry, ids) {
+    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
+    for (const id of Array.isArray(ids) ? ids : [])
+      delete sessions[id];
+    return { version: ARCHIVE_VERSION, sessions };
+  }
+
+  // src/queue.js
+  function hasOpenWork(meta) {
+    if (!meta)
+      return false;
+    if (Number.isFinite(meta.total))
+      return (meta.doing || 0) + (meta.pending || 0) > 0;
+    return true;
+  }
+  function inScope(meta, scope) {
+    if (!meta)
+      return false;
+    if (scope === "open")
+      return hasOpenWork(meta);
+    if (scope === "done")
+      return isFullyFinished(meta);
+    return true;
+  }
+  function openRank(meta) {
+    if (!meta)
+      return 2;
+    if ((meta.blocked || 0) > 0)
+      return 0;
+    if ((meta.doing || 0) > 0)
+      return 1;
+    return 2;
+  }
+  function compareOpen(a, b) {
+    const rank = openRank(a) - openRank(b);
+    if (rank !== 0)
+      return rank;
+    return (b.updatedAt || 0) - (a.updatedAt || 0);
+  }
+  function scopeMetas(metas, scope) {
+    const list = (Array.isArray(metas) ? metas : []).filter((meta) => inScope(meta, scope));
+    if (scope !== "open")
+      return list;
+    return [...list].sort(compareOpen);
+  }
+  function matchIndices(todos, predicate) {
+    const list = Array.isArray(todos) ? todos : [];
+    const byId = new Map;
+    for (let i = 0;i < list.length; i += 1) {
+      const id = list[i] && list[i].id;
+      if (typeof id === "string" && id !== "" && !byId.has(id))
+        byId.set(id, i);
+    }
+    const keep = new Set;
+    for (let i = 0;i < list.length; i += 1) {
+      if (predicate(list[i]))
+        keep.add(i);
+    }
+    const count = keep.size;
+    for (const start of [...keep]) {
+      const seen = new Set([start]);
+      let parentId = list[start] && list[start].parentId;
+      while (typeof parentId === "string" && parentId !== "" && byId.has(parentId)) {
+        const parent = byId.get(parentId);
+        if (seen.has(parent))
+          break;
+        seen.add(parent);
+        if (!keep.has(parent))
+          keep.add(parent);
+        parentId = list[parent] && list[parent].parentId;
+      }
+    }
+    return { keep, count };
+  }
+  function filterList(todos, predicate) {
+    const list = Array.isArray(todos) ? todos : [];
+    const { keep, count } = matchIndices(list, predicate);
+    return { todos: list.filter((_, index) => keep.has(index)), count };
+  }
+  function isBlocked(todo, statusById) {
+    if (!todo || todo.status !== "pending" && todo.status !== "in_progress")
+      return false;
+    if (!Array.isArray(todo.dependsOn) || !(statusById instanceof Map))
+      return false;
+    return todo.dependsOn.some((dep) => statusById.has(dep) && statusById.get(dep) !== "completed");
+  }
+  var MINUTE = 60000;
+  var HOUR = 60 * MINUTE;
+  var DAY = 24 * HOUR;
+  function relativeTime(at, now = Date.now()) {
+    if (!Number.isFinite(at) || at <= 0)
+      return "";
+    const delta = Math.max(0, (Number.isFinite(now) ? now : Date.now()) - at);
+    if (delta < MINUTE)
+      return "刚刚";
+    if (delta < HOUR)
+      return `${Math.floor(delta / MINUTE)} 分钟前`;
+    if (delta < DAY)
+      return `${Math.floor(delta / HOUR)} 小时前`;
+    if (delta < 30 * DAY)
+      return `${Math.floor(delta / DAY)} 天前`;
+    if (delta < 365 * DAY)
+      return `${Math.floor(delta / (30 * DAY))} 个月前`;
+    return `${Math.floor(delta / (365 * DAY))} 年前`;
   }
 
   // src/taxonomy.js
@@ -2645,146 +2768,15 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return key ? `失败：${key}` : "失败：未知错误";
   }
 
-  // src/archive.js
-  var ARCHIVE_KEY = "archive";
-  var ARCHIVE_VERSION = 1;
-  var PREFS_KEY = "archive:prefs";
-  var PREFS_VERSION = 2;
-  var DEFAULT_DAYS = 7;
-  var MAX_DAYS = 365;
-  var DAY_MS = 86400000;
-  function emptyArchive() {
-    return { version: ARCHIVE_VERSION, sessions: {} };
-  }
-  function parseArchive(raw) {
-    const out = emptyArchive();
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-      return out;
-    const src = raw.sessions;
-    if (src === null || typeof src !== "object" || Array.isArray(src))
-      return out;
-    for (const [sessionID, at] of Object.entries(src)) {
-      if (typeof sessionID !== "string" || sessionID === "")
-        continue;
-      if (!Number.isFinite(at))
-        continue;
-      out.sessions[sessionID] = at;
-    }
-    return out;
-  }
-  function emptyPrefs() {
-    return { version: PREFS_VERSION, auto: true, days: DEFAULT_DAYS };
-  }
-  function clampDays(value, fallback = DEFAULT_DAYS) {
-    const n = Number(value);
-    if (!Number.isFinite(n))
-      return fallback;
-    return Math.min(MAX_DAYS, Math.max(0, Math.floor(n)));
-  }
-  function parsePrefs(raw) {
-    const out = emptyPrefs();
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw))
-      return out;
-    if (typeof raw.auto === "boolean")
-      out.auto = raw.auto;
-    if (Number.isFinite(raw.days))
-      out.days = clampDays(raw.days);
-    else if (raw.version === 1)
-      out.days = 0;
-    return out;
-  }
-  function isArchived(entry, meta) {
-    if (!entry || !meta || typeof meta.sessionID !== "string")
-      return false;
-    const at = entry.sessions ? entry.sessions[meta.sessionID] : undefined;
-    if (!Number.isFinite(at))
-      return false;
-    const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
-    return at >= updated;
-  }
-  function partition(metas, entry, keepActiveID) {
-    const active2 = [];
-    const archived = [];
-    for (const meta of Array.isArray(metas) ? metas : []) {
-      if (meta.sessionID === keepActiveID || !isArchived(entry, meta))
-        active2.push(meta);
-      else
-        archived.push(meta);
-    }
-    return { active: active2, archived };
-  }
-  function isFullyFinished(meta) {
-    if (!meta || !Number.isFinite(meta.total) || meta.total <= 0)
-      return false;
-    return (meta.doing || 0) === 0 && (meta.pending || 0) === 0;
-  }
-  function archiveCandidates(metas, entry, opts = {}) {
-    const finished = [];
-    const stale = [];
-    const manual = [];
-    const keep = new Set(Array.isArray(opts.keep) ? opts.keep : []);
-    const hold = opts.hold && typeof opts.hold === "object" ? opts.hold : {};
-    const now = Number.isFinite(opts.now) ? opts.now : Date.now();
-    const days = clampDays(opts.days, 0);
-    for (const meta of Array.isArray(metas) ? metas : []) {
-      if (!meta || typeof meta.sessionID !== "string" || meta.sessionID === "")
-        continue;
-      if (keep.has(meta.sessionID))
-        continue;
-      if (isArchived(entry, meta))
-        continue;
-      const updated = Number.isFinite(meta.updatedAt) ? meta.updatedAt : 0;
-      if (updated > now)
-        continue;
-      const restored = Number.isFinite(hold[meta.sessionID]) ? hold[meta.sessionID] : -Infinity;
-      if (updated <= restored)
-        continue;
-      const age = (now - updated) / DAY_MS;
-      const item = { sessionID: meta.sessionID, ageDays: Math.floor(age) };
-      const done = isFullyFinished(meta);
-      if (done)
-        manual.push(item);
-      if (age < days)
-        continue;
-      if ((meta.blocked || 0) > 0)
-        continue;
-      if (done)
-        finished.push(item);
-      else
-        stale.push(item);
-    }
-    return { finished, stale, manual };
-  }
-  function autoArchiveIDs(metas, entry, opts = {}) {
-    if (!opts.readOk)
-      return [];
-    return archiveCandidates(metas, entry, opts).finished.map((item) => item.sessionID);
-  }
-  function withArchived(entry, ids, now) {
-    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
-    for (const id of Array.isArray(ids) ? ids : []) {
-      if (typeof id === "string" && id !== "")
-        sessions[id] = now;
-    }
-    return { version: ARCHIVE_VERSION, sessions };
-  }
-  function withoutArchived(entry, ids) {
-    const sessions = { ...entry && entry.sessions ? entry.sessions : {} };
-    for (const id of Array.isArray(ids) ? ids : [])
-      delete sessions[id];
-    return { version: ARCHIVE_VERSION, sessions };
-  }
-
   // src/board.js
   var BUSY_POLL_MS = 1500;
   var IDLE_POLL_MS = 5000;
   var ARCHIVE_READ_TTL_MS = 1e4;
   var PREFS_READ_TTL_MS = 30000;
   var TODOS_DIR = "~/.config/openchamber/todos";
-  var UNGROUPED2 = "未分组";
-  var CHIP_W = DAG_COL - 34;
-  var CHIP_H = 26;
+  var UNGROUPED = "未分组";
   var BATCH = 15;
+  var CARD_TOP = 3;
   ensureGutStyle(document);
   var el2 = (id) => document.getElementById(id);
   var esc = (value) => String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
@@ -2800,6 +2792,9 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var indexStamp = "";
   var indexMetas = null;
   var allMetas = [];
+  var sessionInfo = new Map;
+  var sessionInfoLoaded = false;
+  var sessionInfoLoading = false;
   var agenda = [];
   var archived = [];
   var archive = emptyArchive();
@@ -2807,12 +2802,14 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var archivedLoadedCount = BATCH;
   var globalPhases = [];
   var docCache = new Map;
+  var docFailures = new Map;
   var loadedCount = BATCH;
   var currentID = null;
   var renderSeq = 0;
   var loadingMore = false;
-  var filter = { query: "", status: "all", phase: "all", view: "tree", session: "all", showFinished: false };
+  var filter = { query: "", status: "all", phase: "all", scope: "open", session: "all" };
   var selected = null;
+  var expandedSessions = new Set;
   var controls = {};
   var detailHandles = [];
   var observers = [];
@@ -2835,6 +2832,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   var classifying = false;
   var aiToastShown = false;
   var manageOpen = false;
+  var filterOpen = false;
   var aiTest = { state: "idle", text: "" };
   var aiArmedAt = Date.now();
   var ARCHIVE_UNDO_MS = 9000;
@@ -2845,6 +2843,9 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return cached && cached.updatedAt === meta.updatedAt ? cached : null;
   }
   function titleOf(meta, doc) {
+    const info = meta ? sessionInfo.get(meta.sessionID) : null;
+    if (info && info.title)
+      return info.title;
     if (meta && meta.title)
       return meta.title;
     const todos = doc ? doc.todos : [];
@@ -2852,26 +2853,109 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const root = todos.find((todo) => !todo.parentId);
     return (active2 || root || {}).content || (meta ? meta.sessionID : "");
   }
+  function directoryOf(meta) {
+    const info = meta ? sessionInfo.get(meta.sessionID) : null;
+    return info && info.directory ? info.directory : "";
+  }
   function filtering() {
     return filter.query !== "" || filter.status !== "all" || filter.phase !== "all";
   }
-  function matches(todo) {
-    if (filter.query && !todo.content.toLowerCase().includes(filter.query.toLowerCase()))
+  function matches(todo, statusById) {
+    if (filter.status === "blocked") {
+      if (!isBlocked(todo, statusById))
+        return false;
+    } else if (filter.status !== "all" && todo.status !== filter.status)
       return false;
-    if (filter.status !== "all" && todo.status !== filter.status)
+    if (filter.query && !todo.content.toLowerCase().includes(filter.query.toLowerCase()))
       return false;
     if (filter.phase !== "all" && normalizePhase(todo.phase || "") !== filter.phase)
       return false;
     return true;
   }
+  function rowsFor(session) {
+    const open = session.todos.some((todo) => !isDone(todo.status));
+    const wantsFinished = filter.status === "completed" || filter.status === "cancelled" || !open;
+    const base = wantsFinished ? session.todos : pruneFinished(session.todos);
+    const statusById = new Map;
+    for (const todo of session.todos)
+      if (todo.id)
+        statusById.set(todo.id, todo.status);
+    if (!filtering()) {
+      const openTodos = base.filter((todo) => !isDone(todo.status));
+      const fold = openTodos.length > CARD_TOP && session.sessionID !== currentID && filter.session !== session.sessionID && !expandedSessions.has(session.sessionID);
+      if (!fold)
+        return { todos: base, matches: 0, folded: 0, statusById };
+      const first = new Set(openTodos.slice(0, CARD_TOP));
+      const { todos: todos2 } = filterList(base, (todo) => first.has(todo));
+      return { todos: todos2, matches: 0, folded: openTodos.length - CARD_TOP, statusById };
+    }
+    const { todos, count } = filterList(base, (todo) => matches(todo, statusById));
+    return { todos, matches: count, folded: 0, statusById };
+  }
+  function hasMatch(meta) {
+    const doc = docOf(meta);
+    if (!doc)
+      return docFailures.get(meta.sessionID) === meta.updatedAt;
+    return rowsFor(materialize(meta)).matches > 0;
+  }
+  function scopeLabel() {
+    if (filter.scope === "done")
+      return "已完成会话";
+    if (filter.scope === "all")
+      return "全部会话";
+    return "待办会话";
+  }
+  function scopeEmptyNote() {
+    if (filter.scope === "done")
+      return "还没有已完成的会话。";
+    if (filter.scope === "open")
+      return "没有待办会话。所有任务都已完成。";
+    return archived.length ? "当前没有进行中的会话；下面是被收起的。" : "还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。";
+  }
   function pinnedMeta() {
     const byCurrent = currentID ? metaOf(currentID) : null;
-    return byCurrent || agenda[0] || null;
+    return byCurrent && inScope(byCurrent, filter.scope) ? byCurrent : null;
+  }
+  function metaMatchesStatus(meta) {
+    if (filter.status === "all")
+      return true;
+    if (!meta || !Number.isFinite(meta.total))
+      return true;
+    if (filter.status === "blocked")
+      return (meta.blocked || 0) > 0;
+    if (filter.status === "in_progress")
+      return (meta.doing || 0) > 0;
+    if (filter.status === "pending")
+      return (meta.pending || 0) > 0;
+    if (filter.status === "completed")
+      return (meta.done || 0) > 0;
+    if (filter.status === "cancelled")
+      return (meta.cancelled || 0) > 0;
+    return true;
+  }
+  function metaMatchesPhase(meta) {
+    if (filter.phase === "all")
+      return true;
+    if (!meta || !Number.isFinite(meta.total))
+      return true;
+    for (const [name, count] of Object.entries(meta.byPhase || {})) {
+      if ((count || 0) > 0 && normalizePhase(name) === filter.phase)
+        return true;
+    }
+    return false;
+  }
+  function candidateMetas() {
+    let list = scopeMetas(agenda, filter.scope);
+    if (filter.status !== "all")
+      list = list.filter(metaMatchesStatus);
+    if (filter.phase !== "all")
+      list = list.filter(metaMatchesPhase);
+    return list;
   }
   function listMetas() {
     const pinned = pinnedMeta();
     const pinnedID = pinned ? pinned.sessionID : null;
-    return agenda.filter((meta) => meta.sessionID !== pinnedID);
+    return candidateMetas().filter((meta) => meta.sessionID !== pinnedID);
   }
   function windowMetas() {
     if (filter.session !== "all") {
@@ -2886,16 +2970,22 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     return out;
   }
   async function ensureDocs(metas) {
-    const need = metas.filter((meta) => !docOf(meta));
+    const need = metas.filter((meta) => !docOf(meta) && docFailures.get(meta.sessionID) !== meta.updatedAt);
     if (!need.length)
       return;
     await Promise.all(need.map(async (meta) => {
       try {
         const { content } = await host.readFile(`${TODOS_DIR}/${meta.sessionID}.json`);
         const doc = parseDoc(content);
-        if (doc)
+        if (doc) {
           docCache.set(meta.sessionID, { updatedAt: meta.updatedAt, todos: doc.todos, phases: doc.phases });
-      } catch {}
+          docFailures.delete(meta.sessionID);
+        } else {
+          docFailures.set(meta.sessionID, meta.updatedAt);
+        }
+      } catch {
+        docFailures.set(meta.sessionID, meta.updatedAt);
+      }
     }));
   }
   function materialize(meta) {
@@ -2907,7 +2997,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       phases: doc ? doc.phases : []
     };
   }
-  function sessionHeader(meta, opts = {}) {
+  function sessionHeader(meta, opts = {}, matchCount = 0) {
     const doc = docOf(meta);
     let done, total;
     if (Number.isFinite(meta.total)) {
@@ -2919,90 +3009,99 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       done = todos.filter((todo) => isDone(todo.status)).length;
     }
     const pct = total ? Math.round(done / total * 100) : 0;
-    const action = opts.archive ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="把这个会话收进已归档">归档</button>` : opts.restore ? `<button type="button" class="sess-act" data-restore="${esc(meta.sessionID)}" title="把这个会话移回最近会话">恢复</button>` : "";
-    return `<div class="sess-head"><h3>${esc(titleOf(meta, doc))}</h3>` + `<span class="cnt">${done}/${total}</span>${action}</div>` + `<div class="prog"><i style="width:${pct}%"></i></div>`;
+    const action = opts.archive ? `<button type="button" class="sess-act" data-archive="${esc(meta.sessionID)}" title="收起这个会话，放到「已收起」">收起</button>` : opts.restore ? `<button type="button" class="sess-act" data-restore="${esc(meta.sessionID)}" title="把这个会话移回最近会话">恢复</button>` : "";
+    const counts = `${done}/${total}${matchCount ? ` · ${matchCount} 项匹配` : ""}`;
+    const title = titleOf(meta, doc);
+    const directory = directoryOf(meta);
+    return `<div class="sess-head"><h3${directory ? ` title="${esc(directory)}"` : ""}>${esc(title)}</h3>` + `<span class="time">${relativeTime(meta.updatedAt)}</span>` + `<span class="cnt">${counts}</span>${action}</div>` + `<div class="prog"><i style="width:${pct}%"></i></div>`;
   }
   function hiddenNote(session) {
     const hidden = session.todos.length - pruneFinished(session.todos).length;
-    return `<div class="note" style="padding:4px 6px">${hidden} 项已完成，已隐藏（勾选「显示已完成」查看）。</div>`;
+    return `<div class="note" style="padding:4px 6px">${hidden} 项已完成，已隐藏（状态筛选「已完成」查看）。</div>`;
   }
-  function treeRowsHtml(session) {
-    const list = filter.showFinished || filter.status === "completed" || filter.status === "cancelled" ? session.todos : pruneFinished(session.todos);
+  function treeRowsHtml(session, visible) {
+    const list = visible.todos;
     if (!list.length)
       return hiddenNote(session);
     const original = new Map(session.todos.map((todo, index) => [todo, index]));
     const { rows } = buildTree(list, globalPhases);
-    const active2 = filtering();
-    return rows.map((row) => {
+    const html = rows.map((row) => {
       const width = row.depth * INDENT + GUT_NODE;
       if (row.synthetic) {
-        return `<div class="row group" data-session="${esc(session.sessionID)}">` + `<span class="gut" style="width:${width}px">${gutterSvg(row, "")}</span>` + `<span class="txt group-label" style="color:${phaseColor(row.colorIndex)}">${esc(row.content)}</span></div>`;
+        return `<div class="row group" data-session="${esc(session.sessionID)}">` + `<span class="gut" style="width:${width}px">${gutterSvg(row, "")}</span>` + `<span class="txt group-label">${esc(row.content)}</span></div>`;
       }
       const todo = list[row.index];
       const index = original.get(todo);
-      const dim = active2 && !matches(todo) ? " dim" : "";
       const sel = selected && selected.sessionID === session.sessionID && selected.index === index ? " sel" : "";
-      const blocked = row.blocked ? `<span class="pill blocked">受阻</span>` : "";
+      const blocked = isBlocked(todo, visible.statusById) ? `<span class="pill blocked">受阻</span>` : "";
       const phase = todo.phase ? `<span class="pill">${esc(todo.phase)}</span>` : "";
-      return `<div class="row ${esc(todo.status)}${dim}${sel}" data-session="${esc(session.sessionID)}" data-index="${index}">` + `<span class="gut" style="width:${width}px">${gutterSvg(row, todo.status)}</span>` + `<span class="txt">${esc(todo.content)}</span>${blocked}${phase}</div>`;
+      return `<div class="row ${esc(todo.status)}${sel}" data-session="${esc(session.sessionID)}" data-index="${index}"` + ` role="button" tabindex="-1" aria-pressed="${sel ? "true" : "false"}">` + `<span class="gut" style="width:${width}px">${gutterSvg(row, todo.status)}</span>` + `<span class="txt">${esc(todo.content)}</span>${blocked}${phase}</div>`;
     }).join("");
-  }
-  function swimlaneSvg(session) {
-    const list = filter.showFinished || filter.status === "completed" || filter.status === "cancelled" ? session.todos : pruneFinished(session.todos);
-    if (!list.length)
-      return hiddenNote(session);
-    const { nodes, edges, lanes, width, height } = dagLayout(list, globalPhases);
-    const parts = [];
-    for (const lane of lanes) {
-      const color = colorAt(lane.colorIndex);
-      parts.push(`<rect x="0" y="${lane.y}" width="${width}" height="${lane.height}" fill="${color}" opacity="0.05"/>`);
-      parts.push(`<text x="6" y="${lane.y + 16}" font-size="11" font-weight="600" fill="${color}">${esc(lane.name)}</text>`);
-    }
-    for (const edge of edges) {
-      const a = nodes[edge.from];
-      const b = nodes[edge.to];
-      const dx = Math.max(18, Math.abs(b.x - a.x) * 0.45);
-      const d = `M${a.x} ${a.y} C${a.x + dx} ${a.y}, ${b.x - dx} ${b.y}, ${b.x} ${b.y}`;
-      const depends = edge.kind === "depends";
-      parts.push(`<path d="${d}" fill="none" stroke="${depends ? "var(--oc-error, #af3029)" : "var(--oc-muted, #b9b7ad)"}"` + ` stroke-width="1.5" opacity="${depends ? 0.9 : 0.7}"${depends ? ' stroke-dasharray="3 3"' : ""}/>`);
-    }
-    for (const node of nodes) {
-      const x = node.x - CHIP_W / 2;
-      const y = node.y - CHIP_H / 2;
-      const phase = colorAt(node.colorIndex);
-      const text = esc(truncate(node.content, 15));
-      if (isDone(node.status) || node.status === "in_progress") {
-        const fill = isDone(node.status) ? "var(--oc-success, #66800b)" : "var(--oc-primary, #205ea6)";
-        parts.push(`<rect x="${x}" y="${y}" width="${CHIP_W}" height="${CHIP_H}" rx="7" fill="${fill}"/>`);
-        if (node.status === "in_progress") {
-          parts.push(`<rect x="${x - 3}" y="${y - 3}" width="${CHIP_W + 6}" height="${CHIP_H + 6}" rx="9" fill="none" stroke="${fill}" stroke-width="1.6" opacity="0.5"/>`);
-        }
-        parts.push(`<text x="${node.x}" y="${node.y + 4}" font-size="10" fill="#fff" text-anchor="middle">${text}${isDone(node.status) ? " ✓" : " ◐"}</text>`);
-      } else {
-        const stroke = node.blocked ? "var(--oc-error, #af3029)" : phase;
-        parts.push(`<rect x="${x}" y="${y}" width="${CHIP_W}" height="${CHIP_H}" rx="7" fill="none" stroke="${stroke}" stroke-width="1.6"${node.blocked ? ' stroke-dasharray="4 3"' : ""}/>`);
-        parts.push(`<text x="${node.x}" y="${node.y + 4}" font-size="10" fill="var(--oc-fg, #100f0f)" text-anchor="middle">${text}${node.blocked ? " ⛓" : " ○"}</text>`);
-      }
-    }
-    return `<div class="swim"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-label="${esc(titleOf({ sessionID: session.sessionID }))}">${parts.join("")}</svg></div>`;
+    const more = visible.folded ? `<button type="button" class="row-more" data-expand-session="${esc(session.sessionID)}">还有 ${visible.folded} 项未完成</button>` : "";
+    return html + more;
   }
   function sessionCard(meta, current, archivedCard = false) {
     const doc = docOf(meta);
-    const body = doc ? filter.view === "swimlane" ? swimlaneSvg(materialize(meta)) : treeRowsHtml(materialize(meta)) : `<div class="note">加载中…</div>`;
+    let body = `<div class="note">加载中…</div>`;
+    let matchCount = 0;
+    if (doc) {
+      const session = materialize(meta);
+      const visible = rowsFor(session);
+      matchCount = visible.matches;
+      body = treeRowsHtml(session, visible);
+    } else if (docFailures.get(meta.sessionID) === meta.updatedAt) {
+      body = `<div class="note">任务镜像读取失败。` + `<button type="button" class="link" data-retry-session="${esc(meta.sessionID)}">重试</button></div>`;
+    }
     const tag = current ? `<div class="pin-tag">当前会话</div>` : "";
     const opts = archivedCard ? { restore: true } : { archive: true };
     const cls = `sess${current ? " pinned" : ""}${archivedCard && !current ? " archived" : ""}`;
-    return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts)}${body}</section>`;
+    return `<section class="${cls}" data-session="${esc(meta.sessionID)}">${tag}${sessionHeader(meta, opts, matchCount)}${body}</section>`;
   }
-  function hasMatch(meta) {
-    const doc = docOf(meta);
-    return Boolean(doc && doc.todos.some(matches));
+  function ensureRowTabStop() {
+    const box = el2("sessions");
+    if (!box)
+      return;
+    const rows = box.querySelectorAll(".row[data-index]");
+    if (!rows.length)
+      return;
+    const target = box.querySelector(".row.sel[data-index]") || rows[0];
+    for (const row of rows)
+      row.tabIndex = -1;
+    target.tabIndex = 0;
+  }
+  function selectRow(row, focus2 = false) {
+    if (!row || row.dataset.index === undefined)
+      return;
+    selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) };
+    paint();
+    if (!focus2)
+      return;
+    const next = el2("sessions").querySelector(".row.sel[data-index]");
+    if (next)
+      next.focus();
+  }
+  function moveRowFocus(row, step) {
+    const box = el2("sessions");
+    if (!box)
+      return;
+    const rows = [...box.querySelectorAll(".row[data-index]")];
+    const at = rows.indexOf(row);
+    if (at < 0)
+      return;
+    const next = rows[Math.max(0, Math.min(rows.length - 1, at + step))];
+    if (!next || next === row)
+      return;
+    for (const item of rows)
+      item.tabIndex = -1;
+    next.tabIndex = 0;
+    next.focus();
+    next.scrollIntoView({ block: "nearest" });
   }
   function sentinelHtml(list, considered) {
     const more = considered.length < list.length;
     let html = more ? `<div id="sentinel" class="sentinel">↓ 滚动到底加载下一批（还有 ${list.length - considered.length} 个会话）</div>` : `<div class="endnote">已到末尾 · 共 ${list.length} 个会话</div>`;
-    if (filtering() && more) {
-      html += `<div class="endnote">筛选只作用于已加载的 ${considered.length} 个会话 · ` + `<button type="button" id="loadAll" class="link">加载全部以筛选</button></div>`;
+    if (filter.query && more) {
+      html += `<div class="endnote">文本搜索只作用于已加载的 ${considered.length} 个会话 · ` + `<button type="button" id="loadAll" class="link">加载全部以搜索</button></div>`;
     }
     return html;
   }
@@ -3012,6 +3111,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       const meta = metaOf(filter.session);
       box.innerHTML = undoBarHtml() + (meta ? sessionCard(meta, meta.sessionID === currentID, isArchived(archive, meta)) : `<div class="note">该会话已不存在。</div>`);
       paintDetails();
+      ensureRowTabStop();
       observeSentinel();
       return;
     }
@@ -3020,21 +3120,24 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const considered = list.slice(0, loadedCount);
     const shown = filtering() ? considered.filter(hasMatch) : considered;
     const cards = shown.map((meta) => sessionCard(meta, false)).join("");
-    const countNote = filtering() ? ` · 命中 ${shown.length}` : "";
-    const main = pinned ? sessionCard(pinned, true, isArchived(archive, pinned)) + `<div class="divider">最近会话 · 已显示 ${considered.length} / ${list.length}${countNote}</div>` + (cards || `<div class="note">没有匹配的任务。</div>`) + sentinelHtml(list, considered) : archived.length ? `<div class="note">当前没有进行中的会话；下面是已归档的。</div>` : `<div class="note">还没有任何会话的任务。在任一会话里触发一次任务更新（todowrite）即可。</div>`;
-    box.innerHTML = undoBarHtml() + main + archivedSectionHtml();
+    const countNote = filtering() ? ` · 命中 ${shown.length} 个会话` : "";
+    const showPinned = Boolean(pinned) && (!filtering() || hasMatch(pinned));
+    const pinnedCard = showPinned ? sessionCard(pinned, pinned.sessionID === currentID, isArchived(archive, pinned)) : "";
+    const listBlock = list.length ? `<div class="divider">${scopeLabel()} · 已显示 ${considered.length} / ${list.length}${countNote}</div>` + (cards || `<div class="note">没有匹配的任务。</div>`) + sentinelHtml(list, considered) : showPinned ? "" : `<div class="note">${scopeEmptyNote()}</div>`;
+    box.innerHTML = undoBarHtml() + pinnedCard + listBlock + archivedSectionHtml();
     paintDetails();
+    ensureRowTabStop();
     observeSentinel();
   }
   function archivedSectionHtml() {
     if (!archived.length)
       return "";
     const items = archived.reduce((n, meta) => n + (Number.isFinite(meta.total) ? meta.total : 0), 0);
-    const head = `<button type="button" class="arch-fold" id="archiveToggle" aria-expanded="${showArchived}">` + `<span>\uD83D\uDDC4 已归档 ${archived.length} 个会话</span>` + `<span class="n">${items} 项 · ${showArchived ? "收起" : "展开"}</span></button>`;
+    const head = `<button type="button" class="arch-fold" id="archiveToggle" aria-expanded="${showArchived}">` + `<span>已收起 ${archived.length} 个会话</span>` + `<span class="n">${items} 项 · ${showArchived ? "收起" : "展开"}</span></button>`;
     if (!showArchived)
       return `<div class="archive">${head}</div>`;
     const shown = archivedLoadedCount >= archived.length ? archived : archived.slice(0, archivedLoadedCount);
-    const more = archivedLoadedCount < archived.length ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已归档（还有 ${archived.length - archivedLoadedCount} 个）</div>` : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已归档会话</div>`;
+    const more = archivedLoadedCount < archived.length ? `<div id="archivedSentinel" class="sentinel">↓ 加载更多已收起（还有 ${archived.length - archivedLoadedCount} 个）</div>` : `<div class="endnote">已到末尾 · 共 ${archived.length} 个已收起会话</div>`;
     const restoreAll = archived.length > 1 ? `<div class="endnote"><button type="button" class="link" id="restoreAll">全部恢复</button></div>` : "";
     return `<div class="archive">${head}${shown.map((meta) => sessionCard(meta, false, true)).join("")}${more}${restoreAll}</div>`;
   }
@@ -3115,9 +3218,11 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     paint();
   }
   function workspaceCounts() {
-    let doing = 0, pending = 0, done = 0, blocked = 0, total = 0;
+    let doing = 0, pending = 0, done = 0, blocked = 0, total = 0, openSessions = 0;
     const byPhase = {};
     for (const meta of agenda) {
+      if (hasOpenWork(meta))
+        openSessions += 1;
       if (Number.isFinite(meta.total)) {
         total += meta.total;
         done += meta.done || 0;
@@ -3150,7 +3255,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         byPhase[phase] = (byPhase[phase] || 0) + 1;
       }
     }
-    return { byPhase, stats: { doing, pending, done, blocked, total } };
+    return { byPhase, stats: { doing, pending, done, blocked, total, openSessions } };
   }
   function phaseChipHtml(row) {
     const on = filter.phase === row.key ? " on" : "";
@@ -3178,16 +3283,111 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const { shown, hidden } = openGroup ? { shown: openGroup.rows, hidden: 0 } : splitTop(rows, budget);
     const seg = (mode, label) => `<button type="button" class="ph-seg${phaseView.sort === mode ? " on" : ""}" data-sort="${mode}">${label}</button>`;
     const more = hidden ? `<button type="button" class="ph-more" data-expand>+ ${hidden} 其他</button>` : phaseView.expanded && rows.length > TOP_N && !openGroup ? `<button type="button" class="ph-more" data-collapse>收起</button>` : "";
-    const ungroupedChip = ungrouped ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED2)}</span><b>${ungrouped}</b></span>` : "";
-    el2("summary").innerHTML = `<div class="stats"><b>${agenda.length} 会话</b> <span>◐ ${stats.doing} 进行中</span>` + `<span>○ ${stats.pending} 待办</span><span class="blocked">⛓ ${stats.blocked} 受阻</span>` + `<span>✓ ${stats.done} 完成</span><span>共 ${stats.total} 项</span></div>` + `<div class="phases"><span class="ph-label">阶段分布</span>` + `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` + `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` + `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` + (unknownCount ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` + `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>` : "") + `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` + `</div>` + `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` + (groups.length ? `<div class="ph-row ph-fams">` + (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") + groups.map(familyChipHtml).join("") + `</div>` : "") + (manageOpen ? `<div class="ph-manage">` + `<div class="ph-manage-head"><b>阶段管理</b>` + (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") + `<button type="button" class="ph-toggle" data-manage>收起</button></div>` + `<div class="ph-manage-list">` + (rows.length ? rows.slice(0, 24).map((row) => `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` + `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`).join("") : `<span class="ph-none">暂无阶段</span>`) + `</div>` + `<div class="ph-ai">` + `<span class="ph-ai-l">Small Model</span>` + `<button type="button" class="ph-toggle" data-ai-test${aiTest.state === "running" ? " disabled" : ""}>` + `${aiTest.state === "running" ? "请求中…" : "测试连接"}</button>` + (aiTest.text ? `<span class="ph-ai-msg ${aiTest.state}">${esc(aiTest.text)}</span>` : `<span class="ph-ai-hint">发一次最小请求：不写词表、不占归类配额</span>`) + `</div>` + `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` + `</div>` : "");
+    const ungroupedChip = ungrouped ? `<span class="ph-chip static"><i style="background:${colorAt(-1)}"></i><span>${esc(UNGROUPED)}</span><b>${ungrouped}</b></span>` : "";
+    const stat = (kind, label, cls = "") => `<button type="button" class="stat${cls}" data-stat="${kind}">${label}</button>`;
+    const activeFilters = (filter.query ? 1 : 0) + (filter.status !== "all" ? 1 : 0) + (filter.phase !== "all" ? 1 : 0);
+    el2("summary").innerHTML = `<div class="stats">${stat("open", `<b title="有未完成任务的会话">${stats.openSessions} 个会话有未完成</b>`)}` + stat("doing", `${stats.doing} 个进行中`) + stat("pending", `${stats.pending} 个待办`) + stat("blocked", `${stats.blocked} 个受阻`, " blocked") + stat("done", `${stats.done} 个已完成`) + stat("total", `共 ${stats.total} 项`) + `<button type="button" class="stat filter" data-filter aria-expanded="${filterOpen}">` + `${filterOpen ? "收起筛选" : "筛选"}${activeFilters ? ` · ${activeFilters}` : ""}</button>` + (filtering() ? `<button type="button" class="stat clear" data-clear>清除筛选</button>` : "") + `</div>` + `<div class="phase-panel"${filterOpen ? "" : " hidden"}>` + `<div class="phases"><span class="ph-label">阶段分布</span>` + `<span class="ph-meta">${rows.length} 个非空 / ${globalPhases.length} 个名称</span>` + `<span class="ph-tools">${seg("count", "数量")}${seg("declare", "声明序")}${seg("name", "名称")}</span>` + `<button type="button" class="ph-toggle${phaseView.showEmpty ? " on" : ""}" data-show-empty>显示空阶段</button>` + (unknownCount ? `<button type="button" class="ph-toggle ai${classifying ? " on" : ""}" data-classify${classifying ? " disabled" : ""}>` + `${classifying ? "归类中…" : `归类 ${unknownCount} 个新阶段`}</button>` : "") + `<button type="button" class="ph-toggle${manageOpen ? " on" : ""}" data-manage>管理</button>` + `<button type="button" class="ph-close" data-filter-close aria-label="关闭筛选">×</button>` + `</div>` + `<div class="ph-row">${shown.map(phaseChipHtml).join("") || `<span class="ph-none">暂无阶段</span>`}${more}${openGroup ? "" : ungroupedChip}</div>` + (groups.length ? `<div class="ph-row ph-fams">` + (openGroup ? `<button type="button" class="ph-back" data-family="">← 全部</button>` : "") + groups.map(familyChipHtml).join("") + `</div>` : "") + (manageOpen ? `<div class="ph-manage">` + `<div class="ph-manage-head"><b>阶段管理</b>` + (taxonomyStore.previous ? `<button type="button" class="ph-toggle" data-undo-classify>回滚上一版</button>` : "") + `<button type="button" class="ph-toggle" data-manage>收起</button></div>` + `<div class="ph-manage-list">` + (rows.length ? rows.slice(0, 24).map((row) => `<label class="ph-manage-row"><input type="checkbox" data-pin="${esc(row.key)}"${row.pin >= 0 ? " checked" : ""}>` + `<span>${esc(row.label)}</span><b>${row.count}</b><i>${esc(row.family)}</i></label>`).join("") : `<span class="ph-none">暂无阶段</span>`) + `</div>` + `<div class="ph-ai">` + `<span class="ph-ai-l">Small Model</span>` + `<button type="button" class="ph-toggle" data-ai-test${aiTest.state === "running" ? " disabled" : ""}>` + `${aiTest.state === "running" ? "请求中…" : "测试连接"}</button>` + (aiTest.text ? `<span class="ph-ai-msg ${aiTest.state}">${esc(aiTest.text)}</span>` : `<span class="ph-ai-hint">发一次最小请求：不写词表、不占归类配额</span>`) + `</div>` + `<div class="ph-hint">勾选即置顶：无论怎么排序，置顶的阶段都在第一行。归类只影响显示，回滚不碰任务数据。</div>` + `</div>` : "") + `</div>`;
+  }
+  function closeFilterPanel() {
+    if (!filterOpen)
+      return;
+    filterOpen = false;
+    document.removeEventListener("pointerdown", onFilterOutside, true);
+    document.removeEventListener("keydown", onFilterKey, true);
+  }
+  function onFilterOutside(event) {
+    if (!filterOpen)
+      return;
+    const summary = el2("summary");
+    if (summary && event.target instanceof Node && summary.contains(event.target))
+      return;
+    closeFilterPanel();
+    paintSummary();
+  }
+  function onFilterKey(event) {
+    if (!filterOpen || event.key !== "Escape")
+      return;
+    event.preventDefault();
+    closeFilterPanel();
+    paintSummary();
+    const button2 = el2("summary") ? el2("summary").querySelector("[data-filter]") : null;
+    if (button2)
+      button2.focus();
+  }
+  function setFilterOpen(open) {
+    const next = Boolean(open);
+    if (next === filterOpen) {
+      if (next)
+        paintSummary();
+      return;
+    }
+    if (!next) {
+      closeFilterPanel();
+      paintSummary();
+      const button2 = el2("summary") ? el2("summary").querySelector("[data-filter]") : null;
+      if (button2)
+        button2.focus();
+      return;
+    }
+    filterOpen = true;
+    paintSummary();
+    document.addEventListener("pointerdown", onFilterOutside, true);
+    document.addEventListener("keydown", onFilterKey, true);
+    const first = el2("summary") ? el2("summary").querySelector(".phase-panel button, .phase-panel input") : null;
+    if (first)
+      first.focus();
   }
   function togglePhaseFilter(key) {
     filter.phase = filter.phase === key ? "all" : key;
-    if (controls.phase)
-      controls.phase.update({ value: filter.phase });
+    loadedCount = BATCH;
     lastKey = "";
     paintSummary();
-    paint();
+    renderBoard();
+  }
+  function applyStatFilter(kind) {
+    if (kind === "open") {
+      filter.scope = "open";
+      filter.status = "all";
+    } else if (kind === "done") {
+      filter.scope = "all";
+      filter.status = "completed";
+    } else if (kind === "total") {
+      filter.scope = "all";
+      filter.status = "all";
+    } else {
+      filter.scope = "open";
+      filter.status = kind;
+    }
+    loadedCount = BATCH;
+    lastKey = "";
+    if (controls.status)
+      controls.status.update({ value: filter.status });
+    updateScopeControl();
+    closeFilterPanel();
+    paintSummary();
+    const box = el2("sessions");
+    if (box)
+      box.scrollTop = 0;
+    renderBoard();
+  }
+  function clearFilters() {
+    filter.query = "";
+    filter.status = "all";
+    filter.phase = "all";
+    filter.scope = "open";
+    loadedCount = BATCH;
+    lastKey = "";
+    if (controls.search)
+      controls.search.update({ value: "" });
+    if (controls.status)
+      controls.status.update({ value: "all" });
+    updateScopeControl();
+    closeFilterPanel();
+    paintSummary();
+    const box = el2("sessions");
+    if (box)
+      box.scrollTop = 0;
+    renderBoard();
   }
   function applyStore(next) {
     taxonomyStore = next;
@@ -3201,6 +3401,45 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       applyStore(parseStore(await host.storage.get(TAXONOMY_KEY)));
     } catch {
       applyStore(emptyStore());
+    }
+  }
+  async function loadSessionInfo() {
+    if (sessionInfoLoaded || sessionInfoLoading || !host)
+      return;
+    if (typeof host.listProjects !== "function" || typeof host.listSessions !== "function") {
+      sessionInfoLoaded = true;
+      return;
+    }
+    sessionInfoLoading = true;
+    try {
+      const projects = await host.listProjects();
+      const list = projects && Array.isArray(projects.projects) ? projects.projects : [];
+      const snapshots = await Promise.all(list.map((project) => host.listSessions(project.id).catch(() => null)));
+      const next = new Map;
+      for (const snapshot of snapshots) {
+        const sessions = snapshot && Array.isArray(snapshot.sessions) ? snapshot.sessions : [];
+        for (const session of sessions) {
+          if (!session || typeof session.id !== "string" || session.id === "")
+            continue;
+          next.set(session.id, {
+            title: typeof session.title === "string" ? session.title : "",
+            updatedAt: Number.isFinite(session.updatedAt) ? session.updatedAt : 0,
+            directory: typeof session.directory === "string" ? session.directory : ""
+          });
+        }
+      }
+      if (next.size) {
+        sessionInfo = next;
+        sessionInfoLoaded = true;
+        lastKey = "";
+        refresh();
+      } else {
+        sessionInfoLoaded = true;
+      }
+    } catch {
+      sessionInfoLoaded = true;
+    } finally {
+      sessionInfoLoading = false;
     }
   }
   async function saveTaxonomy() {
@@ -3299,6 +3538,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     }
     paintSummary();
   }
+  var STATUS_LABELS = { pending: "待办", in_progress: "进行中", completed: "已完成", cancelled: "已取消" };
+  var PRIORITY_LABELS = { high: "高", medium: "中", low: "低" };
+  var statusLabel = (status) => STATUS_LABELS[status] || status || "—";
+  var priorityLabel = (priority) => PRIORITY_LABELS[priority] || priority || "—";
   function paintDetails() {
     for (const handle of detailHandles)
       handle.dispose();
@@ -3307,8 +3550,10 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     const meta = selected ? metaOf(selected.sessionID) : null;
     const doc = meta ? docOf(meta) : null;
     const todo = doc && selected ? doc.todos[selected.index] : null;
+    box.classList.toggle("open", Boolean(todo));
+    box.setAttribute("aria-hidden", todo ? "false" : "true");
     if (!todo) {
-      box.innerHTML = `<h3>任务详情</h3><div class="kv">点击左侧任务查看详情。</div>`;
+      box.innerHTML = "";
       return;
     }
     const todos = doc.todos;
@@ -3320,13 +3565,19 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       const dep = todos[index];
       return `<a data-goto="${index}">${esc(dep.content)}</a>${dep.status === "completed" ? " ✓" : "（未完成 → 受阻）"}`;
     }).join("<br>") : "—";
-    box.innerHTML = `<h3>任务详情</h3>` + `<div class="content">${esc(todo.content)}</div>` + `<div class="kv">状态：${esc(todo.status)}</div>` + `<div class="kv">阶段：${esc(todo.phase || "—")}</div>` + `<div class="kv">优先级：${esc(todo.priority || "—")}</div>` + `<div class="kv">依赖：<br>${depHtml}</div>` + `<div class="kv">会话：${esc(meta.sessionID)}</div>` + `<div class="actions" id="detailActions"></div>`;
+    box.innerHTML = `<div class="detail-head"><h3>任务详情</h3>` + `<button type="button" class="detail-close" id="detailClose" aria-label="关闭详情">×</button></div>` + `<div class="content">${esc(todo.content)}</div>` + `<div class="kv">状态：${esc(statusLabel(todo.status))}</div>` + `<div class="kv">阶段：${esc(todo.phase || "—")}</div>` + `<div class="kv">优先级：${esc(priorityLabel(todo.priority))}</div>` + `<div class="kv">依赖：<br>${depHtml}</div>` + `<div class="kv">会话：<span title="${esc(meta.sessionID)}">${esc(titleOf(meta, doc))}</span></div>` + (meta.sessionID === currentID ? "" : `<div class="kv">「交给 AI」只作用于当前会话。</div>`) + `<div class="actions" id="detailActions"></div>`;
     const actions = el2("detailActions");
-    const hand = document.createElement("div");
-    const copy = document.createElement("div");
     const open = document.createElement("div");
-    actions.append(hand, copy, open);
-    detailHandles.push(mountButton(hand, { label: "交给 AI 处理", size: "sm", onClick: () => handOff(todo) }), mountButton(copy, { label: "复制", variant: "secondary", size: "sm", onClick: () => copyTodo(todo) }), mountButton(open, { label: "打开会话", variant: "ghost", size: "sm", onClick: () => openSession(meta.sessionID) }));
+    actions.append(open);
+    detailHandles.push(mountButton(open, { label: "打开会话", size: "sm", onClick: () => openSession(meta.sessionID) }));
+    if (meta.sessionID === currentID) {
+      const hand = document.createElement("div");
+      actions.append(hand);
+      detailHandles.push(mountButton(hand, { label: "交给 AI 处理", variant: "secondary", size: "sm", onClick: () => handOff(todo) }));
+    }
+    const copy = document.createElement("div");
+    actions.append(copy);
+    detailHandles.push(mountButton(copy, { label: "复制", variant: "ghost", size: "sm", onClick: () => copyTodo(todo) }));
   }
   function openSession(sessionID) {
     Promise.resolve(host.openSession(sessionID)).catch(() => {
@@ -3459,7 +3710,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       archive = previous;
       archiveReady = false;
       clearUndo();
-      host.toast({ kind: "error", message: `归档未能保存：${error && error.code || error}` });
+      host.toast({ kind: "error", message: `收起未能保存：${error && error.code || error}` });
       lastKey = "";
       await refresh();
       return;
@@ -3470,7 +3721,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   }
   async function archiveSession(sessionID) {
     const previous = archive;
-    await commitArchive(withArchived(archive, [sessionID], Date.now()), previous, "已归档 1 个会话", "已归档 1 个会话，可在「已归档」里恢复。");
+    await commitArchive(withArchived(archive, [sessionID], Date.now()), previous, "已收起 1 个会话", "已收起 1 个会话，可在「已收起」里恢复。");
   }
   async function restoreSession(sessionID) {
     const previous = archive;
@@ -3479,23 +3730,19 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   async function archiveChosen(ids) {
     if (!ids.length)
       return;
-    archiveOpen = false;
     staleIncluded = false;
-    renderArchivePopover();
+    closeArchivePopover();
     const previous = archive;
-    await commitArchive(withArchived(archive, ids, Date.now()), previous, `已归档 ${ids.length} 个会话`, `已归档 ${ids.length} 个会话，可在「已归档」里恢复。`);
+    await commitArchive(withArchived(archive, ids, Date.now()), previous, `已收起 ${ids.length} 个会话`, `已收起 ${ids.length} 个会话，可在「已收起」里恢复。`);
   }
   var idsOf = (list) => list.map((item) => item.sessionID);
   function paintArchiveControl() {
-    const total = candidates.finished.length + candidates.stale.length;
     if (controls.archive)
-      controls.archive.update({ label: `归档候选 ${total}` });
-    if (controls.archiveFinished) {
-      const manual = candidates.manual.length;
-      controls.archiveFinished.update({
-        label: manual ? `归档已完成 ${manual}` : "归档已完成 0",
-        disabled: manual === 0
-      });
+      controls.archive.update({ label: "⋯" });
+    const button2 = el2("archiveHost") ? el2("archiveHost").querySelector("button") : null;
+    if (button2) {
+      button2.title = "收起与会话设置";
+      button2.setAttribute("aria-label", "收起与会话设置");
     }
     if (archiveOpen)
       renderArchivePopover();
@@ -3513,6 +3760,36 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     if (pop)
       pop.remove();
     document.removeEventListener("pointerdown", onOutsidePointer, true);
+    document.removeEventListener("keydown", onArchiveKey, true);
+  }
+  function onArchiveKey(event) {
+    if (!archiveOpen)
+      return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeArchivePopover();
+      const button2 = el2("archiveHost") ? el2("archiveHost").querySelector("button") : null;
+      if (button2)
+        button2.focus();
+      return;
+    }
+    if (event.key !== "Tab")
+      return;
+    const pop = el2("archiveHost") ? el2("archiveHost").querySelector(".arch-pop") : null;
+    if (!pop)
+      return;
+    const items = [...pop.querySelectorAll("button:not(:disabled), input:not(:disabled)")].filter((node) => node instanceof HTMLElement && node.offsetParent !== null);
+    if (!items.length)
+      return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
   function toggleArchivePopover() {
     if (archiveOpen) {
@@ -3522,6 +3799,12 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
     archiveOpen = true;
     renderArchivePopover();
     document.addEventListener("pointerdown", onOutsidePointer, true);
+    document.addEventListener("keydown", onArchiveKey, true);
+    const pop = el2("archiveHost") ? el2("archiveHost").querySelector(".arch-pop") : null;
+    if (!pop)
+      return;
+    const focusable = pop.querySelector("button:not(:disabled), input:not(:disabled)");
+    (focusable || pop).focus();
   }
   function renderArchivePopover() {
     const hostEl = el2("archiveHost");
@@ -3537,14 +3820,15 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       pop = document.createElement("div");
       pop.className = "arch-pop";
       pop.setAttribute("role", "dialog");
-      pop.setAttribute("aria-label", "归档");
+      pop.setAttribute("aria-label", "收起");
+      pop.tabIndex = -1;
       hostEl.append(pop);
     }
     const fin = candidates.finished.length;
     const stale = candidates.stale.length;
     const man = candidates.manual.length;
     const all = man + (staleIncluded ? stale : 0);
-    pop.innerHTML = `<div class="ap-head"><b>归档候选 ${fin + stale}</b>` + `<span>手动 ${man} · 自动 ${fin} · 超期 ${stale}</span></div>` + `<div class="ap-row"><span class="ap-l">全部已完成 · 手动</span>` + `<b class="ap-n">${man}</b><span class="ap-tag manual">手动</span></div>` + `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` + `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` + `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` + `<span class="ap-l">超期未完成 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">手动</span></label>` + `<div class="ap-hint">「全部已完成」不看年龄；「超期」只给自动 sweep 计数。未勾选时只计数，不进任何自动流程；勾选后才随本次一并归档，仍可撤销。</div>` + `<div class="ap-hr"></div>` + `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` + `<span class="ap-l">自动归档已完成</span></label>` + `<div class="ap-row ap-days"><span>超过</span>` + `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` + `<span>天</span></div>` + `<div class="ap-hr"></div>` + `<div class="ap-actions">` + `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>归档全部已完成 ${man}</button>` + `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>归档超期已完成 ${fin}</button>` + (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部归档 ${all}</button>` : "") + `</div>`;
+    pop.innerHTML = `<div class="ap-head"><b>可收起 ${man} 个已完成会话</b>` + `<span>超期 ${fin} · 久未更新 ${stale}</span></div>` + `<div class="ap-row"><span class="ap-l">全部已完成 · 手动</span>` + `<b class="ap-n">${man}</b><span class="ap-tag manual">可执行</span></div>` + `<div class="ap-row"><span class="ap-l">已完成 · 超期 ${prefs.days} 天</span>` + `<b class="ap-n">${fin}</b><span class="ap-tag">自动</span></div>` + `<label class="ap-row ap-check${stale ? "" : " muted"}"><input type="checkbox" id="apStale"${staleIncluded ? " checked" : ""}${stale ? "" : " disabled"}>` + `<span class="ap-l">久未更新 · 仅提示</span><b class="ap-n">${stale}</b><span class="ap-tag manual">可选</span></label>` + `<div class="ap-hint">按钮只显示可以立即收起的数。久未更新仍是开放工作，只做提示；勾选后才随本次一并收起，仍可撤销。</div>` + `<div class="ap-hr"></div>` + `<label class="ap-row ap-check"><input type="checkbox" id="apAuto"${prefs.auto ? " checked" : ""}>` + `<span class="ap-l">自动收起已完成</span></label>` + `<div class="ap-row ap-days"><span>超过</span>` + `<input id="apDays" type="number" min="0" max="365" step="1" value="${prefs.days}" aria-label="超期天数">` + `<span>天</span></div>` + `<div class="ap-hr"></div>` + `<div class="ap-actions">` + `<button type="button" id="apManual" class="ap-btn pri"${man ? "" : " disabled"}>收起全部已完成 ${man}</button>` + `<button type="button" id="apFinished" class="ap-btn"${fin ? "" : " disabled"}>收起超期已完成 ${fin}</button>` + (staleIncluded && all ? `<button type="button" id="apAll" class="ap-btn">全部收起 ${all}</button>` : "") + `</div>`;
     const staleBox = pop.querySelector("#apStale");
     if (staleBox) {
       staleBox.addEventListener("change", () => {
@@ -3625,21 +3909,28 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   function updateSessionOptions() {
     if (!controls.session)
       return;
-    const options = [{ id: "all", label: "全部会话" }, ...agenda.map((meta) => ({ id: meta.sessionID, label: truncate(meta.title || meta.sessionID, 28) }))];
+    const options = [{ id: "all", label: "全部会话" }, ...agenda.map((meta) => ({ id: meta.sessionID, label: truncate(titleOf(meta, docOf(meta)), 28) }))];
     controls.session.update({ options });
   }
-  function updatePhaseOptions() {
-    if (!controls.phase)
+  function updateScopeControl() {
+    if (!controls.scope)
       return;
-    const { byPhase } = workspaceCounts();
-    const { rows } = buildRows(byPhase, { aliases: taxonomy.aliases, familyMap: taxonomy.familyMap, showEmpty: false });
-    const options = [{ id: "all", label: "全部阶段" }];
-    for (const row of rows)
-      options.push({ id: row.key, label: `${row.label} (${row.count})` });
-    if (filter.phase !== "all" && !rows.some((row) => row.key === filter.phase)) {
-      options.push({ id: filter.phase, label: filter.phase });
+    let open = 0;
+    let done = 0;
+    for (const meta of agenda) {
+      if (hasOpenWork(meta))
+        open += 1;
+      else if (inScope(meta, "done"))
+        done += 1;
     }
-    controls.phase.update({ options, value: filter.phase });
+    controls.scope.update({
+      items: [
+        { id: "open", label: "待办", count: open },
+        { id: "all", label: "全部", count: agenda.length },
+        { id: "done", label: "已完成", count: done }
+      ],
+      activeId: filter.scope
+    });
   }
   function mountToolbar() {
     controls.search = mountSearchField(el2("searchHost"), {
@@ -3649,7 +3940,23 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       onChange: (value) => {
         filter.query = value;
         controls.search.update({ value });
+        paintSummary();
         paint();
+      }
+    });
+    controls.scope = mountTabs(el2("scopeHost"), {
+      items: [
+        { id: "open", label: "待办" },
+        { id: "all", label: "全部" },
+        { id: "done", label: "已完成" }
+      ],
+      activeId: filter.scope,
+      onChange: (id) => {
+        filter.scope = id;
+        loadedCount = BATCH;
+        lastKey = "";
+        updateScopeControl();
+        renderBoard();
       }
     });
     controls.session = mountSelect(el2("sessionHost"), {
@@ -3664,16 +3971,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         renderBoard();
       }
     });
-    controls.view = mountSelect(el2("viewHost"), {
-      label: "视图",
-      value: "tree",
-      options: [{ id: "tree", label: "任务树" }, { id: "swimlane", label: "泳道图" }],
-      onChange: (value) => {
-        filter.view = value;
-        controls.view.update({ value });
-        paint();
-      }
-    });
     controls.status = mountSelect(el2("statusHost"), {
       label: "状态",
       value: "all",
@@ -3681,46 +3978,21 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         { id: "all", label: "全部状态" },
         { id: "in_progress", label: "进行中" },
         { id: "pending", label: "待办" },
+        { id: "blocked", label: "受阻" },
         { id: "completed", label: "已完成" },
         { id: "cancelled", label: "已取消" }
       ],
       onChange: (value) => {
         filter.status = value;
+        loadedCount = BATCH;
+        lastKey = "";
         controls.status.update({ value });
-        paint();
-      }
-    });
-    controls.phase = mountSelect(el2("phaseHost"), {
-      label: "阶段",
-      value: "all",
-      options: [{ id: "all", label: "全部阶段" }],
-      onChange: (value) => {
-        filter.phase = value;
-        controls.phase.update({ value });
-        paint();
-      }
-    });
-    controls.finished = mountCheckbox(el2("finishedHost"), {
-      label: "显示已完成",
-      checked: false,
-      onChange: (checked) => {
-        filter.showFinished = checked;
-        controls.finished.update({ checked });
-        paint();
-      }
-    });
-    controls.archiveFinished = mountButton(el2("archiveFinishedHost"), {
-      label: "归档已完成 0",
-      variant: "secondary",
-      size: "sm",
-      disabled: true,
-      onClick: () => {
-        if (candidates.manual.length)
-          archiveChosen(idsOf(candidates.manual));
+        paintSummary();
+        renderBoard();
       }
     });
     controls.archive = mountButton(el2("archiveHost"), {
-      label: "归档候选 0",
+      label: "⋯",
       variant: "secondary",
       size: "sm",
       onClick: () => {
@@ -3732,6 +4004,23 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       const target = event.target instanceof Element ? event.target : null;
       if (!target)
         return;
+      if (target.closest("[data-filter]")) {
+        setFilterOpen(!filterOpen);
+        return;
+      }
+      if (target.closest("[data-filter-close]")) {
+        setFilterOpen(false);
+        return;
+      }
+      const stat = target.closest("[data-stat]");
+      if (stat) {
+        applyStatFilter(stat.dataset.stat);
+        return;
+      }
+      if (target.closest("[data-clear]")) {
+        clearFilters();
+        return;
+      }
       const chip = target.closest("[data-phase]");
       if (chip) {
         togglePhaseFilter(chip.dataset.phase);
@@ -3810,6 +4099,19 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         paint();
         return;
       }
+      const retry = target.closest("[data-retry-session]");
+      if (retry) {
+        docFailures.delete(retry.dataset.retrySession);
+        lastKey = "";
+        renderBoard();
+        return;
+      }
+      const expand = target.closest("[data-expand-session]");
+      if (expand) {
+        expandedSessions.add(expand.dataset.expandSession);
+        paint();
+        return;
+      }
       const archiveButton = target.closest("[data-archive]");
       if (archiveButton) {
         archiveSession(archiveButton.dataset.archive);
@@ -3823,15 +4125,42 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       const row = target.closest(".row");
       if (!row || row.dataset.index === undefined)
         return;
-      selected = { sessionID: row.dataset.session, index: Number(row.dataset.index) };
-      paint();
+      selectRow(row);
+    });
+    el2("sessions").addEventListener("keydown", (event) => {
+      const row = event.target instanceof Element ? event.target.closest(".row[data-index]") : null;
+      if (!row)
+        return;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectRow(row, true);
+        return;
+      }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        moveRowFocus(row, event.key === "ArrowDown" ? 1 : -1);
+      }
     });
     el2("details").addEventListener("click", (event) => {
-      const link = event.target instanceof Element ? event.target.closest("[data-goto]") : null;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target)
+        return;
+      if (target.closest("#detailClose")) {
+        selected = null;
+        paint();
+        const row = el2("sessions").querySelector(".row[data-index]");
+        if (row)
+          row.focus();
+        return;
+      }
+      const link = target.closest("[data-goto]");
       if (!link || !selected)
         return;
       selected = { sessionID: selected.sessionID, index: Number(link.dataset.goto) };
       paint();
+      const next = el2("sessions").querySelector(".row.sel[data-index]");
+      if (next)
+        next.focus();
     });
   }
   async function readIndexMetas() {
@@ -3949,7 +4278,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
         filter.session = "all";
     }
     updateSessionOptions();
-    updatePhaseOptions();
+    updateScopeControl();
     paintSummary();
     paintArchiveControl();
     await renderBoard();
@@ -4028,6 +4357,7 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       currentID = ctx && ctx.session && typeof ctx.session.id === "string" ? ctx.session.id : null;
       mountToolbar();
       refresh();
+      loadSessionInfo();
       start();
     });
     host.onSession((session) => {
