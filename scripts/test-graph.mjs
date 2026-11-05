@@ -150,8 +150,10 @@ const names = (rows) => rows.map((r) => r.content)
     [T("t", { id: "t", phase: "impl" }), T("u", { id: "u", parentId: "t", phase: "test" })],
     ["plan", "impl", "test"],
   )
-  eq("rows: colorIndex from phase", rows.map((r) => r.colorIndex), [1, 2])
-  eq("rows: phase passed through", rows.map((r) => r.phase), ["impl", "test"])
+  const real = rows.filter((r) => !r.synthetic)
+  eq("rows: phase header uses the phase color", rows.find((r) => r.synthetic)?.colorIndex, 1)
+  eq("rows: colorIndex from phase", real.map((r) => r.colorIndex), [1, 2])
+  eq("rows: phase passed through", real.map((r) => r.phase), ["impl", "test"])
 }
 
 // --- blocked: a dependsOn on an unfinished task -------------------------------
@@ -208,9 +210,114 @@ const names = (rows) => rows.map((r) => r.content)
   eq("group: tasks nest one level under their phase", rows.filter((r) => !r.synthetic).map((r) => r.depth), [1, 1, 1])
   eq("group: the first phase is not the last root", rows.find((r) => r.synthetic).isLast, false)
 }
+
+// --- phase headers coexist with explicit parentId nesting --------------------
 {
-  const { rows } = buildTree([T("a", { id: "a", phase: "x" }), T("b", { id: "b", parentId: "a", phase: "x" })])
-  eq("group: explicit nesting suppresses synthesis", rows.some((r) => r.synthetic), false)
+  const { rows } = buildTree([
+    T("a", { id: "a", phase: "X" }),
+    T("b", { id: "b", parentId: "a", phase: "X" }),
+    T("c", { id: "c", phase: "X" }),
+  ])
+  eq("group+tree: one phase header", rows.filter((r) => r.synthetic).map((r) => r.content), ["X"])
+  eq("group+tree: row order", names(rows), ["X", "a", "b", "c"])
+  eq("group+tree: depths", rows.map((r) => r.depth), [0, 1, 2, 1])
+  eq("group+tree: last flags", rows.map((r) => r.isLast), [true, false, true, true])
+  eq("group+tree: ancestorLast", rows.map((r) => r.ancestorLast), [[], [true], [true, false], [true]])
+}
+{
+  const { rows } = buildTree([
+    T("a", { id: "a", phase: "X" }),
+    T("b", { id: "b", parentId: "a", phase: "Y" }),
+  ], ["X", "Y"])
+  eq("group+tree: a phase with only subtasks gets no empty header", rows.filter((r) => r.synthetic).map((r) => r.content), ["X"])
+  eq("group+tree: cross-phase child keeps its own phase", rows.find((r) => r.content === "b").phase, "Y")
+  eq("group+tree: cross-phase child depth", rows.find((r) => r.content === "b").depth, 2)
+}
+{
+  const { rows } = buildTree([
+    T("root", { id: "r" }),
+    T("s", { id: "s", parentId: "r", phase: "X" }),
+  ])
+  eq("group+tree: phase only on a subtask leaves the list ungrouped", rows.some((r) => r.synthetic), false)
+}
+
+// --- roots are decided after cycle breaking, then grouped -------------------
+{
+  const { rows } = buildTree([
+    T("a", { id: "a", parentId: "b", phase: "X" }),
+    T("b", { id: "b", parentId: "a", phase: "X" }),
+    T("c", { id: "c", phase: "X" }),
+  ])
+  eq("group+tree: a broken cycle still sits under its phase", rows.filter((r) => r.synthetic).map((r) => r.content), ["X"])
+  eq("group+tree: cycle rows all under the header", rows.map((r) => r.depth), [0, 1, 1, 1])
+}
+
+// --- a dangling parentId is a root, so it still gets a phase header ---------
+{
+  const { rows } = buildTree([
+    T("o", { id: "o", parentId: "nope", phase: "X" }),
+    T("p", { id: "p", phase: "X" }),
+  ])
+  eq("group+tree: dangling parent still groups by phase", rows.filter((r) => r.synthetic).map((r) => r.content), ["X"])
+  eq("group+tree: dangling parent rows", rows.map((r) => r.depth), [0, 1, 1])
+}
+
+// --- mixed unphased roots stay before the phase headers ---------------------
+{
+  const { rows } = buildTree([
+    T("A", { id: "a", phase: "X" }),
+    T("B", { id: "b" }),
+    T("C", { id: "c", phase: "Y" }),
+    T("D", { id: "d" }),
+  ], ["X", "Y"])
+  eq("group+tree: mixed order", names(rows), ["B", "D", "X", "A", "Y", "C"])
+  eq("group+tree: mixed depths", rows.map((r) => r.depth), [0, 0, 0, 1, 0, 1])
+}
+
+// --- the phase header shifts the depth cap by one level ---------------------
+{
+  const todos = [T("n0", { id: "n0", phase: "X" })]
+  for (let i = 1; i <= 9; i += 1) todos.push(T(`n${i}`, { id: `n${i}`, parentId: `n${i - 1}`, phase: "X" }))
+  const { rows } = buildTree(todos)
+  eq("group+tree: depth-capped chain keeps every row", rows.length, 11)
+  eq("group+tree: depth cap still applies under a header", Math.max(...rows.map((r) => r.depth)), MAX_DEPTH)
+}
+
+// --- pruning a finished ancestor must not flip the headers off --------------
+{
+  const open = [
+    T("done", { id: "a", status: "completed", phase: "X" }),
+    T("doing", { id: "b", parentId: "a", status: "pending", phase: "X" }),
+  ]
+  const { rows } = buildTree(pruneFinished(open))
+  eq("group+tree: pruned tree keeps the phase header", rows.filter((r) => r.synthetic).map((r) => r.content), ["X"])
+  eq("group+tree: pruned tree depths", rows.map((r) => r.depth), [0, 1, 2])
+}
+
+// --- synthetic keys never collide with task keys ----------------------------
+{
+  const { rows } = buildTree([
+    T("first", { id: "syn:phase:X", phase: "X" }),
+    T("second", { id: "syn:phase:X", phase: "X" }),
+    T("third", { id: "phase:X", phase: "X" }),
+  ])
+  eq("group+tree: all row keys are unique", new Set(rows.map((r) => r.key)).size, rows.length)
+  eq("group+tree: one header despite colliding-looking ids", rows.filter((r) => r.synthetic).length, 1)
+}
+
+// --- no rows means no empty phase headers ----------------------------------
+{
+  const { rows } = buildTree([], ["X", "Y"])
+  eq("group+tree: empty list has no empty headers", rows.length, 0)
+}
+
+// --- buildTree never mutates the caller's list ------------------------------
+{
+  const list = [T("a", { id: "a", phase: "X" }), T("b", { id: "b", parentId: "a", phase: "X" })]
+  const first = buildTree(list)
+  const second = buildTree(list)
+  eq("group+tree: buildTree is idempotent", JSON.stringify(first.rows), JSON.stringify(second.rows))
+  eq("group+tree: input todos are not marked synthetic", list.some((t) => t.synthetic), false)
 }
 {
   const { rows } = buildTree([T("a", { id: "a" }), T("b", { id: "b" })])

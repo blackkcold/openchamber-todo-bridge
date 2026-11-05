@@ -2008,37 +2008,6 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       if (parent && parent !== node)
         node.parent = parent;
     }
-    const nested = list.some((todo) => typeof todo.parentId === "string" && todo.parentId !== "");
-    if (!nested && phases.length > 0) {
-      const used = new Set(list.map((todo) => typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : ""));
-      const groups = new Map;
-      for (const phase of phases) {
-        if (!used.has(phase))
-          continue;
-        const group = {
-          key: `phase:${phase}`,
-          index: -1,
-          content: phase,
-          status: "",
-          priority: "",
-          phase,
-          colorIndex: phaseColorIndex(phase, phases),
-          dependsOn: [],
-          synthetic: true,
-          parent: null,
-          children: []
-        };
-        groups.set(phase, group);
-        nodes.push(group);
-      }
-      for (const node of nodes) {
-        if (node.synthetic || node.parent)
-          continue;
-        const phase = list[node.index].phase;
-        if (typeof phase === "string" && phase !== "" && groups.has(phase))
-          node.parent = groups.get(phase);
-      }
-    }
     const state = new Map;
     for (const start of nodes) {
       if (state.get(start) === 2)
@@ -2057,6 +2026,52 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
       }
       for (const node of path)
         state.set(node, 2);
+    }
+    const rootPhases = new Set;
+    for (const node of nodes) {
+      if (node.parent)
+        continue;
+      if (node.phase !== "")
+        rootPhases.add(node.phase);
+    }
+    const groups = new Map;
+    if (rootPhases.size > 0) {
+      const usedKeys = new Set(nodes.map((node) => node.key));
+      const uniqueKey = (base) => {
+        let key = base;
+        let n = 1;
+        while (usedKeys.has(key)) {
+          key = `${base}#${n}`;
+          n += 1;
+        }
+        usedKeys.add(key);
+        return key;
+      };
+      for (const phase of phases) {
+        if (!rootPhases.has(phase))
+          continue;
+        const group = {
+          key: uniqueKey(`syn:phase:${phase}`),
+          index: -1,
+          content: phase,
+          status: "",
+          priority: "",
+          phase,
+          colorIndex: phaseColorIndex(phase, phases),
+          dependsOn: [],
+          synthetic: true,
+          parent: null,
+          children: []
+        };
+        groups.set(phase, group);
+        nodes.push(group);
+      }
+      for (const node of nodes) {
+        if (node.synthetic || node.parent)
+          continue;
+        if (node.phase !== "" && groups.has(node.phase))
+          node.parent = groups.get(node.phase);
+      }
     }
     const roots = [];
     for (const node of nodes) {
@@ -4368,3 +4383,5 @@ textarea.oc-sdk-input { height: auto; padding: 8px 12px; resize: vertical; }
   }
   boot();
 })();
+
+// ui-source-sha256: 1097b839818fdef3780709c6406f6c50d7c7ae3e4bb65518921dc72b9d35c5ed
