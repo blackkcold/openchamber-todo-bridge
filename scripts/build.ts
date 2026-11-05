@@ -9,7 +9,7 @@
 // source of truth instead of a copy that can drift. Only the section references
 // them, so the panel and board do not carry that weight.
 import { createHash } from "node:crypto"
-import { appendFile, readFile, rm } from "node:fs/promises"
+import { appendFile, readFile, readdir, rm } from "node:fs/promises"
 
 const PAGES = [
   { source: "src/main.js", outdir: "status", plugin: true },
@@ -23,6 +23,15 @@ const pluginSource = await readFile("opencode-plugin/index.js", "utf8")
 const pluginPackage = await readFile("opencode-plugin/package.json", "utf8")
 /** A build-drift marker: a source change without a rebuild fails test-build. */
 const pluginSourceHash = createHash("sha256").update(pluginSource).digest("hex")
+
+// Every page bundles some of `src/`; one hash over the whole UI source set makes
+// any source change without a rebuild visible to test-build, on all three pages.
+const uiFiles = (await readdir("src")).filter((file) => file.endsWith(".js")).sort()
+const uiHash = createHash("sha256")
+for (const file of uiFiles) {
+  uiHash.update(file).update("\n").update(await readFile(`src/${file}`, "utf8")).update("\n")
+}
+const uiSourceHash = uiHash.digest("hex")
 
 for (const page of PAGES) {
   const define = page.plugin
@@ -49,6 +58,7 @@ for (const page of PAGES) {
     process.exit(1)
   }
   console.log("built:", result.outputs.map((o) => o.path).join(", "))
+  await appendFile(`${page.outdir}/main.js`, `\n// ui-source-sha256: ${uiSourceHash}\n`)
 }
 
 // The extension installs the built section without running this script. Keep a

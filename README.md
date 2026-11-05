@@ -26,7 +26,17 @@ In OpenChamber, open **Settings → Extensions**, paste this repository URL, sel
 https://github.com/blackkcold/openchamber-todo-bridge
 ```
 
-Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.1.0` to the URL.
+Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.2.0` to the URL.
+
+### v1.2.0 — phase headers, even with subtasks
+
+Phase headers and explicit subtask nesting now coexist. A phase header is drawn whenever at least one root task names that phase; tasks with `parentId` stay under their parent, and a phase used only by subtasks gets no empty header. Cycle breaking now happens before the root/header decision, so a malformed parent chain cannot push a task outside its phase. This fixes GPT-model sessions where the todo list mixed `phase` with `parentId` and the headers disappeared.
+
+- `buildTree` groups root tasks by phase even when the list is nested; a dangling `parentId` becomes a root and still groups correctly.
+- Synthetic header keys use a `syn:phase:` namespace, so a task id can never collide with a header.
+- The build now stamps all three pages with a `ui-source-sha256` marker; `test-build` rejects a source change that was not rebuilt.
+
+Verification: `bun run build`, `bun run validate` and the full 15-suite test pass; the graph checks cover coexistence, empty-header avoidance, cycles, dangling/duplicate ids, pruning, depth and key uniqueness.
 
 ### v1.1.0 — a work queue, not an archive
 

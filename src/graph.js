@@ -86,8 +86,8 @@ export function hasStructure(todos) {
 /**
  * Build the tree rows.
  *
- * `declared` is the optional top-level `phases` array from the mirror; it only
- * fixes the colour order.
+ * `declared` is the optional top-level `phases` array from the mirror; it fixes
+ * the colour and header order.
  */
 export function buildTree(todos, declared = []) {
   const list = Array.isArray(todos) ? todos : []
@@ -133,18 +133,55 @@ export function buildTree(todos, declared = []) {
     if (parent && parent !== node) node.parent = parent
   }
 
-  // A phase-only list (no `parentId` anywhere) still becomes a tree: one
-  // synthetic node per used phase, and every task hangs under its phase, so the
-  // rows indent and draw connectors instead of reading as a flat list. Explicit
-  // nesting always wins — synthesis happens only when nothing is nested.
-  const nested = list.some((todo) => typeof todo.parentId === "string" && todo.parentId !== "")
-  if (!nested && phases.length > 0) {
-    const used = new Set(list.map((todo) => (typeof todo.phase === "string" && todo.phase !== "" ? todo.phase : "")))
-    const groups = new Map()
+  // Break cycles before deciding which nodes are roots: a node that escapes a
+  // cycle is a root, and roots are what a phase header groups. Doing this after
+  // synthesis would leave escaped cycle nodes outside their phase header.
+  const state = new Map() // node -> 1 on the current path, 2 settled
+  for (const start of nodes) {
+    if (state.get(start) === 2) continue
+    const path = []
+    let cur = start
+    while (cur && state.get(cur) !== 2 && state.get(cur) !== 1) {
+      state.set(cur, 1)
+      path.push(cur)
+      cur = cur.parent
+    }
+    if (cur && state.get(cur) === 1) {
+      const from = path.indexOf(cur)
+      for (let i = from; i < path.length; i += 1) path[i].parent = null
+    }
+    for (const node of path) state.set(node, 2)
+  }
+
+  // Phase headers and explicit nesting coexist: every root task that names a
+  // phase hangs under a synthetic header for that phase, while explicit children
+  // stay under their own parent. A phase is only headed when it has at least one
+  // root task, so a phase used only by subtasks never renders an empty header.
+  // Headers are appended after the real nodes: unphased roots keep their list
+  // order, and headers follow the declared phase order.
+  const rootPhases = new Set()
+  for (const node of nodes) {
+    if (node.parent) continue
+    if (node.phase !== "") rootPhases.add(node.phase)
+  }
+  const groups = new Map()
+  if (rootPhases.size > 0) {
+    // A task id may itself look like a synthetic key; keep every row key unique.
+    const usedKeys = new Set(nodes.map((node) => node.key))
+    const uniqueKey = (base) => {
+      let key = base
+      let n = 1
+      while (usedKeys.has(key)) {
+        key = `${base}#${n}`
+        n += 1
+      }
+      usedKeys.add(key)
+      return key
+    }
     for (const phase of phases) {
-      if (!used.has(phase)) continue
+      if (!rootPhases.has(phase)) continue
       const group = {
-        key: `phase:${phase}`,
+        key: uniqueKey(`syn:phase:${phase}`),
         index: -1,
         content: phase,
         status: "",
@@ -161,30 +198,8 @@ export function buildTree(todos, declared = []) {
     }
     for (const node of nodes) {
       if (node.synthetic || node.parent) continue
-      const phase = list[node.index].phase
-      if (typeof phase === "string" && phase !== "" && groups.has(phase)) node.parent = groups.get(phase)
+      if (node.phase !== "" && groups.has(node.phase)) node.parent = groups.get(node.phase)
     }
-  }
-
-  // Break cycles. Follow each parent chain once, colouring nodes as we go; a
-  // node already on the current path closes a cycle, and every node from that
-  // node onward is detached to a root. A node that merely leads into a cycle
-  // keeps its parent (which is now a root), so no task is ever dropped.
-  const state = new Map() // node -> 1 on the current path, 2 settled
-  for (const start of nodes) {
-    if (state.get(start) === 2) continue
-    const path = []
-    let cur = start
-    while (cur && state.get(cur) !== 2 && state.get(cur) !== 1) {
-      state.set(cur, 1)
-      path.push(cur)
-      cur = cur.parent
-    }
-    if (cur && state.get(cur) === 1) {
-      const from = path.indexOf(cur)
-      for (let i = from; i < path.length; i += 1) path[i].parent = null
-    }
-    for (const node of path) state.set(node, 2)
   }
 
   const roots = []
