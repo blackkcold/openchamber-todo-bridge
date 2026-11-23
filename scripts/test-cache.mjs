@@ -4,7 +4,8 @@
 // after the persisted conversation. That is only safe while three things stay
 // true, and this harness is what keeps them true:
 //
-//   1. system, tools and the persisted message prefix are never mutated;
+//   1. system and tools are never mutated, and everything before the last user
+//      message stays byte-stable;
 //   2. an unchanged todo list produces byte-identical reminder text, with no
 //      clock, random, round counter or object-key-order dependency;
 //   3. the transient reminder is neither written to storage nor persisted as a
@@ -19,7 +20,7 @@ import { createHash } from "node:crypto"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import plugin, { buildReminder, TODOS_INPUT, TODOWRITE_DESCRIPTION } from "../opencode-plugin/index.js"
+import plugin, { buildReminder, TOOL_SURFACE, TODOS_INPUT, TODOWRITE_DESCRIPTION } from "../opencode-plugin/index.js"
 
 let failed = 0
 const check = (name, pass, detail = "") => {
@@ -70,7 +71,7 @@ const LONG_200 = Array.from({ length: 200 }, (_, index) => task(index + 1, index
   phase: index % 5 === 0 ? "调研" : "实现",
 }))
 
-/** A finished list: the tool result renders the whole list, so it is prompt-visible history. */
+/** A finished list: the tool result is counts only, and `todoread` recovers the titles. */
 const FINISHED_TWO = [
   task(1, "completed", { id: "t1", phase: "调研" }),
   task(2, "cancelled", { id: "t2", phase: "实现" }),
@@ -87,7 +88,8 @@ const FINISHED_TWO = [
 const REMINDER_HASH_NO_PHASES = "3cc7829133b8051fe626fab388b5c7678729a9df5a854d931171009b06817826"
 const REMINDER_HASH_WITH_PHASES = "7fa9585cd64fff543c28942c1ee0dbf91d129c10c72e789d65a8db4d07ee14b8"
 const RESULT_OPEN_HASH = "2c57290332ab05bf176c20b40359e1b71bd49207223e1a980f89bc5eb14500b6"
-const RESULT_FINISHED_HASH = "68fdc9ed8c8db4a9946403f314e6b261fd1e05938eadcc91f7d71a997382243a"
+const RESULT_FINISHED_HASH = "01a6ac3d12a1f99eb943fc559169b9a2221152cd4b2541a57cd5454483c0acd9"
+const TOOL_SURFACE_HASH = "c7fd78e6dc4094ee8ca2ad141e9c0ba878ea97537bab3a9883924ce151b47ce0"
 
 /**
  * A minimal V2 plugin context: real plugin setup, real tools, real mirror/index
@@ -144,29 +146,49 @@ const TOOLS = [
 
 // ---- prefix: the part a provider can cache ---------------------------------
 
-console.log("\ncache prefix — system/tools/history stay stable")
+console.log("\ncache prefix — system/tools and the prefix before the last user stay stable")
 {
   const h = await harness(THREE_OPEN)
   try {
     const history = [{ role: "user", content: [{ type: "text", text: "Do the task" }] }]
     const reminders = []
     for (let round = 0; round < 4; round += 1) {
-      const expectedPrefix = structuredClone(history)
+      const lastIsUser = history.at(-1)?.role === "user"
+      const expectedPrefix = lastIsUser ? history.slice(0, -1) : history
+      const snapshot = structuredClone(history)
       const event = request(history, SYSTEM, TOOLS)
       await h.hook(event)
       check(`round ${round + 1}: system prefix unchanged`, digest(event.system) === digest(SYSTEM))
       check(`round ${round + 1}: tools prefix unchanged`, digest(event.tools) === digest(TOOLS))
       check(
-        `round ${round + 1}: persisted message prefix unchanged`,
-        digest(event.messages.slice(0, history.length)) === digest(expectedPrefix),
+        `round ${round + 1}: everything before the last user is unchanged`,
+        digest(event.messages.slice(0, expectedPrefix.length)) === digest(expectedPrefix),
       )
-      check(`round ${round + 1}: exactly one tail message`, event.messages.length === history.length + 1)
+      check(
+        `round ${round + 1}: only a non-user tail grows the message count`,
+        event.messages.length === history.length + (lastIsUser ? 0 : 1),
+        `${event.messages.length} vs ${history.length}`,
+      )
       const tail = event.messages.at(-1)
+      const reminderPart = tail && Array.isArray(tail.content)
+        ? tail.content.find((part) => typeof part?.text === "string" && part.text.startsWith("[Session task state"))
+        : null
       check(
         `round ${round + 1}: tail is a user reminder`,
-        Boolean(tail) && tail.role === "user" && typeof tail.content?.[0]?.text === "string",
+        Boolean(tail) && tail.role === "user" && Boolean(reminderPart),
       )
-      reminders.push(tail.content[0].text)
+      if (lastIsUser) {
+        check(
+          `round ${round + 1}: the last user's original text is preserved`,
+          tail.content[0]?.text === "Do the task" && tail.content.length === 2,
+        )
+      }
+      check(
+        `round ${round + 1}: no consecutive user roles`,
+        !(event.messages.length >= 2 && event.messages.at(-2).role === "user"),
+      )
+      check(`round ${round + 1}: the input history is not mutated`, digest(history) === digest(snapshot))
+      reminders.push(reminderPart.text)
       history.push({ role: "assistant", content: [{ type: "text", text: "Working on it." }] })
       history.push({ role: "tool", content: [{ type: "text", text: "Tool result." }] })
     }
@@ -179,6 +201,17 @@ console.log("\ncache prefix — system/tools/history stay stable")
     const bumped = request(history, SYSTEM, TOOLS)
     await h.hook(bumped)
     check("unchanged list with a new updatedAt keeps the same reminder", bumped.messages.at(-1).content[0].text === reminders[0])
+
+    // A repeated hook on one event must not add a second reminder.
+    const repeated = request(history, SYSTEM, TOOLS)
+    await h.hook(repeated)
+    const once = structuredClone(repeated.messages)
+    await h.hook(repeated)
+    check("a repeated hook adds no second reminder", digest(repeated.messages) === digest(once))
+    const markerCount = repeated.messages
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .filter((part) => typeof part?.text === "string" && part.text.startsWith("[Session task state")).length
+    check("one reminder part after two hooks", markerCount === 1, `${markerCount} parts`)
 
     // A list change may change the tail, but it must not move the prefix.
     await h.tools.get("todowrite").execute({ todos: [{ content: "Changed task", status: "pending" }], phases: [] }, { sessionID: "ses_cache_fixture" })
@@ -242,11 +275,17 @@ console.log("\ncache safety — the hook does not mutate the input history")
   const h = await harness(THREE_OPEN)
   try {
     const history = [{ role: "user", content: [{ type: "text", text: "Do the task" }] }]
+    const snapshot = structuredClone(history)
     const event = { sessionID: "ses_cache_fixture", system: SYSTEM, tools: TOOLS, messages: history }
     await h.hook(event)
     check("input message array is not mutated", history.length === 1, `length ${history.length}`)
-    check("hook assigns a new message array", event.messages !== history && event.messages.length === 2)
-    check("the new array keeps the original messages", digest(event.messages.slice(0, 1)) === digest(history))
+    check("input message object is not mutated", digest(history) === digest(snapshot))
+    check("hook assigns a new message array", event.messages !== history && event.messages.length === 1)
+    check("the last user message object is rebuilt", event.messages[0] !== history[0])
+    check(
+      "the rebuilt message keeps the original text and adds the reminder",
+      event.messages[0].content[0].text === "Do the task" && event.messages[0].content.length === 2,
+    )
   } finally {
     await h.dispose()
     await rm(h.dir, { recursive: true, force: true })
@@ -323,12 +362,12 @@ console.log("\ncache determinism — no clock, random, round or key-order drift"
 console.log("\ncontext budget — reminders are bounded")
 {
   const budgets = [
-    ["3 open", THREE_OPEN, 1000],
-    ["47 done + 3 open", DONE_47_OPEN_3, 5000],
-    ["10 structured", STRUCTURED_10, 2500],
-    // Structured ids add ~1k to the pathological 200-open case. This is a
-    // regression ceiling, not an endorsement of a 17k reminder; A1/A4 lower it.
-    ["200 open", LONG_200, 18000],
+    ["3 open", THREE_OPEN, 900],
+    ["47 done + 3 open", DONE_47_OPEN_3, 900],
+    ["10 structured", STRUCTURED_10, 900],
+    // The compact reminder caps its open section at 2000 chars and the whole
+    // block at 2400, so this is the contract ceiling, not just a regression guard.
+    ["200 open", LONG_200, 2400],
   ]
   for (const [label, todos, max] of budgets) {
     const h = await harness(todos)
@@ -338,17 +377,20 @@ console.log("\ncontext budget — reminders are bounded")
       const before = JSON.stringify(event).length
       await h.hook(event)
       const after = JSON.stringify(event).length
-      const reminder = event.messages.at(-1).content[0].text
-      check(`${label}: reminder <= ${max} chars`, reminder.length <= max, `got ${reminder.length}`)
-      check(`${label}: exactly one tail message`, event.messages.length === history.length + 1)
+      const reminderPart = event.messages.at(-1).content.find((part) =>
+        typeof part?.text === "string" && part.text.startsWith("[Session task state"))
+      const reminder = reminderPart ? reminderPart.text : ""
+      check(`${label}: reminder <= ${max} chars`, reminder.length > 0 && reminder.length <= max, `got ${reminder.length}`)
+      check(`${label}: a user tail keeps the message count`, event.messages.length === history.length)
+      check(`${label}: the last user's text is preserved`, event.messages.at(-1).content[0].text === "Do the task")
       check(
         `${label}: request delta is the reminder plus <= 300 chars`,
         after - before <= reminder.length + 300,
         `delta ${after - before}, reminder ${reminder.length}`,
       )
       console.log(`  size  ${label}: reminder ${reminder.length} chars, request delta ${after - before} chars`)
-      if (reminder.length > 8000) {
-        console.log(`  warn  ${label}: the reminder is long; A1/A4 should lower it before release`)
+      if (reminder.length > 2400) {
+        console.log(`  warn  ${label}: the reminder is over its 2400-char contract`)
       }
     } finally {
       await h.dispose()
@@ -369,6 +411,21 @@ check(
   digest({ description: TODOWRITE_DESCRIPTION, input: TODOS_INPUT }) === TOOL_PREFIX_HASH,
 )
 check(
+  "tool surface digest is frozen (name, description, input, options, order)",
+  digest(TOOL_SURFACE) === TOOL_SURFACE_HASH,
+  TOOL_SURFACE_HASH.slice(0, 12),
+)
+check(
+  "tool order is todowrite, then todoread",
+  TOOL_SURFACE.map((tool) => tool.name).join(",") === "todowrite,todoread",
+)
+check(
+  "the surface carries the exported descriptions and inputs",
+  TOOL_SURFACE[0].description === TODOWRITE_DESCRIPTION &&
+    TOOL_SURFACE[0].input === TODOS_INPUT &&
+    TOOL_SURFACE.every((tool) => tool.options.codemode === false),
+)
+check(
   "tool description stays in [1200, 3000] chars",
   TODOWRITE_DESCRIPTION.length >= 1200 && TODOWRITE_DESCRIPTION.length <= 3000,
   `got ${TODOWRITE_DESCRIPTION.length}`,
@@ -378,6 +435,11 @@ check(
   try {
     const tool = h.tools.get("todowrite")
     check("todowrite is registered", Boolean(tool))
+    check(
+      "both tools are registered in surface order",
+      [...h.tools.keys()].join(",") === "todowrite,todoread",
+      [...h.tools.keys()].join(","),
+    )
     const input = { todos: DONE_47_OPEN_3, phases: ["调研", "实现", "验证"] }
     const inputSize = JSON.stringify(input).length
     const result = await tool.execute(input, { sessionID: "ses_cache_tool" })
@@ -411,7 +473,13 @@ console.log("\ncache safety — tool result text is frozen")
       { todos: FINISHED_TWO, phases: ["调研", "实现"] },
       { sessionID: "ses_cache_hash_fin" },
     )
-    check("finished-list result is unchanged", textDigest(finished.content) === RESULT_FINISHED_HASH)
+    check("finished-list result is the compact counts form", textDigest(finished.content) === RESULT_FINISHED_HASH)
+    check(
+      "finished-list result does not render the titles",
+      !finished.content.includes("Task 1") && !finished.content.includes("Task 2"),
+    )
+    check("finished-list result stays under 500 chars", finished.content.length <= 500, `${finished.content.length} chars`)
+    console.log(`  size  finished-list result ${finished.content.length} chars`)
   } finally {
     await h.dispose()
     await rm(h.dir, { recursive: true, force: true })

@@ -176,7 +176,7 @@ console.log("\nstorage read fault — explicit phases writes, omitted phases fai
   }
 }
 
-console.log("\nresult — compact for open lists, full for finished lists")
+console.log("\nresult — compact for open and finished lists, todoread recovers")
 {
   const h = await harness({ todos: [], phases: [], updatedAt: 0 })
   try {
@@ -199,8 +199,24 @@ console.log("\nresult — compact for open lists, full for finished lists")
       ],
       phases: [],
     }, { sessionID: "ses_result" })
-    check("finished list keeps the full render", finished.content.includes("Finished task") && finished.content.includes("Cancelled task"))
-    check("finished list uses the completed marks", finished.content.includes("[x]") && finished.content.includes("[-]"))
+    check(
+      "finished list result is compact counts",
+      finished.content === "Todo list updated (2 items: 1 done, 1 cancelled). Full list: todoread.",
+      finished.content,
+    )
+    check("finished list result does not render the titles", !finished.content.includes("Finished task") && !finished.content.includes("Cancelled task"))
+    check("finished list result points to todoread", finished.content.includes("Full list: todoread"))
+    check("finished list result stays under 500 chars", finished.content.length <= 500, `${finished.content.length} chars`)
+
+    const recovered = await h.tools.get("todoread").execute({}, { sessionID: "ses_result" })
+    check(
+      "todoread still recovers the finished titles",
+      recovered.content.includes("Finished task") && recovered.content.includes("Cancelled task"),
+    )
+    check("todoread keeps the completed marks", recovered.content.includes("[x]") && recovered.content.includes("[-]"))
+
+    const empty = await tool.execute({ todos: [], phases: [] }, { sessionID: "ses_result_empty" })
+    check("empty list result is compact", empty.content === "Todo list updated (empty).", empty.content)
   } finally {
     await h.dispose()
     await rm(h.dir, { recursive: true, force: true })

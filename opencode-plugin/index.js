@@ -45,6 +45,19 @@ const STORAGE_PREFIX = "todos/"
 const INDEX_NAME = "_index.json"
 const MARK = { pending: "[ ]", in_progress: "[•]", completed: "[x]", cancelled: "[-]" }
 
+/**
+ * Write-time input limits. They live in `normalize()` only: the JSON schema
+ * stays byte-identical so the tools prefix (and its cache) is untouched. A list
+ * stored by an older version may exceed these; `parseRecord()` still reads it,
+ * so existing sessions keep displaying and mirroring.
+ */
+const MAX_TODOS = 200
+const MAX_CONTENT = 500
+const MAX_ID = 64
+const MAX_PHASE = 64
+const MAX_DEPENDS = 20
+const MAX_PHASES = 20
+
 /** Where the mirror writes. Override for testing with TODO_BRIDGE_DIR. */
 function mirrorDir() {
   const override = process.env.TODO_BRIDGE_DIR
@@ -76,6 +89,9 @@ export function normalize(input) {
   }
   const raw = input.todos
   if (!Array.isArray(raw)) throw new Error("`todos` must be an array")
+  if (raw.length > MAX_TODOS) {
+    throw new Error(`todowrite accepts at most ${MAX_TODOS} todos (got ${raw.length})`)
+  }
 
   const todos = raw.map((entry, index) => {
     const at = `todo #${index + 1}`
@@ -84,6 +100,9 @@ export function normalize(input) {
     }
     const content = typeof entry.content === "string" ? entry.content.trim() : ""
     if (!content) throw new Error(`${at} requires a non-empty \`content\` string`)
+    if (content.length > MAX_CONTENT) {
+      throw new Error(`${at} \`content\` must be at most ${MAX_CONTENT} characters (got ${content.length})`)
+    }
     if (!TODO_STATUSES.includes(entry.status)) {
       throw new Error(`${at} has invalid \`status\` (expected: ${TODO_STATUSES.join(", ")})`)
     }
@@ -94,14 +113,30 @@ export function normalize(input) {
       }
       todo.priority = entry.priority
     }
-    if (entry.id !== undefined) todo.id = requireString(entry.id, `${at} \`id\``)
+    if (entry.id !== undefined) {
+      todo.id = requireString(entry.id, `${at} \`id\``)
+      if (todo.id.length > MAX_ID) {
+        throw new Error(`${at} \`id\` must be at most ${MAX_ID} characters (got ${todo.id.length})`)
+      }
+    }
     if (entry.parentId !== undefined && entry.parentId !== null) {
       todo.parentId = requireString(entry.parentId, `${at} \`parentId\``)
+      if (todo.parentId.length > MAX_ID) {
+        throw new Error(`${at} \`parentId\` must be at most ${MAX_ID} characters (got ${todo.parentId.length})`)
+      }
     }
-    if (entry.phase !== undefined) todo.phase = requireString(entry.phase, `${at} \`phase\``)
+    if (entry.phase !== undefined) {
+      todo.phase = requireString(entry.phase, `${at} \`phase\``)
+      if (todo.phase.length > MAX_PHASE) {
+        throw new Error(`${at} \`phase\` must be at most ${MAX_PHASE} characters (got ${todo.phase.length})`)
+      }
+    }
     if (entry.dependsOn !== undefined) {
       if (!Array.isArray(entry.dependsOn) || entry.dependsOn.some((dep) => typeof dep !== "string" || dep.trim() === "")) {
         throw new Error(`${at} \`dependsOn\` must be an array of non-empty strings`)
+      }
+      if (entry.dependsOn.length > MAX_DEPENDS) {
+        throw new Error(`${at} \`dependsOn\` accepts at most ${MAX_DEPENDS} ids (got ${entry.dependsOn.length})`)
       }
       todo.dependsOn = entry.dependsOn.map((dep) => dep.trim())
     }
@@ -113,7 +148,16 @@ export function normalize(input) {
     if (!Array.isArray(input.phases) || input.phases.some((p) => typeof p !== "string" || p.trim() === "")) {
       throw new Error("`phases` must be an array of non-empty strings")
     }
-    result.phases = input.phases.map((p) => p.trim())
+    if (input.phases.length > MAX_PHASES) {
+      throw new Error(`\`phases\` accepts at most ${MAX_PHASES} phases (got ${input.phases.length})`)
+    }
+    result.phases = input.phases.map((p, index) => {
+      const phase = p.trim()
+      if (phase.length > MAX_PHASE) {
+        throw new Error(`\`phases\` entry ${index + 1} must be at most ${MAX_PHASE} characters (got ${phase.length})`)
+      }
+      return phase
+    })
   }
   return result
 }
@@ -572,14 +616,17 @@ export const TODOWRITE_DESCRIPTION = [
  * Stable wording: elapsed rounds are runtime bookkeeping, not model context.
  */
 /**
- * The tool result is history. Keep it compact while work is open: the call
- * arguments already hold the full list and the next reminder carries it again.
- * A finished list has no reminder, so it keeps the full render as the recovery
- * copy.
+ * The tool result is history. Keep it compact: the call arguments already hold
+ * the full list, and `todoread` is the recovery channel. A finished list used to
+ * write the whole render into history — for a long list that is thousands of
+ * characters the model already saw in the call, so it is counts only now.
  */
-function resultContent(todos, phases = []) {
+function resultContent(todos) {
   if (!hasOpen(todos)) {
-    return `Todo list updated (${todos.length} ${todos.length === 1 ? "item" : "items"}):\n${render(todos, phases)}`
+    if (todos.length === 0) return "Todo list updated (empty)."
+    const done = todos.filter((todo) => todo.status === "completed").length
+    const cancelled = todos.filter((todo) => todo.status === "cancelled").length
+    return `Todo list updated (${todos.length} items: ${done} done, ${cancelled} cancelled). Full list: todoread.`
   }
   const open = todos.filter((todo) => todo.status === "pending" || todo.status === "in_progress").length
   const doing = todos.filter((todo) => todo.status === "in_progress").length
@@ -589,23 +636,313 @@ function resultContent(todos, phases = []) {
   return `Updated: ${open} open${progress}, ${done} done, ${cancelled} cancelled. Full list: todoread.`
 }
 
+/**
+ * The reminder is transient tail context, so every round pays for it. It used to
+ * repeat the whole list (every finished item too) while `todoread` already offers
+ * the full render. This compact form keeps the open work, a counts line and the
+ * done/cancelled items that open work structurally needs (parents and
+ * dependencies), so the task tree survives compaction without paying for 47
+ * finished rows every round.
+ *
+ * The hard bounds are deliberate: the open section never exceeds
+ * REMINDER_BODY_MAX and the assembled reminder never exceeds REMINDER_TOTAL_MAX.
+ * When room runs out, open items are hidden and counted; the header and the
+ * footer nudge are never trimmed.
+ */
+const REMINDER_OPEN_MAX = 40
+const REMINDER_BODY_MAX = 2000
+const REMINDER_ITEM_MAX = 200
+const REMINDER_STRUCTURAL_MAX = 12
+const REMINDER_TOTAL_MAX = 2400
+const REMINDER_TITLE_MAX = 120
+/** Pathological phase lists must not push the reminder past its total bound. */
+const REMINDER_PHASES_MAX = 400
+
+const REMINDER_HEADER = [
+  "[Session task state — reference only; continue the user's current task.]",
+  "Current todo list for this session:",
+]
+const REMINDER_FOOTER = [
+  "Keep this list current with todowrite:",
+  "- mark a task `completed` as soon as it is done and verified",
+  "- move the next task to `in_progress` before starting it (one at a time)",
+  "- capture follow-ups discovered during the work",
+  "- keep the tree meaningful: stable `id`s, `parentId`, `phase`, `dependsOn`",
+]
+const REMINDER_REF_HEADER = "Referenced done/cancelled:"
+const REMINDER_IDS_PREFIX = "Referenced ids only: "
+
+const hiddenLine = (count) => `… +${count} open not shown; call todoread.`
+
+/**
+ * The done/cancelled items that open work still needs: completed ancestors and
+ * completed dependencies (plus their ancestors). Emitted in the original `todos`
+ * order so the text is deterministic; Sets are used for membership only, never
+ * for ordering. Returned in full — the renderer caps the detailed lines and
+ * prints the rest as ids, so a reference is never silently dropped.
+ */
+export function structuralReferences(todos, open) {
+  const list = Array.isArray(todos) ? todos : []
+  const byId = new Map()
+  for (const todo of list) {
+    if (todo && typeof todo.id === "string" && todo.id !== "") byId.set(todo.id, todo)
+  }
+  const needed = new Set()
+  // Cycle-safe: a malformed parent chain must not loop forever.
+  const addAncestors = (todo) => {
+    const visited = new Set()
+    let parentId = todo && typeof todo.parentId === "string" ? todo.parentId : ""
+    while (parentId !== "" && !visited.has(parentId)) {
+      visited.add(parentId)
+      const parent = byId.get(parentId)
+      if (!parent) break
+      if (parent.status === "completed" || parent.status === "cancelled") needed.add(parent)
+      parentId = typeof parent.parentId === "string" ? parent.parentId : ""
+    }
+  }
+  for (const todo of Array.isArray(open) ? open : []) {
+    if (!todo || typeof todo !== "object") continue
+    addAncestors(todo)
+    for (const depId of Array.isArray(todo.dependsOn) ? todo.dependsOn : []) {
+      const dep = byId.get(depId)
+      if (!dep) continue
+      if (dep.status === "completed" || dep.status === "cancelled") {
+        needed.add(dep)
+        addAncestors(dep)
+      }
+    }
+  }
+  const references = []
+  for (const todo of list) if (needed.has(todo)) references.push(todo)
+  return references
+}
+
+const truncate = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text)
+
+/** One reminder line: the `render` shape, with a bounded `content`. */
+function reminderLine(todo, index, showIds) {
+  const content = truncate(todo.content, REMINDER_ITEM_MAX)
+  const phase = todo.phase ? ` [${todo.phase}]` : ""
+  const priority = todo.priority ? ` — ${todo.priority} priority` : ""
+  const id = showIds && todo.id ? ` #${todo.id}` : ""
+  const parent = todo.parentId ? ` <- ${todo.parentId}` : ""
+  const deps = Array.isArray(todo.dependsOn) && todo.dependsOn.length
+    ? ` deps:${todo.dependsOn.join(",")}`
+    : ""
+  return `${index + 1}. ${MARK[todo.status]} ${content}${phase}${priority}${id}${parent}${deps}`
+}
+
+/**
+ * Open display order: in-progress first (at most five, original order among
+ * them), then every remaining open item in original order. Each line keeps its
+ * original list position, like `render` does.
+ */
+function orderedOpen(open) {
+  const doing = open.filter((todo) => todo.status === "in_progress").slice(0, 5)
+  const leading = new Set(doing)
+  const remaining = open.filter((todo) => !leading.has(todo))
+  return [...doing, ...remaining]
+}
+
+/** `#id` when the item has one, otherwise its original 1-based row. */
+function referenceLabel(todo, indexByTodo) {
+  return todo.id ? `#${todo.id}` : `row ${indexByTodo.get(todo) + 1}`
+}
+
+function referenceText(todo, indexByTodo) {
+  const title = truncate(todo.content, REMINDER_TITLE_MAX)
+  return `  + ${referenceLabel(todo, indexByTodo)} ${MARK[todo.status]} ${title}`
+}
+
+function assembleReminder(openText, extrasText) {
+  const header = REMINDER_HEADER.join("\n")
+  const footer = REMINDER_FOOTER.join("\n")
+  const middle = extrasText ? `${openText}\n${extrasText}` : openText
+  return `${header}\n${middle}\n\n${footer}`
+}
+
+/**
+ * Fits the structural references into the room left after the fixed parts and a
+ * minimal open section.
+ *
+ * The block is built greedily, because a review found the old fallback either
+ * dropped readable detail that would have fit or cut an id in half (`#t1, #t`
+ * reads like a real id and can become a broken `parentId`). So: the header plus
+ * as many detail lines as fit (never more than REMINDER_STRUCTURAL_MAX), then
+ * the remaining references as whole ids on one line. If the ids line does not
+ * fit, only whole labels are kept and it ends with ` …`; a label is never cut.
+ * If no detail line fits, ids are emitted alone when they fit, otherwise nothing.
+ */
+function referencesBlock(references, indexByTodo, budget) {
+  if (!Array.isArray(references) || references.length === 0 || budget <= 0) return ""
+  const lines = [REMINDER_REF_HEADER]
+  let used = REMINDER_REF_HEADER.length
+  if (used > budget) return ""
+  const detailed = references.slice(0, REMINDER_STRUCTURAL_MAX)
+  for (const todo of detailed) {
+    const line = `\n${referenceText(todo, indexByTodo)}`
+    if (used + line.length > budget) break
+    lines.push(line.slice(1))
+    used += line.length
+  }
+  const shown = lines.length - 1
+  const ids = idsLine(references.slice(shown), indexByTodo, shown > 0 ? budget - used - 1 : budget)
+  if (shown === 0) return ids
+  return ids ? `${lines.join("\n")}\n${ids}` : lines.join("\n")
+}
+
+/**
+ * One line of whole ids for the references that did not get a detail line. It
+ * stops before a label that would overflow and says so with ` …`; an id is
+ * never truncated, because a prefix of an id is a different, broken id.
+ */
+function idsLine(remaining, indexByTodo, room) {
+  if (remaining.length === 0 || room <= REMINDER_IDS_PREFIX.length) return ""
+  let line = REMINDER_IDS_PREFIX
+  let included = 0
+  for (let index = 0; index < remaining.length; index += 1) {
+    const label = referenceLabel(remaining[index], indexByTodo)
+    const more = index < remaining.length - 1
+    const addition = `${included > 0 ? ", " : ""}${label}`
+    if (line.length + addition.length + (more ? 2 : 0) > room) break
+    line += addition
+    included += 1
+  }
+  if (included === 0) return ""
+  return included < remaining.length ? `${line} …` : line
+}
+
+/**
+ * The model-visible compact reminder. `todoread` and finished tool results keep
+ * the full `render`; only the transient per-round reminder is compacted.
+ */
+export function renderReminder(todos, phases = []) {
+  const list = Array.isArray(todos) ? todos : []
+  const declared = Array.isArray(phases)
+    ? phases.filter((phase) => typeof phase === "string" && phase !== "")
+    : []
+  if (list.length === 0) return assembleReminder("(the todo list is empty)", "")
+
+  const open = list.filter((todo) => todo.status === "pending" || todo.status === "in_progress")
+  const done = list.filter((todo) => todo.status === "completed").length
+  const cancelled = list.filter((todo) => todo.status === "cancelled").length
+  const showIds = list.some((todo) => typeof todo.id === "string" && todo.id !== "")
+  const indexByTodo = new Map(list.map((todo, index) => [todo, index]))
+
+  const counts = done > 0 || cancelled > 0
+    ? `Done: ${done}, cancelled: ${cancelled} (todoread for the full list)`
+    : ""
+  const phasesLine = declared.length
+    ? truncate(`Phases: ${declared.join(", ")}`, REMINDER_PHASES_MAX)
+    : ""
+
+  // Room left for references after the fixed parts and the smallest possible
+  // open section (the truncation line, or the empty-list line).
+  const openMinText = open.length > 0
+    ? hiddenLine(open.length)
+    : "(no open tasks — call todoread for the full list)"
+  const fixedExtras = [counts, phasesLine].filter(Boolean).join("\n")
+  const refsBudget = REMINDER_TOTAL_MAX - assembleReminder(openMinText, fixedExtras).length
+  const references = structuralReferences(list, open)
+  const refs = referencesBlock(references, indexByTodo, refsBudget)
+
+  if (open.length === 0) {
+    const extras = [counts, refs, phasesLine].filter(Boolean).join("\n")
+    return assembleReminder("(no open tasks — call todoread for the full list)", extras)
+  }
+
+  const extrasText = [counts, refs, phasesLine].filter(Boolean).join("\n")
+  const openBudget = REMINDER_TOTAL_MAX - assembleReminder("", extrasText).length
+  const cap = Math.min(REMINDER_BODY_MAX, openBudget)
+
+  const ordered = orderedOpen(open)
+  const lines = []
+  let length = 0
+  for (let index = 0; index < ordered.length && lines.length < REMINDER_OPEN_MAX; index += 1) {
+    const line = reminderLine(ordered[index], indexByTodo.get(ordered[index]), showIds)
+    const hiddenAfter = ordered.length - (lines.length + 1)
+    const reserved = hiddenAfter > 0 ? 1 + hiddenLine(hiddenAfter).length : 0
+    const grown = length + (lines.length > 0 ? 1 : 0) + line.length + reserved
+    if (grown > cap) break
+    lines.push(line)
+    length += (lines.length > 1 ? 1 : 0) + line.length
+  }
+
+  const renderOpen = () => {
+    const hidden = ordered.length - lines.length
+    return hidden > 0 ? `${lines.join("\n")}\n${hiddenLine(hidden)}` : lines.join("\n")
+  }
+  let text = assembleReminder(renderOpen(), extrasText)
+  // Belt and braces: the section caps should keep this from firing, but the
+  // total bound is a contract, so trim open lines until it holds.
+  while (text.length > REMINDER_TOTAL_MAX && lines.length > 0) {
+    lines.pop()
+    text = assembleReminder(renderOpen(), extrasText)
+  }
+  return text
+}
+
 export function buildReminder(todos, phases = []) {
-  const lines = [
-    "[Session task state — reference only; continue the user's current task.]",
-    "Current todo list for this session:",
-    render(todos, phases),
-    "",
-  ]
+  return renderReminder(todos, phases)
+}
 
-  lines.push(
-      "Keep this list current with todowrite:",
-      "- mark a task `completed` as soon as it is done and verified",
-      "- move the next task to `in_progress` before starting it (one at a time)",
-      "- capture follow-ups discovered during the work",
-      "- keep the tree meaningful: stable `id`s, `parentId`, `phase`, `dependsOn`",
-  )
+const REMINDER_MARKER = "[Session task state"
 
-  return lines.join("\n")
+/** A tool part that has started but not finished; a missing `state` is old history. */
+function hasPendingToolCall(message) {
+  const content = message && Array.isArray(message.content) ? message.content : []
+  return content.some((part) =>
+    part && part.type === "tool" && part.state &&
+    (part.state.status === "pending" || part.state.status === "running"))
+}
+
+/**
+ * Injects the transient reminder without ever producing two consecutive user
+ * turns. The block is tail-only and is never persisted.
+ *
+ * - Last message is `user`: rebuild that message with a new content array that
+ *   keeps the original parts and appends the reminder as a text part.
+ * - Last message is `tool`, another role, or an assistant with no pending tool
+ *   call: append a new user message.
+ * - Last message is an assistant with a pending/running tool call: return false.
+ *   The next request carries the tool result; injecting a user turn now would put
+ *   it in the middle of the call/result pair.
+ *
+ * Idempotent: a text part already starting with REMINDER_MARKER is replaced, so
+ * calling twice never adds a second reminder. A malformed message returns false
+ * rather than corrupting history. The original array and message objects are
+ * never mutated; `event.messages` is replaced with a new array when it changes.
+ */
+export function appendReminder(event, text) {
+  if (!event || typeof event !== "object" || !Array.isArray(event.messages)) return false
+  const messages = event.messages
+  const last = messages.length > 0 ? messages[messages.length - 1] : null
+  const role = last && typeof last === "object" ? last.role : undefined
+
+  if (role === "assistant" && hasPendingToolCall(last)) return false
+
+  if (role === "user") {
+    const content = last.content
+    let parts
+    if (typeof content === "string") {
+      // A string that already starts with the marker is a previous reminder.
+      parts = content.startsWith(REMINDER_MARKER) ? [] : [{ type: "text", text: content }]
+    } else if (Array.isArray(content)) {
+      parts = content.filter((part) =>
+        !(part && typeof part === "object" && part.type === "text" &&
+          typeof part.text === "string" && part.text.startsWith(REMINDER_MARKER)))
+    } else {
+      return false
+    }
+    event.messages = [
+      ...messages.slice(0, -1),
+      { ...last, content: [...parts, { type: "text", text }] },
+    ]
+    return true
+  }
+
+  event.messages = [...messages, { role: "user", content: [{ type: "text", text }] }]
+  return true
 }
 
 export const TODOS_INPUT = {
@@ -642,6 +979,19 @@ export const TODOS_INPUT = {
 
 const EMPTY_INPUT = { type: "object", properties: {}, additionalProperties: false }
 
+export const TODOREAD_DESCRIPTION =
+  "Read the current session todo list. Use it to recover the list after context compaction or to check progress before starting the next task."
+
+/**
+ * The single source for what the plugin registers. The digest in
+ * `scripts/test-cache.mjs` covers name, description, input and options in this
+ * order, so the runtime and the frozen surface cannot drift apart.
+ */
+export const TOOL_SURFACE = [
+  { name: "todowrite", description: TODOWRITE_DESCRIPTION, input: TODOS_INPUT, options: { codemode: false } },
+  { name: "todoread", description: TODOREAD_DESCRIPTION, input: EMPTY_INPUT, options: { codemode: false } },
+]
+
 export default {
   id: "openchamber-todo-bridge",
 
@@ -665,98 +1015,90 @@ export default {
       logIndexError(error)
     }
 
-    const tools = await ctx.tool.transform((editor) => {
-      editor.add({
-        name: "todowrite",
-        description: TODOWRITE_DESCRIPTION,
-        input: TODOS_INPUT,
-        options: { codemode: false },
-        async execute(input, context) {
-          const normalized = normalize(input)
-          // Two calls in one assistant turn must not interleave storage, mirror
-          // and index writes for the same session.
-          const hasPhases = Object.hasOwn(normalized, "phases")
-          return runSerial(context.sessionID, async () => {
-            const { todos } = normalized
-            // `phases` is optional input. Omitting it must not erase the stored
-            // order, so that path needs a fresh read. When the caller supplies
-            // phases, no read is needed; a storage read fault must not fail a
-            // write that already carries all the metadata it needs.
-            let previous = hasPhases
-              ? sessionCache.get(context.sessionID)?.record || null
-              : await readRecord(ctx, context.sessionID, { fresh: true })
-            const phases = (hasPhases ? normalized.phases : previous.phases) || []
-            const signature = signatureOf(todos, phases)
-            // Two ways to know the stored list already equals this one: this
-            // generation mirrored it, or the fresh read just returned it. The
-            // second is what makes a restart behave like the old in-memory guard
-            // without seeding the signature from a read (which hid a missing
-            // mirror). Both paths check the file before trusting the claim.
-            const storedSignature = previous ? signatureOf(previous.todos, previous.phases) : ""
-            if (sessionSignatures.get(context.sessionID) === signature || storedSignature === signature) {
-              // The signature says this generation mirrored this exact list. Trust
-              // it only while the mirror is still on disk: a wiped profile, a
-              // deleted file, or a failed write before a restart must not leave
-              // the board blind forever.
-              if (await mirrorPresent(context.sessionID)) {
-                return { content: resultContent(todos, phases) }
-              }
-              // Repair only the mirror. A fresh read is the source of truth: the
-              // storage record may have moved on since our last cached copy.
-              let stored = previous
-              try {
-                stored = await readRecord(ctx, context.sessionID, { fresh: true })
-              } catch {
-                /* fall through to the normal write, which reports storage faults */
-              }
-              if (stored && signatureOf(stored.todos, stored.phases) === signature) {
-                try {
-                  // Keep the original updatedAt: a repair is not activity. Bumping
-                  // it would reorder the board and could resurface an archived
-                  // session for a change nobody made.
-                  await mirror(context.sessionID, stored.todos, stored.phases, stored.updatedAt)
-                  rememberSignature(context.sessionID, signature)
-                } catch (error) {
-                  logMirrorError(error)
-                }
-                return { content: resultContent(todos, phases) }
-              }
-              // Storage moved past our signature; write the incoming list below.
-              previous = stored || previous
+    /** One implementation per tool name in TOOL_SURFACE. */
+    const execute = {
+      async todowrite(input, context) {
+        const normalized = normalize(input)
+        // Two calls in one assistant turn must not interleave storage, mirror
+        // and index writes for the same session.
+        const hasPhases = Object.hasOwn(normalized, "phases")
+        return runSerial(context.sessionID, async () => {
+          const { todos } = normalized
+          // `phases` is optional input. Omitting it must not erase the stored
+          // order, so that path needs a fresh read. When the caller supplies
+          // phases, no read is needed; a storage read fault must not fail a
+          // write that already carries all the metadata it needs.
+          let previous = hasPhases
+            ? sessionCache.get(context.sessionID)?.record || null
+            : await readRecord(ctx, context.sessionID, { fresh: true })
+          const phases = (hasPhases ? normalized.phases : previous.phases) || []
+          const signature = signatureOf(todos, phases)
+          // Two ways to know the stored list already equals this one: this
+          // generation mirrored it, or the fresh read just returned it. The
+          // second is what makes a restart behave like the old in-memory guard
+          // without seeding the signature from a read (which hid a missing
+          // mirror). Both paths check the file before trusting the claim.
+          const storedSignature = previous ? signatureOf(previous.todos, previous.phases) : ""
+          if (sessionSignatures.get(context.sessionID) === signature || storedSignature === signature) {
+            // The signature says this generation mirrored this exact list. Trust
+            // it only while the mirror is still on disk: a wiped profile, a
+            // deleted file, or a failed write before a restart must not leave
+            // the board blind forever.
+            if (await mirrorPresent(context.sessionID)) {
+              return { content: resultContent(todos) }
             }
-            const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
-            const record = { todos, phases, updatedAt }
-            await ctx.storage.set(storageKey(context.sessionID), record)
-            cacheRecord(context.sessionID, record)
-            // Mirror after the durable write: a mirror failure must not lose the list.
-            let mirrored = true
+            // Repair only the mirror. A fresh read is the source of truth: the
+            // storage record may have moved on since our last cached copy.
+            let stored = previous
             try {
-              await mirror(context.sessionID, todos, phases, updatedAt)
-            } catch (error) {
-              mirrored = false
-              logMirrorError(error)
+              stored = await readRecord(ctx, context.sessionID, { fresh: true })
+            } catch {
+              /* fall through to the normal write, which reports storage faults */
             }
-            // A failed mirror is retried by the next write, even an identical one.
-            if (mirrored) rememberSignature(context.sessionID, signature)
-            return { content: resultContent(todos, phases) }
-          })
-        },
-      })
+            if (stored && signatureOf(stored.todos, stored.phases) === signature) {
+              try {
+                // Keep the original updatedAt: a repair is not activity. Bumping
+                // it would reorder the board and could resurface an archived
+                // session for a change nobody made.
+                await mirror(context.sessionID, stored.todos, stored.phases, stored.updatedAt)
+                rememberSignature(context.sessionID, signature)
+              } catch (error) {
+                logMirrorError(error)
+              }
+              return { content: resultContent(todos) }
+            }
+            // Storage moved past our signature; write the incoming list below.
+            previous = stored || previous
+          }
+          const updatedAt = Math.max(Date.now(), (previous?.updatedAt || 0) + 1)
+          const record = { todos, phases, updatedAt }
+          await ctx.storage.set(storageKey(context.sessionID), record)
+          cacheRecord(context.sessionID, record)
+          // Mirror after the durable write: a mirror failure must not lose the list.
+          let mirrored = true
+          try {
+            await mirror(context.sessionID, todos, phases, updatedAt)
+          } catch (error) {
+            mirrored = false
+            logMirrorError(error)
+          }
+          // A failed mirror is retried by the next write, even an identical one.
+          if (mirrored) rememberSignature(context.sessionID, signature)
+          return { content: resultContent(todos) }
+        })
+      },
 
-      editor.add({
-        name: "todoread",
-        description:
-          "Read the current session todo list. Use it to recover the list after context compaction or to check progress before starting the next task.",
-        input: EMPTY_INPUT,
-        options: { codemode: false },
-        async execute(_input, context) {
-          await pendingWrite(context.sessionID)
-          // This is the explicit recovery path. Read it fresh: a cached list
-          // from another process must never become the basis for a rewrite.
-          const record = await readRecord(ctx, context.sessionID, { fresh: true })
-          return { content: `Current todo list:\n${render(record.todos, record.phases)}` }
-        },
-      })
+      async todoread(_input, context) {
+        await pendingWrite(context.sessionID)
+        // This is the explicit recovery path. Read it fresh: a cached list
+        // from another process must never become the basis for a rewrite.
+        const record = await readRecord(ctx, context.sessionID, { fresh: true })
+        return { content: `Current todo list:\n${render(record.todos, record.phases)}` }
+      },
+    }
+
+    const tools = await ctx.tool.transform((editor) => {
+      for (const tool of TOOL_SURFACE) editor.add({ ...tool, execute: execute[tool.name] })
     })
 
     // The hook edits only the outgoing request. Keep dynamic task state after
@@ -771,15 +1113,13 @@ export default {
         await pendingWrite(event.sessionID)
         const record = await readRecord(ctx, event.sessionID)
         if (!hasOpen(record.todos)) return
-        // Replace the array instead of pushing into it: the host may hand us the
-        // live history array, and a transient reminder must never become a
-        // persisted user turn. Assigning a new array keeps the prefix untouched.
-        // Verified against OpenCode 2.0.16: the caller reads event.messages
-        // after the hook, so replacing the property updates the request.
-        event.messages = [
-          ...event.messages,
-          { role: "user", content: [{ type: "text", text: buildReminder(record.todos, record.phases) }] },
-        ]
+        // A transient reminder must never become a persisted user turn. If the
+        // history ends in a user message, attach the block to that message instead
+        // of adding a second consecutive user turn (some providers reject it).
+        // appendReminder replaces the array and rebuilds that message; it never
+        // mutates the caller's array or message objects. Verified against
+        // OpenCode 2.0.16: the caller reads event.messages after the hook.
+        appendReminder(event, buildReminder(record.todos, record.phases))
       } catch (error) {
         // A storage or host fault must not fail the model request. The list is
         // still durable; the next round can inject it again.
