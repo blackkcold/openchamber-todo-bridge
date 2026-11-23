@@ -28,6 +28,24 @@ https://github.com/blackkcold/openchamber-todo-bridge
 
 Send a message in an OpenCode session to start using the todo tools. To pin a version, append a release tag such as `#v1.2.0` to the URL.
 
+### v1.3.1 — injection without consecutive user turns
+
+The transient reminder is now positioned for providers that reject two user messages in a row. When the outgoing request ends with a user message, the reminder is attached to that message as a second text part instead of adding a new turn; the original text is kept and comes first. When the request ends with a tool result, or an assistant turn with no call in flight, a new user message is appended. An assistant turn with a pending or running tool call is left alone — the next request carries the tool result.
+
+Reapplying the hook replaces the existing reminder instead of adding a second, so an event is idempotent. The reminder stays transient and is never persisted, and everything before the last user message is untouched.
+
+### v1.3.0 — a smaller, bounded prompt tail
+
+Release A shrinks what the plugin adds to every request and bounds what it writes, without changing the tool surface:
+
+- The transient reminder carries only the open work — in-progress first, then pending — plus a counts line and the completed or cancelled parents and dependencies that open tasks still reference, so a compaction cannot flatten the tree. It is bounded at 40 open items, 2000 characters of open work and 2400 characters in total; hidden open items are counted as `… +K open not shown; call todoread.` and never disappear silently. Finished items nothing refers to are left to `todoread`.
+- `todowrite` rejects an oversized write with a message naming the field, the limit and the actual value: at most 200 todos, 500 characters per `content` (after trimming), 64 per `id`, `parentId` and `phase`, 20 `dependsOn` ids and 20 declared phases. The limits are runtime validation only; the schema and description are byte-identical, so the tools prefix and its cache are untouched. A list stored by an older version is still read, displayed and mirrored.
+- A finished-list `todowrite` result is counts only — `Todo list updated (N items: D done, C cancelled). Full list: todoread.` — instead of repeating the rendered list in history. `todoread` remains the recovery path and still returns the full render.
+
+This release does not change how often the reminder is injected: it still goes out while work is open. The unchanged-list nudge and cross-provider tail handling are later releases.
+
+Verification: `bun run test-reminder` covers the reminder bounds and structural references; `test-plugin`, `test-state` and `test-cache` pin the limits, the compact result and the `TOOL_SURFACE` digest; the full 16-suite suite is green.
+
 ### v1.2.0 — phase headers, even with subtasks
 
 Phase headers and explicit subtask nesting now coexist. A phase header is drawn whenever at least one root task names that phase; tasks with `parentId` stay under their parent, and a phase used only by subtasks gets no empty header. Cycle breaking now happens before the root/header decision, so a malformed parent chain cannot push a task outside its phase. This fixes GPT-model sessions where the todo list mixed `phase` with `parentId` and the headers disappeared.
@@ -255,6 +273,22 @@ savings still depend on the model, routing, and workload. No savings percentage
 is claimed. Regression coverage checks stable system/history prefixes and
 changed, finished, and empty lists.
 
+## Coexistence with OpenChamber's built-in Tasks
+
+OpenChamber's `experimental.todo` runs beside this plugin without touching the
+model surface:
+
+- It is a server-side reader of `todowrite` events. It registers no tool, changes
+  no model tool table, and changes no cache.
+- Its `parseTodos` keeps only `content` and `status`, so the built-in Tasks panel
+  is flat. This bridge's panel is the one that draws the tree.
+- Expect no `phase` or `dependsOn` in the built-in Tasks panel; use the bridge
+  panel for structure.
+- Keep `codemode: false`. Before changing it to `true`, verify that
+  `session.tool.input.started`'s `data.name` is still `todowrite`; otherwise the
+  built-in Tasks panel silently stops receiving data.
+- This plugin adds no native-tool probe, warning, or tool-table change.
+
 ## Compatibility & permissions
 
 - OpenCode v2
@@ -281,7 +315,8 @@ The built pages in `status/`, `panel/`, and `board/` are committed because OpenC
 half of prompt caching: system/tools/history prefixes stay unchanged, an
 unchanged todo list produces byte-identical reminder text, the transient reminder
 never becomes a persisted user turn, a storage fault does not fail the model
-request, and reminder/tool-result sizes stay inside a bounded budget.
+request, and reminder/tool-result sizes stay inside a bounded budget (2400
+characters for the reminder, with a 2000-character cap on its open section).
 
 For real provider data, run:
 

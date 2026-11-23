@@ -2,14 +2,19 @@
 //
 // Run under Node, not the browser: the plugin imports `node:fs`, `node:os` and
 // `node:path`, so it cannot load in a page. `design/plan-matrix.html` covers the
-// browser-safe half (`src/plugin-install.js`).
+// browser-safe half (`src/plugin-install.js`). One small setup harness at the end
+// checks the tool-result wording that only exists behind `setup()`.
 //
 // The contract assertions matter most. OpenCode's system prompt never mentions
 // todos; in v1 the entire behavioral contract lived in the tool description, and
 // that is what made agents reach for the tool unprompted. An earlier revision of
 // this plugin condensed the description to a few lines and agents stopped using
 // the tool proactively. These assertions exist to stop that regression.
-import { buildReminder, TODOWRITE_DESCRIPTION, normalize, summarize, titleFor } from "../opencode-plugin/index.js"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+import plugin, { buildReminder, TODOWRITE_DESCRIPTION, normalize, summarize, titleFor } from "../opencode-plugin/index.js"
 
 let failed = 0
 const check = (name, pass) => {
@@ -84,6 +89,77 @@ for (const [why, payload] of rejects) {
   let threw = false
   try { normalize(payload) } catch { threw = true }
   check(`rejects bad ${why}`, threw)
+}
+
+console.log("\nnormalize — write-time input limits")
+{
+  const todos = (count) => Array.from({ length: count }, (_, index) => ({
+    content: `task ${index + 1}`,
+    status: "pending",
+  }))
+  const limits = [
+    ["201 todos", { todos: todos(201) }, /at most 200 todos \(got 201\)/],
+    ["501-char content", { todos: [{ content: "x".repeat(501), status: "pending" }] }, /content.*at most 500 characters \(got 501\)/],
+    ["65-char id", { todos: [{ content: "a", status: "pending", id: "i".repeat(65) }] }, /id.*at most 64 characters \(got 65\)/],
+    ["65-char parentId", { todos: [{ content: "a", status: "pending", parentId: "p".repeat(65) }] }, /parentId.*at most 64 characters \(got 65\)/],
+    ["65-char phase", { todos: [{ content: "a", status: "pending", phase: "p".repeat(65) }] }, /phase.*at most 64 characters \(got 65\)/],
+    ["21 dependsOn", { todos: [{ content: "a", status: "pending", dependsOn: Array.from({ length: 21 }, (_, i) => `d${i}`) }] }, /dependsOn.*at most 20 ids \(got 21\)/],
+    ["21 phases", { todos: [{ content: "a", status: "pending" }], phases: Array.from({ length: 21 }, (_, i) => `p${i}`) }, /phases.*at most 20 phases \(got 21\)/],
+    ["65-char declared phase", { todos: [{ content: "a", status: "pending" }], phases: ["p".repeat(65)] }, /phases.*entry 1.*at most 64 characters \(got 65\)/],
+  ]
+  for (const [why, payload, pattern] of limits) {
+    let error = null
+    try { normalize(payload) } catch (caught) { error = caught }
+    check(`rejects ${why}`, error !== null && pattern.test(error.message), error ? error.message : "accepted")
+  }
+  const accepted = normalize({
+    todos: Array.from({ length: 200 }, (_, index) => ({
+      content: "x".repeat(500),
+      status: "pending",
+      id: `i${index}`,
+    })),
+  })
+  check("accepts 200 todos", accepted.todos.length === 200)
+  check("accepts 500-char content after trimming", accepted.todos[0].content.length === 500)
+  const longId = normalize({ todos: [{ content: "a", status: "pending", id: "i".repeat(64) }] })
+  check("accepts a 64-char id", longId.todos[0].id.length === 64)
+}
+
+console.log("\nresult — an empty finished list has readable wording")
+{
+  const dir = await mkdtemp(join(tmpdir(), "todo-plugin-empty-"))
+  process.env.TODO_BRIDGE_DIR = dir
+  const tools = new Map()
+  const dispose = await plugin.setup({
+    storage: { get: async () => ({ todos: [] }), set: async () => {} },
+    tool: {
+      transform: async (fn) => {
+        fn({ add: (tool) => tools.set(tool.name, tool) })
+        return { dispose: async () => {} }
+      },
+    },
+    session: { hook: async () => ({ dispose: async () => {} }) },
+  })
+  try {
+    const empty = await tools.get("todowrite").execute({ todos: [] }, { sessionID: "ses_plugin_empty" })
+    check("empty finished result is compact", empty.content === "Todo list updated (empty).", empty.content)
+    const finished = await tools.get("todowrite").execute({
+      todos: [
+        { content: "First finished", status: "completed" },
+        { content: "Second finished", status: "cancelled" },
+      ],
+      phases: [],
+    }, { sessionID: "ses_plugin_finished" })
+    check(
+      "finished result carries counts and the recovery pointer",
+      finished.content === "Todo list updated (2 items: 1 done, 1 cancelled). Full list: todoread.",
+      finished.content,
+    )
+    check("finished result stays under 500 chars", finished.content.length <= 500, `${finished.content.length} chars`)
+  } finally {
+    await dispose()
+    await rm(dir, { recursive: true, force: true })
+  }
 }
 
 console.log("\nsummarize — the index summary the board reads")
